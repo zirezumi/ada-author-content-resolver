@@ -48,7 +48,7 @@ const LOOKBACK_MIN = 1;
 const LOOKBACK_MAX = 90;
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;     // 24h
 const FETCH_TIMEOUT_MS = 5000;                // per network call
-const USER_AGENT = "AuthorUpdates/3.0 (+https://example.com)";
+const USER_AGENT = "AuthorUpdates/3.1 (+https://example.com)";
 const CONCURRENCY = 4;                        // feed checks in parallel (bounded)
 const MAX_FEED_CANDIDATES = 15;               // latency guard
 const MAX_KNOWN_URLS = 5;                     // abuse guard
@@ -58,16 +58,27 @@ const USE_SEARCH = !!(process.env.GOOGLE_CSE_KEY && process.env.GOOGLE_CSE_CX);
 const DEFAULT_MIN_SEARCH_CONFIDENCE = 0.7;
 const SEARCH_MAX_RESULTS = 10;
 
-// Strong global blocklist (negative site operators & runtime filtering)
+/**
+ * Strong global blocklist (negative site operators & runtime filtering)
+ * NOTE: per user request, Substack is intentionally NOT blocked.
+ */
 const SEARCH_BLOCKLIST: string[] = (process.env.SEARCH_BLOCKLIST ||
   [
+    // Socials/UGC
     "x.com","twitter.com","facebook.com","instagram.com","tiktok.com","linkedin.com",
     "youtube.com","youtu.be","reddit.com","news.ycombinator.com",
-    "medium.com","substack.com",
-    "github.com","gitlab.com","bitbucket.org",
-    "quora.com","pinterest.com","tumblr.com","notion.site","producthunt.com",
-    "dev.to","hashnode.com","stackexchange.com","stackoverflow.com","kaggle.com",
-    "patreon.com","t.me","discord.com","discord.gg"
+    "medium.com", // keep Medium blocked to avoid author home feeds dominating
+    // "substack.com",  <-- intentionally NOT blocked
+    "quora.com","pinterest.com","tumblr.com","notion.site",
+    "producthunt.com","dev.to","hashnode.com","stackexchange.com","stackoverflow.com","kaggle.com",
+    "patreon.com","t.me","discord.com","discord.gg",
+
+    // Shopping/marketplaces/booksellers
+    "amazon.com","amazon.co.uk","amazon.ca","amazon.com.au","amazon.de","amazon.fr","amazon.es","amazon.it",
+    "a.co","amzn.to",
+    "ebay.com","walmart.com","target.com","bestbuy.com",
+    "barnesandnoble.com","bookshop.org","books.google.com",
+    "aliexpress.com","alibaba.com","etsy.com"
   ].join(","))
   .split(",")
   .map((s: string) => s.trim().toLowerCase())
@@ -289,7 +300,7 @@ function lastName(s: string): string {
 }
 
 /* =============================
-   URL heuristics (home/index/article detection)
+   URL/article heuristics
    ============================= */
 function isLikelyHomepage(u: string): boolean {
   try {
@@ -456,7 +467,6 @@ function contentHasAuthorAndBook(pageText: string, authorName: string, bookTitle
 function tokensWithinProximity(text: string, a: string[], b: string[], windowSize = 60): boolean {
   const t = tokens(text);
   if (!a.length || !b.length || !t.length) return false;
-  // simple proximity: check windows around the first token of A
   const firstA = a[0];
   for (let i = 0; i < t.length; i++) {
     if (t[i] !== firstA) continue;
@@ -467,6 +477,34 @@ function tokensWithinProximity(text: string, a: string[], b: string[], windowSiz
     const hasB = window.includes(b[0]) || jaccard(window, b) >= 0.2;
     if (hasA && hasB) return true;
   }
+  return false;
+}
+
+/* ===== Shopping/product-page detection ===== */
+function isShoppingLike(url: string, html?: string): boolean {
+  const u = url.toLowerCase();
+  if (
+    /\b\/dp\/[a-z0-9]{6,}\b/.test(u) ||                 // amazon /dp/ASIN
+    /\b\/gp\/product\b/.test(u) ||                      // amazon /gp/product
+    /\/product(s)?\//.test(u) ||                        // generic product slug
+    /\/cart\b|\/checkout\b|\/buy\b|\/add\-to\-cart\b/.test(u)
+  ) {
+    return true;
+  }
+
+  if (!html) return false;
+
+  if (/<script[^>]+type=["']application\/ld\+json["'][^>]*>[\s\S]*?"@type"\s*:\s*"Product"/i.test(html)) {
+    return true;
+  }
+  if (/<meta[^>]+property=["']og:type["'][^>]+content=["']product["']/i.test(html)) {
+    return true;
+  }
+
+  const hasPrice = /itemprop=["']price["']|property=["']product:price["']|>\s*\$\s?\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?\s*<|Price:/i.test(html);
+  const hasAddToCart = /add\s*to\s*cart|buy\s*now|checkout/i.test(html);
+  if (hasPrice && hasAddToCart) return true;
+
   return false;
 }
 
@@ -877,6 +915,11 @@ export default async function handler(req: any, res: any) {
         // Fetch page
         const { html, text } = await fetchPageText(cand.url);
         if (!html || !text) continue;
+
+        // Block shopping / product pages explicitly
+        if (isShoppingLike(cand.url, html)) {
+          continue;
+        }
 
         // Article-shape checks
         const articleLike =
