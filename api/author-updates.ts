@@ -431,14 +431,20 @@ async function evaluateFeeds(feeds: string[], lookback: number, ctx: Context) {
 
   // 1) Any recent within window? choose highest confidence; tie-break by newest
   const recent = results
-    .filter(r => r.ok && r.recentWithinWindow && r.latest)
-    .sort((a, b) => (b.confidence - a.confidence) || (b.latest!.date.getTime() - a.latest!.date.getTime()));
+    .filter((r: EvalResult) => r.ok && r.recentWithinWindow && r.latest)
+    .sort((a: EvalResult, b: EvalResult) =>
+      (b.confidence - a.confidence) ||
+      (b.latest!.date.getTime() - a.latest!.date.getTime())
+    );
   if (recent.length) return { choice: recent[0], results };
-
+  
   // 2) Otherwise, pick highest confidence overall; tie-break by freshest latest
   const byConf = results
-    .filter(r => r.ok && (r.authorUrl || r.latest))
-    .sort((a, b) => (b.confidence - a.confidence) || ((b.latest?.date.getTime() || 0) - (a.latest?.date.getTime() || 0)));
+    .filter((r: EvalResult) => r.ok && (r.authorUrl || r.latest))
+    .sort((a: EvalResult, b: EvalResult) =>
+      (b.confidence - a.confidence) ||
+      ((b.latest?.date.getTime() || 0) - (a.latest?.date.getTime() || 0))
+    );
   if (byConf.length) return { choice: byConf[0], results };
 
   // 3) Fallback any OK result
@@ -663,18 +669,19 @@ export default async function handler(req: any, res: any) {
     }
 
     // Build debug helper
-    const buildDebug = (list: EvalResult[]) => list.slice(0, 5).map(r => ({
-      feedUrl: r.feedUrl,
-      ok: r.ok,
-      source: r.source,
-      latest: r.latest ? r.latest.date.toISOString() : null,
-      recentWithinWindow: r.recentWithinWindow,
-      confidence: Number(r.confidence.toFixed(2)),
-      reason: r.reason,
-      siteTitle: r.siteTitle || null,
-      feedTitle: r.feedTitle || null,
-      error: r.error || null
-    }));
+    const buildDebug = (list: EvalResult[]) =>
+      list.slice(0, 5).map((r: EvalResult) => ({
+        feedUrl: r.feedUrl,
+        ok: r.ok,
+        source: r.source,
+        latest: r.latest ? r.latest.date.toISOString() : null,
+        recentWithinWindow: r.recentWithinWindow,
+        confidence: Number(r.confidence.toFixed(2)),
+        reason: r.reason,
+        siteTitle: r.siteTitle || null,
+        feedTitle: r.feedTitle || null,
+        error: r.error || null
+      }));
 
     if (choice && choice.recentWithinWindow && choice.latest) {
       const payload: CacheValue = {
