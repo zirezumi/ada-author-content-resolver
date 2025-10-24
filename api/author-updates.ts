@@ -96,8 +96,9 @@ const BLOCKED_HOST_PARTS: string[] = [
   "walmart",
   "target.com",
   "audible.com",
-  // newsletter we currently block per requirements
+  // etc
   "substack.com",
+  "barbican.com"
 ];
 
 const INDEX_PATH_HINTS = [
