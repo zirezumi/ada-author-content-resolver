@@ -48,7 +48,7 @@ const LOOKBACK_MIN = 1;
 const LOOKBACK_MAX = 90;
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;     // 24h
 const FETCH_TIMEOUT_MS = 5000;                // per network call
-const USER_AGENT = "AuthorUpdates/3.1 (+https://example.com)";
+const USER_AGENT = "AuthorUpdates/3.2 (+https://example.com)";
 const CONCURRENCY = 4;                        // feed checks in parallel (bounded)
 const MAX_FEED_CANDIDATES = 15;               // latency guard
 const MAX_KNOWN_URLS = 5;                     // abuse guard
@@ -60,17 +60,19 @@ const SEARCH_MAX_RESULTS = 10;
 
 /**
  * Strong global blocklist (negative site operators & runtime filtering)
- * NOTE: per user request, Substack is intentionally NOT blocked.
+ * Per your latest config: Substack is BLOCKED again; also block Spotify/Apple for podcasts.
  */
 const SEARCH_BLOCKLIST: string[] = (process.env.SEARCH_BLOCKLIST ||
   [
     // Socials/UGC
     "x.com","twitter.com","facebook.com","instagram.com","tiktok.com","linkedin.com",
     "youtube.com","youtu.be","reddit.com","news.ycombinator.com",
-    "medium.com", "substack.com", "spotify.com", "apple.com",
-    "quora.com","pinterest.com","tumblr.com","notion.site",
+    "medium.com","substack.com","quora.com","pinterest.com","tumblr.com","notion.site",
     "producthunt.com","dev.to","hashnode.com","stackexchange.com","stackoverflow.com","kaggle.com",
     "patreon.com","t.me","discord.com","discord.gg",
+
+    // Podcasts/audio (avoid podcast episode result noise)
+    "spotify.com","open.spotify.com","apple.com","podcasts.apple.com","music.apple.com",
 
     // Shopping/marketplaces/booksellers
     "amazon.com","amazon.co.uk","amazon.ca","amazon.com.au","amazon.de","amazon.fr","amazon.es","amazon.it",
@@ -170,7 +172,8 @@ function makeCacheKey(
   publisher?: string,
   isbn?: string,
   includeSearch?: boolean,
-  minSearchConf?: number
+  minSearchConf?: number,
+  requireBookMatch?: boolean
 ) {
   const urlKey = urls.map((u) => u.trim().toLowerCase()).filter(Boolean).sort().join("|");
   const hintKey = hints
@@ -190,7 +193,8 @@ function makeCacheKey(
     (publisher || "").toLowerCase().trim(),
     (isbn || "").replace(/[-\s]/g, ""),
     includeSearch ? "search" : "nosearch",
-    String(minSearchConf ?? DEFAULT_MIN_SEARCH_CONFIDENCE)
+    String(minSearchConf ?? DEFAULT_MIN_SEARCH_CONFIDENCE),
+    requireBookMatch ? "reqbook" : "noreqbook"
   ].join("::");
 }
 function getCached(key: string): CacheValue | null {
@@ -276,6 +280,10 @@ function jaccard(a: string[] | string, b: string[] | string) {
 function containsAll(hay: string[], needles: string[]) {
   const H = new Set(hay);
   return needles.every((n) => H.has(n));
+}
+function containsAny(hay: string[], needles: string[]) {
+  const H = new Set(hay);
+  return needles.some((n) => H.has(n));
 }
 function startsWithAll(hay: string[], needles: string[]) {
   const h = hay.join(" ");
@@ -463,6 +471,14 @@ function contentHasAuthorAndBook(pageText: string, authorName: string, bookTitle
   const bookOK   = jaccard(tBook, t)   >= 0.25 || containsAll(t, tBook);
   return authorOK && bookOK;
 }
+function contentHasAuthorOrBook(text: string, authorName: string, bookTitle: string): {author:boolean; book:boolean} {
+  const t = tokens(text);
+  const tAuthor = tokens(authorName);
+  const tBook   = tokens(bookTitle);
+  const authorOK = tAuthor.length ? (jaccard(tAuthor, t) >= 0.2 || containsAll(t, tAuthor)) : false;
+  const bookOK   = tBook.length   ? (jaccard(tBook, t)   >= 0.2 || containsAll(t, tBook))   : false;
+  return { author: authorOK, book: bookOK };
+}
 function tokensWithinProximity(text: string, a: string[], b: string[], windowSize = 60): boolean {
   const t = tokens(text);
   if (!a.length || !b.length || !t.length) return false;
@@ -477,6 +493,21 @@ function tokensWithinProximity(text: string, a: string[], b: string[], windowSiz
     if (hasA && hasB) return true;
   }
   return false;
+}
+const INTERVIEW_KEYWORDS = [
+  "interview", "conversation", "in conversation", "q&a", "qa", "ask me anything",
+  "talks", "dialogue", "fireside", "panel", "live", "podcast", "transcript"
+];
+function contentHasInterviewSignals(text: string): boolean {
+  const t = tokens(text);
+  const k = INTERVIEW_KEYWORDS.flatMap(tokens);
+  return containsAny(t, k);
+}
+function titleHasAuthor(authorName: string, title: string): boolean {
+  const a = tokens(authorName);
+  const t = tokens(title);
+  const overlap = new Set(a.filter((x) => new Set(t).has(x)));
+  return overlap.size >= Math.min(2, a.length);
 }
 
 /* ===== Shopping/product-page detection ===== */
@@ -700,8 +731,8 @@ async function evaluateFeeds(feeds: string[], lookback: number, ctx: Context) {
 function negativeSiteOperators(domains: string[]): string {
   return domains.map((d: string) => `-site:${d}`).join(" ");
 }
-function buildQuery(authorName: string, bookTitle: string, extra?: string) {
-  const base = `"${authorName}" "${bookTitle}"`;
+function buildQuery(authorName: string, bookTitle?: string, extra?: string) {
+  const base = bookTitle ? `"${authorName}" "${bookTitle}"` : `"${authorName}"`;
   const negatives = negativeSiteOperators(SEARCH_BLOCKLIST);
   return [base, extra, negatives].filter(Boolean).join(" ");
 }
@@ -720,11 +751,11 @@ function scoreWebHit(hit: WebHit, authorName: string, bookTitle: string): WebHit
   const authorMatch = tAuthor.length && (jaccard(tAuthor, tCombined) >= 0.3 || containsAll(tCombined, tAuthor));
   if (authorMatch) { score += 0.35; reasons.push("author_in_title_or_snippet"); }
 
-  // book presence
+  // book presence (soft bonus; not required)
   const bookMatch = tBook.length && (jaccard(tBook, tCombined) >= 0.3 || containsAll(tCombined, tBook));
   if (bookMatch) { score += 0.35; reasons.push("book_in_title_or_snippet"); }
 
-  // penalties
+  // mild penalties for non-articley shapes at URL level
   if (isLikelyHomepage(hit.url)) {
     score -= 0.25; reasons.push("penalty_homepage");
   } else if (!urlLooksArticleLike(hit.url)) {
@@ -744,10 +775,17 @@ async function webSearchBest(authorName: string, bookTitle: string, lookbackDays
   const dateRestrict = lookbackDays <= 7 ? "d7" : "d30";
 
   const variants: string[] = [
+    // strict pair
     buildQuery(authorName, bookTitle),
-    buildQuery(authorName, bookTitle, "interview OR conversation OR transcript OR Q&A"),
+    // interview style
+    buildQuery(authorName, bookTitle, 'interview OR "in conversation" OR transcript OR Q&A'),
+    // title anchors
     buildQuery(authorName, bookTitle, `intitle:"${lastName(authorName)}"`),
     buildQuery(authorName, bookTitle, `intitle:"${bookTitle}"`),
+    // author-only (recent), to catch fresh interviews without book mention in snippet
+    buildQuery(authorName, undefined, 'interview OR "in conversation" OR transcript OR Q&A'),
+    buildQuery(authorName, undefined, `intitle:"${lastName(authorName)}"`),
+    buildQuery(authorName, undefined, ``),
   ];
 
   for (const q of variants) {
@@ -866,6 +904,8 @@ export default async function handler(req: any, res: any) {
 
     const debug: boolean = body.debug === true;
     const strictAuthorMatch: boolean = body.strict_author_match === true;
+    const requireBookMatch: boolean = body.require_book_match === true;
+
     const minConfidence: number = typeof body.min_confidence === "number"
       ? Math.max(0, Math.min(1, body.min_confidence))
       : DEFAULT_MIN_CONFIDENCE;
@@ -891,7 +931,8 @@ export default async function handler(req: any, res: any) {
       author, knownUrls, lookback, hints,
       strictAuthorMatch, minConfidence,
       bookTitle, publisher, isbn,
-      includeSearch, minSearchConfidence
+      includeSearch, minSearchConfidence,
+      requireBookMatch
     );
     const cached = getCached(cacheKey);
     if (cached && !debug) {
@@ -903,7 +944,7 @@ export default async function handler(req: any, res: any) {
        Web search first (CSE), no allowlist
        ------------------------------------ */
     let bestSearch: WebHit | null = null;
-    if (includeSearch && USE_SEARCH && bookTitle) {
+    if (includeSearch && USE_SEARCH) {
       const hits = await webSearchBest(author, bookTitle, lookback);
 
       for (const cand of hits) {
@@ -915,7 +956,7 @@ export default async function handler(req: any, res: any) {
         const { html, text } = await fetchPageText(cand.url);
         if (!html || !text) continue;
 
-        // Block shopping / product pages explicitly
+        // Block shopping / product or store-like pages explicitly
         if (isShoppingLike(cand.url, html)) {
           continue;
         }
@@ -937,32 +978,44 @@ export default async function handler(req: any, res: any) {
         const pageDate = pageISO ? new Date(pageISO) : undefined;
         const pageFresh = pageDate && !isNaN(pageDate.getTime()) ? daysAgo(pageDate) <= lookback : false;
 
-        const confOK = boosted.confidence >= minSearchConfidence;
+        // Byline check
         const bylineOK = authorAppearsAsByline(html, author);
 
-        // TIER A: strictly content BY the author (byline present)
-        if (bylineOK && confOK && (pageFresh || !pageISO)) {
+        // Title & content presence
+        const hasAuthorInTitle = titleHasAuthor(author, cand.title);
+        const { author: authorInBody, book: bookInBody } = contentHasAuthorOrBook(text, author, bookTitle);
+        const hasInterviewSignal = contentHasInterviewSignals(text);
+
+        // ---- TIER A: BYLINE (content BY the author) ----
+        if (bylineOK && boosted.confidence >= minSearchConfidence && (pageFresh || !pageISO)) {
           boosted.reason = Array.from(new Set([...(boosted.reason || []), "accept_byline"]));
           bestSearch = boosted;
-          break; // stop at first acceptable article
+          break;
         }
 
-        // TIER B: participation (author featured, not credited as author)
-        const titleHasLastName = (() => {
-          const ln = lastName(author);
-          return !!ln && tokens(boosted.title).includes(ln);
-        })();
+        // ---- TIER B: FEATURED (author in title) ----
+        // Accept if fresh (or no date found), author in title, article-like, and confidence threshold.
+        // If require_book_match, also require either the book in body OR interview signals.
+        if (
+          hasAuthorInTitle &&
+          boosted.confidence >= Math.max(0, minSearchConfidence - 0.05) &&
+          (pageFresh || !pageISO) &&
+          (!requireBookMatch || bookInBody || hasInterviewSignal)
+        ) {
+          boosted.reason = Array.from(new Set([...(boosted.reason || []), "accept_featured_title"]));
+          bestSearch = boosted;
+          break;
+        }
 
-        const participationOK =
-          articleLike &&
-          pageFresh && // must be within window for Tier B
-          titleHasLastName &&
-          contentHasAuthorAndBook(text, author, bookTitle) &&
-          tokensWithinProximity(text, tokens(author), tokens(bookTitle), 60) &&
-          confOK;
-
-        if (participationOK) {
-          boosted.reason = Array.from(new Set([...(boosted.reason || []), "accept_participation"]));
+        // ---- TIER C: TOPICAL (author & book in body OR interview signals) ----
+        // When page is fresh, accept if author appears in body AND (book in body OR interview signals).
+        if (
+          (pageFresh || !pageISO) &&
+          authorInBody &&
+          (bookInBody || hasInterviewSignal) &&
+          boosted.confidence >= minSearchConfidence
+        ) {
+          boosted.reason = Array.from(new Set([...(boosted.reason || []), "accept_topical_body"]));
           bestSearch = boosted;
           break;
         }
