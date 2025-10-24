@@ -47,8 +47,8 @@ const LOOKBACK_DEFAULT = 30;                  // days
 const LOOKBACK_MIN = 1;
 const LOOKBACK_MAX = 90;
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;     // 24h
-const FETCH_TIMEOUT_MS = 4500;                // per network call
-const USER_AGENT = "AuthorUpdates/2.0 (+https://example.com)";
+const FETCH_TIMEOUT_MS = 5000;                // per network call
+const USER_AGENT = "AuthorUpdates/3.0 (+https://example.com)";
 const CONCURRENCY = 4;                        // feed checks in parallel (bounded)
 const MAX_FEED_CANDIDATES = 15;               // latency guard
 const MAX_KNOWN_URLS = 5;                     // abuse guard
@@ -57,18 +57,23 @@ const MAX_KNOWN_URLS = 5;                     // abuse guard
 const USE_SEARCH = !!(process.env.GOOGLE_CSE_KEY && process.env.GOOGLE_CSE_CX);
 const DEFAULT_MIN_SEARCH_CONFIDENCE = 0.7;
 const SEARCH_MAX_RESULTS = 10;
-const DOMAIN_WHITELIST = (process.env.SEARCH_DOMAIN_WHITELIST || "")
+
+// Strong global blocklist (negative site operators & runtime filtering)
+const SEARCH_BLOCKLIST: string[] = (process.env.SEARCH_BLOCKLIST ||
+  [
+    "x.com","twitter.com","facebook.com","instagram.com","tiktok.com","linkedin.com",
+    "youtube.com","youtu.be","reddit.com","news.ycombinator.com",
+    "medium.com","substack.com",
+    "github.com","gitlab.com","bitbucket.org",
+    "quora.com","pinterest.com","tumblr.com","notion.site","producthunt.com",
+    "dev.to","hashnode.com","stackexchange.com","stackoverflow.com","kaggle.com",
+    "patreon.com","t.me","discord.com","discord.gg"
+  ].join(","))
   .split(",")
-  .map((s) => s.trim().toLowerCase())
+  .map((s: string) => s.trim().toLowerCase())
   .filter(Boolean);
 
-// Soft blocklist to drop social/homepage-like noise & aggregators
-const SEARCH_BLOCKLIST = (process.env.SEARCH_BLOCKLIST || "x.com,twitter.com,facebook.com,instagram.com,tiktok.com,linkedin.com,youtube.com,yt.be,medium.com,substack.com,reddit.com,news.ycombinator.com")
-  .split(",")
-  .map((s) => s.trim().toLowerCase())
-  .filter(Boolean);
-
-/* ===== Identity scoring tunables ===== */
+/* ===== Identity scoring tunables (RSS fallback) ===== */
 const DEFAULT_MIN_CONFIDENCE = 0.6; // 0..1
 const STRICT_REJECT_PAYLOAD = { error: "no_confident_author_match" };
 
@@ -159,7 +164,10 @@ function makeCacheKey(
 ) {
   const urlKey = urls.map((u) => u.trim().toLowerCase()).filter(Boolean).sort().join("|");
   const hintKey = hints
-    ? JSON.stringify(Object.keys(hints as Record<string, unknown>).sort().reduce((o: any, k: string) => ((o[k] = (hints as any)[k]), o), {}))
+    ? JSON.stringify(Object.keys(hints as Record<string, unknown>).sort().reduce((o: Record<string, unknown>, k: string) => {
+        (o as any)[k] = (hints as any)[k];
+        return o;
+      }, {}))
     : "";
   return [
     author.trim().toLowerCase(),
@@ -275,6 +283,10 @@ function itemText(it: any): string {
   ].filter(Boolean);
   return String(bits.join(" ").slice(0, 5000));
 }
+function lastName(s: string): string {
+  const parts = tokens(s);
+  return parts.length ? parts[parts.length - 1] : "";
+}
 
 /* =============================
    URL heuristics (home/index/article detection)
@@ -287,7 +299,6 @@ function isLikelyHomepage(u: string): boolean {
     return (clean === "" || depth <= 1) && (!search || search === "");
   } catch { return false; }
 }
-
 function urlLooksArticleLike(u: string): boolean {
   try {
     const { pathname } = new URL(u);
@@ -298,7 +309,6 @@ function urlLooksArticleLike(u: string): boolean {
     return depth >= 2 || hasDateSeg || longSlug;
   } catch { return false; }
 }
-
 function isIndexLikeUrl(u: string): boolean {
   try {
     const url = new URL(u);
@@ -404,10 +414,34 @@ function authorAppearsAsByline(html: string, authorName: string): boolean {
   return namesRoughMatch(authorName, byline);
 }
 
-/* ====== Additional helpers for Tier-B acceptance ====== */
-function lastName(s: string): string {
-  const parts = tokens(s);
-  return parts.length ? parts[parts.length - 1] : "";
+/* ===== Article-shape signals ===== */
+function looksSchemaArticle(html: string): boolean {
+  const scripts = html.match(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
+  for (const tag of scripts) {
+    const m = tag.match(/<script[^>]*>([\s\S]*?)<\/script>/i);
+    const json = m?.[1]?.trim();
+    if (!json) continue;
+    try {
+      const data = JSON.parse(json);
+      const arr = Array.isArray(data) ? data : [data];
+      for (const obj of arr) {
+        const t = String(obj?.["@type"] || obj?.type || "");
+        if (/Article|NewsArticle|BlogPosting/i.test(t)) return true;
+      }
+    } catch { /* ignore */ }
+  }
+  return false;
+}
+function ogTypeIsArticle(html: string): boolean {
+  const m = html.match(/<meta[^>]+property=["']og:type["'][^>]+content=["']([^"']+)["']/i)?.[1];
+  return !!m && /article/i.test(m);
+}
+function paragraphCountFromHtml(html: string): number {
+  const ps = html.match(/<p\b[^>]*>[\s\S]*?<\/p>/gi);
+  return ps ? ps.length : 0;
+}
+function textLengthOk(text: string, minChars = 1500): boolean {
+  return text.replace(/\s+/g, " ").length >= minChars;
 }
 function contentHasAuthorAndBook(pageText: string, authorName: string, bookTitle: string): boolean {
   const t = tokens(pageText);
@@ -419,9 +453,25 @@ function contentHasAuthorAndBook(pageText: string, authorName: string, bookTitle
   const bookOK   = jaccard(tBook, t)   >= 0.25 || containsAll(t, tBook);
   return authorOK && bookOK;
 }
+function tokensWithinProximity(text: string, a: string[], b: string[], windowSize = 60): boolean {
+  const t = tokens(text);
+  if (!a.length || !b.length || !t.length) return false;
+  // simple proximity: check windows around the first token of A
+  const firstA = a[0];
+  for (let i = 0; i < t.length; i++) {
+    if (t[i] !== firstA) continue;
+    const start = Math.max(0, i - windowSize);
+    const end = Math.min(t.length, i + a.length + windowSize);
+    const window = t.slice(start, end);
+    const hasA = containsAll(window, a);
+    const hasB = window.includes(b[0]) || jaccard(window, b) >= 0.2;
+    if (hasA && hasB) return true;
+  }
+  return false;
+}
 
 /* =============================
-   Feed candidates
+   Feed candidates (RSS fallback)
    ============================= */
 async function findFeeds(author: string, knownUrls: string[] = [], hints?: PlatformHints): Promise<string[]> {
   const candidates = new Set<string>();
@@ -608,8 +658,17 @@ async function evaluateFeeds(feeds: string[], lookback: number, ctx: Context) {
 }
 
 /* =============================
-   Google CSE multi-query search + filters
+   Google CSE search (no allowlist, strong negatives)
    ============================= */
+function negativeSiteOperators(domains: string[]): string {
+  return domains.map((d: string) => `-site:${d}`).join(" ");
+}
+function buildQuery(authorName: string, bookTitle: string, extra?: string) {
+  const base = `"${authorName}" "${bookTitle}"`;
+  const negatives = negativeSiteOperators(SEARCH_BLOCKLIST);
+  return [base, extra, negatives].filter(Boolean).join(" ");
+}
+
 function scoreWebHit(hit: WebHit, authorName: string, bookTitle: string): WebHit {
   const reasons: string[] = [];
   let score = 0;
@@ -628,10 +687,6 @@ function scoreWebHit(hit: WebHit, authorName: string, bookTitle: string): WebHit
   const bookMatch = tBook.length && (jaccard(tBook, tCombined) >= 0.3 || containsAll(tCombined, tBook));
   if (bookMatch) { score += 0.35; reasons.push("book_in_title_or_snippet"); }
 
-  // domain whitelist bonus
-  const host = hit.host.toLowerCase();
-  if (DOMAIN_WHITELIST.includes(host)) { score += 0.15; reasons.push(`domain_whitelist:${host}`); }
-
   // penalties
   if (isLikelyHomepage(hit.url)) {
     score -= 0.25; reasons.push("penalty_homepage");
@@ -647,50 +702,50 @@ function scoreWebHit(hit: WebHit, authorName: string, bookTitle: string): WebHit
   return hit;
 }
 
-function buildSiteFilter(domains: string[]): string {
-  const d = Array.from(new Set(domains.map((h) => h.toLowerCase().trim()).filter(Boolean)));
-  return d.length ? d.map((h) => `site:${h}`).join(" OR ") : "";
-}
-
 async function webSearchBest(authorName: string, bookTitle: string, lookbackDays: number): Promise<WebHit[]> {
   if (!process.env.GOOGLE_CSE_KEY || !process.env.GOOGLE_CSE_CX) return [];
-  const base = `"${authorName}" "${bookTitle}"`;
-  const siteFilter = buildSiteFilter(DOMAIN_WHITELIST);
   const dateRestrict = lookbackDays <= 7 ? "d7" : "d30";
 
   const variants: string[] = [
-    siteFilter ? `${base} (${siteFilter})` : base,
-    siteFilter ? `${base} (${siteFilter}) interview` : `${base} interview`,
-    siteFilter ? `${base} (${siteFilter}) conversation` : `${base} conversation`,
+    buildQuery(authorName, bookTitle),
+    buildQuery(authorName, bookTitle, "interview OR conversation OR transcript OR Q&A"),
+    buildQuery(authorName, bookTitle, `intitle:"${lastName(authorName)}"`),
+    buildQuery(authorName, bookTitle, `intitle:"${bookTitle}"`),
   ];
 
   for (const q of variants) {
-    const url = new URL("https://www.googleapis.com/customsearch/v1");
-    url.searchParams.set("key", process.env.GOOGLE_CSE_KEY!);
-    url.searchParams.set("cx", process.env.GOOGLE_CSE_CX!);
-    url.searchParams.set("q", q);
-    url.searchParams.set("num", String(SEARCH_MAX_RESULTS));
-    url.searchParams.set("dateRestrict", dateRestrict);
+    for (const start of [1, 11, 21]) { // fetch up to 3 pages
+      const url = new URL("https://www.googleapis.com/customsearch/v1");
+      url.searchParams.set("key", process.env.GOOGLE_CSE_KEY!);
+      url.searchParams.set("cx", process.env.GOOGLE_CSE_CX!);
+      url.searchParams.set("q", q);
+      url.searchParams.set("num", String(SEARCH_MAX_RESULTS));
+      url.searchParams.set("dateRestrict", dateRestrict);
+      url.searchParams.set("start", String(start));
 
-    const resp = await fetchWithTimeout(url.toString());
-    if (!resp?.ok) continue;
-    const data: any = await resp.json();
-    const items: any[] = Array.isArray(data?.items) ? data.items : [];
-    if (!items.length) continue;
+      const resp = await fetchWithTimeout(url.toString());
+      if (!resp?.ok) continue;
+      const data: any = await resp.json();
+      const items: any[] = Array.isArray(data?.items) ? data.items : [];
+      if (!items.length) continue;
 
-    const hits: WebHit[] = items.map((it: any): WebHit => {
-      const title = String(it.title || "");
-      const link = String(it.link || "");
-      const snippet = String(it.snippet || "");
-      const host = hostOf(link);
-      return { title, url: link, snippet, host, publishedAt: undefined, confidence: 0, reason: [] };
-    }).filter((h: WebHit) => !SEARCH_BLOCKLIST.includes(h.host));
+      const hits: WebHit[] = items
+        .map((it: any): WebHit => {
+          const title = String(it.title || "");
+          const link = String(it.link || "");
+          const snippet = String(it.snippet || "");
+          const host = hostOf(link);
+          return { title, url: link, snippet, host, publishedAt: undefined, confidence: 0, reason: [] };
+        })
+        .filter((h: WebHit) => !SEARCH_BLOCKLIST.includes(h.host));
 
-    if (hits.length) {
-      return hits
-        .map((h: WebHit) => scoreWebHit(h, authorName, bookTitle))
-        .sort((a: WebHit, b: WebHit) => b.confidence - a.confidence)
-        .slice(0, SEARCH_MAX_RESULTS);
+      if (hits.length) {
+        const scored: WebHit[] = hits
+          .map((h: WebHit) => scoreWebHit(h, authorName, bookTitle))
+          .sort((a: WebHit, b: WebHit) => b.confidence - a.confidence)
+          .slice(0, SEARCH_MAX_RESULTS);
+        if (scored.length) return scored;
+      }
     }
   }
 
@@ -807,11 +862,9 @@ export default async function handler(req: any, res: any) {
       return res.status(200).json(cached);
     }
 
-    // Build RSS/Atom candidates (kept as fallback)
-    const baseFeeds = await findFeeds(author, knownUrls, hints);
-    const feeds = Array.from(new Set(baseFeeds));
-
-    // Google CSE best-of search (multi-variant) + page-content & byline verification (Tiered)
+    /* ------------------------------------
+       Web search first (CSE), no allowlist
+       ------------------------------------ */
     let bestSearch: WebHit | null = null;
     if (includeSearch && USE_SEARCH && bookTitle) {
       const hits = await webSearchBest(author, bookTitle, lookback);
@@ -821,43 +874,49 @@ export default async function handler(req: any, res: any) {
         if (isIndexLikeUrl(cand.url) || isLikelyHomepage(cand.url) || !urlLooksArticleLike(cand.url)) {
           continue;
         }
-
+        // Fetch page
         const { html, text } = await fetchPageText(cand.url);
+        if (!html || !text) continue;
+
+        // Article-shape checks
+        const articleLike =
+          looksSchemaArticle(html) ||
+          ogTypeIsArticle(html) ||
+          paragraphCountFromHtml(html) >= 3 ||
+          textLengthOk(text);
+
+        if (!articleLike) continue;
+
+        // Score boost based on body content
         const boosted = boostIfContentMatches(cand, author, bookTitle, text);
 
         // Extract publish date & verify byline on page
-        const pageISO = html ? extractPublishDateISO(html) : undefined;
+        const pageISO = extractPublishDateISO(html);
         const pageDate = pageISO ? new Date(pageISO) : undefined;
         const pageFresh = pageDate && !isNaN(pageDate.getTime()) ? daysAgo(pageDate) <= lookback : false;
 
-        const whitelisted = DOMAIN_WHITELIST.includes(boosted.host);
-        const confOK = boosted.confidence >= (whitelisted ? minSearchConfidence : (minSearchConfidence + 0.1));
-        const bylineOK = html ? authorAppearsAsByline(html, author) : false;
+        const confOK = boosted.confidence >= minSearchConfidence;
+        const bylineOK = authorAppearsAsByline(html, author);
 
-        // TIER A: strictly content BY the author
-        if (bylineOK && confOK && (pageFresh || (!pageISO && whitelisted))) {
+        // TIER A: strictly content BY the author (byline present)
+        if (bylineOK && confOK && (pageFresh || !pageISO)) {
           boosted.reason = Array.from(new Set([...(boosted.reason || []), "accept_byline"]));
           bestSearch = boosted;
           break; // stop at first acceptable article
         }
 
         // TIER B: participation (author featured, not credited as author)
-        // Requirements:
-        // - whitelisted domain
-        // - article-like, not homepage/index (already screened above)
-        // - pageFresh (must have a publish date within window; stricter than Tier A)
-        // - page text contains author AND book
-        // - title includes author last name (cheap sanity)
         const titleHasLastName = (() => {
           const ln = lastName(author);
           return !!ln && tokens(boosted.title).includes(ln);
         })();
 
         const participationOK =
-          whitelisted &&
-          pageFresh &&
+          articleLike &&
+          pageFresh && // must be within window for Tier B
           titleHasLastName &&
           contentHasAuthorAndBook(text, author, bookTitle) &&
+          tokensWithinProximity(text, tokens(author), tokens(bookTitle), 60) &&
           confOK;
 
         if (participationOK) {
@@ -897,16 +956,18 @@ export default async function handler(req: any, res: any) {
       return res.status(200).json(payload);
     }
 
-    // Evaluate feeds and identity scoring as fallback
+    /* ------------------------------------
+       RSS/Atom fallback with identity scoring
+       ------------------------------------ */
+    const baseFeeds = await findFeeds(author, knownUrls, hints);
+    const feeds = Array.from(new Set(baseFeeds));
     const { choice, results } = await evaluateFeeds(feeds, lookback, ctx);
 
-    // Strict author matching gate
     if (strictAuthorMatch && (!choice || choice.confidence < minConfidence)) {
       res.setHeader("x-cache", "MISS");
       return res.status(200).json(STRICT_REJECT_PAYLOAD);
     }
 
-    // Build debug helper
     const buildDebug = (list: EvalResult[]) =>
       list.slice(0, 5).map((r: EvalResult) => ({
         feedUrl: r.feedUrl,
