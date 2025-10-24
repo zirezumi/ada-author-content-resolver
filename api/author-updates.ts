@@ -8,6 +8,42 @@ import pLimit from "p-limit";
 export const config = { runtime: "nodejs" } as const;
 
 /* =============================
+   Auth
+   ============================= */
+// Comma-separated list of valid secrets, e.g. "s1,s2"
+const AUTH_SECRETS = (process.env.AUTHOR_UPDATES_SECRET || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+// In local dev you can set SKIP_AUTH=true to bypass auth checks.
+const SKIP_AUTH = (process.env.SKIP_AUTH || "").toLowerCase() === "true";
+
+function headerCI(req: any, name: string): string | undefined {
+  // case-insensitive header getter
+  if (!req?.headers) return undefined;
+  const entries = Object.entries(req.headers) as Array<[string, string]>;
+  const hit = entries.find(([k]) => k.toLowerCase() === name.toLowerCase());
+  return hit?.[1];
+}
+
+function requireAuth(req: any, res: any): boolean {
+  if (SKIP_AUTH) return true;
+  if (!AUTH_SECRETS.length) {
+    // No secrets defined in env; lock down by default
+    res.status(500).json({ error: "server_misconfigured: missing AUTHOR_UPDATES_SECRET" });
+    return false;
+  }
+  const provided = (headerCI(req, "x-auth") || "").trim();
+  const ok = provided && AUTH_SECRETS.includes(provided);
+  if (!ok) {
+    res.status(401).json({ error: "unauthorized" });
+    return false;
+  }
+  return true;
+}
+
+/* =============================
    Tunables
    ============================= */
 const LOOKBACK_DEFAULT = 30;                  // days
@@ -31,7 +67,6 @@ type CacheValue = {
   published_at?: string;
   source?: string;
   author_url?: string;
-  // debug field only when requested
   _debug?: Array<{
     feedUrl: string;
     ok: boolean;
@@ -130,11 +165,11 @@ function sourceFromUrl(url?: string) {
 function guessFeedsFromSite(site: string): string[] {
   const clean = site.replace(/\/+$/, "");
   return [
-    `${clean}/feed`,      // WordPress/Ghost/Hugo often expose this
+    `${clean}/feed`,
     `${clean}/rss.xml`,
     `${clean}/atom.xml`,
     `${clean}/index.xml`,
-    `${clean}/?feed=rss2`, // WordPress
+    `${clean}/?feed=rss2`,
   ];
 }
 
@@ -346,14 +381,8 @@ export default async function handler(req: any, res: any) {
       return res.status(405).json({ error: "POST required" });
     }
 
-    // Optional shared-secret auth
-    const expect = process.env.AUTHOR_UPDATES_SECRET;
-    const gotHeader = (req.headers["x-auth"] ||
-      (req.headers["X-Auth"] as string) ||
-      "") as string;
-    if (expect && gotHeader !== expect) {
-      return res.status(401).json({ error: "unauthorized" });
-    }
+    // 🔒 Shared-secret authentication
+    if (!requireAuth(req, res)) return;
 
     // Parse body (Vercel often already parsed JSON)
     const bodyRaw = req.body ?? {};
@@ -462,7 +491,6 @@ export default async function handler(req: any, res: any) {
     res.setHeader("x-cache", "MISS");
     return res.status(200).json(empty);
   } catch (err: unknown) {
-    // Ensure JSON error response on unexpected failures
     const message = (err as Error)?.message || "internal_error";
     console.error("handler_error", message);
     return res.status(500).json({ error: message });
