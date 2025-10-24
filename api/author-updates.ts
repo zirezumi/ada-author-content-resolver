@@ -67,8 +67,7 @@ const SEARCH_BLOCKLIST: string[] = (process.env.SEARCH_BLOCKLIST ||
     // Socials/UGC
     "x.com","twitter.com","facebook.com","instagram.com","tiktok.com","linkedin.com",
     "youtube.com","youtu.be","reddit.com","news.ycombinator.com",
-    "medium.com", // keep Medium blocked to avoid author home feeds dominating
-    // "substack.com",  <-- intentionally NOT blocked
+    "medium.com", "substack.com", "spotify.com",
     "quora.com","pinterest.com","tumblr.com","notion.site",
     "producthunt.com","dev.to","hashnode.com","stackexchange.com","stackoverflow.com","kaggle.com",
     "patreon.com","t.me","discord.com","discord.gg",
