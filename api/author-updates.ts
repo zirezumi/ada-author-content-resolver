@@ -48,7 +48,7 @@ const LOOKBACK_MIN = 1;
 const LOOKBACK_MAX = 90;
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;     // 24h
 const FETCH_TIMEOUT_MS = 4500;                // per network call
-const USER_AGENT = "AuthorUpdates/1.8 (+https://example.com)";
+const USER_AGENT = "AuthorUpdates/1.9 (+https://example.com)";
 const CONCURRENCY = 4;                        // feed checks in parallel (bounded)
 const MAX_FEED_CANDIDATES = 15;               // latency guard
 const MAX_KNOWN_URLS = 5;                     // abuse guard
@@ -62,8 +62,8 @@ const DOMAIN_WHITELIST = (process.env.SEARCH_DOMAIN_WHITELIST || "")
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 
-// NEW: soft blocklist to drop social/homepages noise
-const SEARCH_BLOCKLIST = (process.env.SEARCH_BLOCKLIST || "x.com,twitter.com,facebook.com,instagram.com,tiktok.com,linkedin.com,youtube.com,yt.be,medium.com,substack.com")
+// Soft blocklist to drop social/homepage-like noise & aggregators
+const SEARCH_BLOCKLIST = (process.env.SEARCH_BLOCKLIST || "x.com,twitter.com,facebook.com,instagram.com,tiktok.com,linkedin.com,youtube.com,yt.be,medium.com,substack.com,reddit.com,news.ycombinator.com")
   .split(",")
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
@@ -248,8 +248,9 @@ function isHttpUrl(s: string) { try { const u = new URL(s); return u.protocol ==
 function tokens(s: string): string[] {
   return s.toLowerCase().normalize("NFKC").replace(/[^\p{L}\p{N}\s.-]/gu, " ").split(/[\s.-]+/).filter(Boolean);
 }
-function jaccard(a: string[], b: string[]) {
-  const A = new Set(a); const B = new Set(b);
+function jaccard(a: string[] | string, b: string[] | string) {
+  const A = new Set(typeof a === "string" ? a.split(" ") : a);
+  const B = new Set(typeof b === "string" ? b.split(" ") : b);
   const inter = [...A].filter((x) => B.has(x)).length;
   const uni = new Set([...A, ...B]).size;
   return uni ? inter / uni : 0;
@@ -276,7 +277,7 @@ function itemText(it: any): string {
 }
 
 /* =============================
-   URL heuristics (demote homepages; prefer article-like)
+   URL heuristics (home/index/article detection)
    ============================= */
 function isLikelyHomepage(u: string): boolean {
   try {
@@ -295,6 +296,25 @@ function urlLooksArticleLike(u: string): boolean {
     const hasDateSeg = /\b(20\d{2})[\/\-]/.test(pathname);
     const longSlug = parts.some((p) => p.length >= 12);
     return depth >= 2 || hasDateSeg || longSlug;
+  } catch { return false; }
+}
+
+function isIndexLikeUrl(u: string): boolean {
+  try {
+    const url = new URL(u);
+    const p = url.pathname.toLowerCase();
+    if (p === "/" || p === "") return true;
+    const patterns = [
+      "/topic/", "/topics/", "/tag/", "/tags/",
+      "/category/", "/categories/", "/section/", "/sections/",
+      "/search/", "/archive/", "/author/", "/authors/"
+    ];
+    if (patterns.some((seg) => p.includes(seg))) return true;
+    const qp = Array.from(url.searchParams.keys()).map((k) => k.toLowerCase());
+    if (qp.includes("page") || qp.includes("topic") || qp.includes("tag")) return true;
+    const depth = p.split("/").filter(Boolean).length;
+    if (depth <= 1 && url.search && url.search.length > 0) return true;
+    return false;
   } catch { return false; }
 }
 
@@ -318,6 +338,70 @@ function extractPublishDateISO(html: string): string | undefined {
     if (!isNaN(new Date(iso).getTime())) return iso;
   }
   return undefined;
+}
+
+/* =============================
+   Byline extraction & verification
+   ============================= */
+function normalizeSpaces(s: string) {
+  return s.replace(/\s+/g, " ").trim();
+}
+function namesRoughMatch(target: string, candidate: string): boolean {
+  const t = tokens(target).join(" ");
+  const c = tokens(candidate).join(" ");
+  if (!t || !c) return false;
+  if (c.includes(t) || t.includes(c)) return true;
+  const j = jaccard(t, c);
+  return j >= 0.6;
+}
+function extractBylineFromHtml(html: string): string | null {
+  const metas: RegExp[] = [
+    /<meta[^>]+name=["']author["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+property=["']article:author["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+name=["']byline["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+name=["']byl["'][^>]+content=["']([^"']+)["']/i, // NYT
+    /<meta[^>]+property=["']og:author["'][^>]+content=["']([^"']+)["']/i,
+  ];
+  for (const rx of metas) {
+    const m = html.match(rx);
+    if (m?.[1]) return normalizeSpaces(m[1]);
+  }
+
+  const scripts = html.match(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
+  for (const tag of scripts) {
+    const m = tag.match(/<script[^>]*>([\s\S]*?)<\/script>/i);
+    const json = m?.[1]?.trim();
+    if (!json) continue;
+    try {
+      const data = JSON.parse(json);
+      const candidates: any[] = Array.isArray(data) ? data : [data];
+      for (const obj of candidates) {
+        const t = (obj?.["@type"] || obj?.type || "");
+        if (/Article|NewsArticle|BlogPosting/i.test(String(t))) {
+          const author = (obj as any).author;
+          if (typeof author === "string") return normalizeSpaces(author);
+          if (author && typeof author === "object") {
+            if (Array.isArray(author)) {
+              const first = author.find((a: any) => a?.name);
+              if (first?.name) return normalizeSpaces(first.name);
+            } else if ((author as any).name) {
+              return normalizeSpaces((author as any).name);
+            }
+          }
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
+  const bylineMatch = html.match(/>By\s+([A-Z][A-Za-z'.\-]+\s+(?:[A-Z][A-Za-z'.\-]+\s*){0,3})</i);
+  if (bylineMatch?.[1]) return normalizeSpaces(bylineMatch[1]);
+
+  return null;
+}
+function authorAppearsAsByline(html: string, authorName: string): boolean {
+  const byline = extractBylineFromHtml(html);
+  if (!byline) return false;
+  return namesRoughMatch(authorName, byline);
 }
 
 /* =============================
@@ -367,7 +451,7 @@ async function findFeeds(author: string, knownUrls: string[] = [], hints?: Platf
 }
 
 /* =============================
-   Identity scoring + evaluation
+   Identity scoring + evaluation (RSS fallback)
    ============================= */
 async function fetchSiteTitle(url: string): Promise<string | null> {
   try {
@@ -508,7 +592,7 @@ async function evaluateFeeds(feeds: string[], lookback: number, ctx: Context) {
 }
 
 /* =============================
-   Google CSE multi-query search + filters (Option 2)
+   Google CSE multi-query search + filters
    ============================= */
 function scoreWebHit(hit: WebHit, authorName: string, bookTitle: string): WebHit {
   const reasons: string[] = [];
@@ -532,11 +616,14 @@ function scoreWebHit(hit: WebHit, authorName: string, bookTitle: string): WebHit
   const host = hit.host.toLowerCase();
   if (DOMAIN_WHITELIST.includes(host)) { score += 0.15; reasons.push(`domain_whitelist:${host}`); }
 
-  // homepage / shallow penalties
+  // penalties
   if (isLikelyHomepage(hit.url)) {
     score -= 0.25; reasons.push("penalty_homepage");
   } else if (!urlLooksArticleLike(hit.url)) {
     score -= 0.1; reasons.push("penalty_not_article_like");
+  }
+  if (isIndexLikeUrl(hit.url)) {
+    score -= 0.4; reasons.push("penalty_index_like");
   }
 
   hit.confidence = Math.max(0, Math.min(1, score));
@@ -581,9 +668,7 @@ async function webSearchBest(authorName: string, bookTitle: string, lookbackDays
       const snippet = String(it.snippet || "");
       const host = hostOf(link);
       return { title, url: link, snippet, host, publishedAt: undefined, confidence: 0, reason: [] };
-    })
-    // Drop social & obvious noise
-    .filter((h: WebHit) => !SEARCH_BLOCKLIST.includes(h.host));
+    }).filter((h: WebHit) => !SEARCH_BLOCKLIST.includes(h.host));
 
     if (hits.length) {
       return hits
@@ -710,26 +795,33 @@ export default async function handler(req: any, res: any) {
     const baseFeeds = await findFeeds(author, knownUrls, hints);
     const feeds = Array.from(new Set(baseFeeds));
 
-    // Google CSE best-of search (multi-variant) + page-content verification
+    // Google CSE best-of search (multi-variant) + page-content & byline verification
     let bestSearch: WebHit | null = null;
     if (includeSearch && USE_SEARCH && bookTitle) {
       const hits = await webSearchBest(author, bookTitle, lookback);
-      const top = hits[0];
-      if (top) {
-        const { html, text } = await fetchPageText(top.url);
-        const boosted = boostIfContentMatches(top, author, bookTitle, text);
 
-        // Try extracting publish date from page content
+      for (const cand of hits) {
+        // Early URL filters
+        if (isIndexLikeUrl(cand.url) || isLikelyHomepage(cand.url) || !urlLooksArticleLike(cand.url)) {
+          continue;
+        }
+
+        const { html, text } = await fetchPageText(cand.url);
+        const boosted = boostIfContentMatches(cand, author, bookTitle, text);
+
+        // Extract publish date & verify byline on page
         const pageISO = html ? extractPublishDateISO(html) : undefined;
         const pageDate = pageISO ? new Date(pageISO) : undefined;
         const pageFresh = pageDate && !isNaN(pageDate.getTime()) ? daysAgo(pageDate) <= lookback : false;
 
         const whitelisted = DOMAIN_WHITELIST.includes(boosted.host);
-        const articleLike = urlLooksArticleLike(boosted.url) && !isLikelyHomepage(boosted.url);
         const confOK = boosted.confidence >= (whitelisted ? minSearchConfidence : (minSearchConfidence + 0.1));
+        const bylineOK = html ? authorAppearsAsByline(html, author) : false;
 
-        if (articleLike && confOK && (pageFresh || (!pageISO && whitelisted))) {
+        // Accept strictly content BY the author
+        if (bylineOK && confOK && (pageFresh || (!pageISO && whitelisted))) {
           bestSearch = boosted;
+          break; // stop at first acceptable article
         }
       }
     }
