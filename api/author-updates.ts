@@ -98,7 +98,7 @@ const BLOCKED_HOST_PARTS: string[] = [
   "audible.com",
   // etc
   "substack.com",
-  "barbican.com"
+  "barbican.org"
 ];
 
 const INDEX_PATH_HINTS = [
