@@ -4,13 +4,13 @@
   "scripts": {
     "dev": "vercel dev",
     "typecheck": "tsc --noEmit",
-    "build": "echo \"no build step\""
+    "build": "tsc --noEmit"
   },
   "dependencies": {
     "rss-parser": "^3.13.0"
   },
   "devDependencies": {
-    "@types/node": "^24.9.1",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "@types/node": "^20.11.0"
   }
 }

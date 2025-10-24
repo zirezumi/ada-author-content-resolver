@@ -1,3 +1,4 @@
+/// <reference types="node" />
 // api/author-updates.ts
 import Parser from "rss-parser";
 // import type { VercelRequest, VercelResponse } from '@vercel/node'  // optional types if you add @vercel/node
