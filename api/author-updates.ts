@@ -48,7 +48,7 @@ const LOOKBACK_MIN = 1;
 const LOOKBACK_MAX = 90;
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;     // 24h
 const FETCH_TIMEOUT_MS = 4500;                // per network call
-const USER_AGENT = "AuthorUpdates/1.9 (+https://example.com)";
+const USER_AGENT = "AuthorUpdates/2.0 (+https://example.com)";
 const CONCURRENCY = 4;                        // feed checks in parallel (bounded)
 const MAX_FEED_CANDIDATES = 15;               // latency guard
 const MAX_KNOWN_URLS = 5;                     // abuse guard
@@ -276,23 +276,6 @@ function itemText(it: any): string {
   return String(bits.join(" ").slice(0, 5000));
 }
 
-function lastName(s: string): string {
-  const parts = tokens(s);
-  return parts.length ? parts[parts.length - 1] : "";
-}
-
-function contentHasAuthorAndBook(pageText: string, authorName: string, bookTitle: string): boolean {
-  const t = tokens(pageText);
-  const tAuthor = tokens(authorName);
-  const tBook = tokens(bookTitle);
-  if (!t.length || !tAuthor.length || !tBook.length) return false;
-
-  const authorOK = jaccard(tAuthor, t) >= 0.25 || containsAll(t, tAuthor);
-  const bookOK   = jaccard(tBook, t)   >= 0.25 || containsAll(t, tBook);
-  return authorOK && bookOK;
-}
-
-
 /* =============================
    URL heuristics (home/index/article detection)
    ============================= */
@@ -419,6 +402,22 @@ function authorAppearsAsByline(html: string, authorName: string): boolean {
   const byline = extractBylineFromHtml(html);
   if (!byline) return false;
   return namesRoughMatch(authorName, byline);
+}
+
+/* ====== Additional helpers for Tier-B acceptance ====== */
+function lastName(s: string): string {
+  const parts = tokens(s);
+  return parts.length ? parts[parts.length - 1] : "";
+}
+function contentHasAuthorAndBook(pageText: string, authorName: string, bookTitle: string): boolean {
+  const t = tokens(pageText);
+  const tAuthor = tokens(authorName);
+  const tBook = tokens(bookTitle);
+  if (!t.length || !tAuthor.length || !tBook.length) return false;
+
+  const authorOK = jaccard(tAuthor, t) >= 0.25 || containsAll(t, tAuthor);
+  const bookOK   = jaccard(tBook, t)   >= 0.25 || containsAll(t, tBook);
+  return authorOK && bookOK;
 }
 
 /* =============================
@@ -812,7 +811,7 @@ export default async function handler(req: any, res: any) {
     const baseFeeds = await findFeeds(author, knownUrls, hints);
     const feeds = Array.from(new Set(baseFeeds));
 
-    // Google CSE best-of search (multi-variant) + page-content & byline verification
+    // Google CSE best-of search (multi-variant) + page-content & byline verification (Tiered)
     let bestSearch: WebHit | null = null;
     if (includeSearch && USE_SEARCH && bookTitle) {
       const hits = await webSearchBest(author, bookTitle, lookback);
@@ -837,10 +836,11 @@ export default async function handler(req: any, res: any) {
 
         // TIER A: strictly content BY the author
         if (bylineOK && confOK && (pageFresh || (!pageISO && whitelisted))) {
+          boosted.reason = Array.from(new Set([...(boosted.reason || []), "accept_byline"]));
           bestSearch = boosted;
-          break;
-          }
-         
+          break; // stop at first acceptable article
+        }
+
         // TIER B: participation (author featured, not credited as author)
         // Requirements:
         // - whitelisted domain
@@ -852,15 +852,16 @@ export default async function handler(req: any, res: any) {
           const ln = lastName(author);
           return !!ln && tokens(boosted.title).includes(ln);
         })();
-        
+
         const participationOK =
           whitelisted &&
           pageFresh &&
           titleHasLastName &&
           contentHasAuthorAndBook(text, author, bookTitle) &&
-          confOK; // keep confidence threshold
-         
+          confOK;
+
         if (participationOK) {
+          boosted.reason = Array.from(new Set([...(boosted.reason || []), "accept_participation"]));
           bestSearch = boosted;
           break;
         }
