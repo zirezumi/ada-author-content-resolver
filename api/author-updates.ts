@@ -1,7 +1,9 @@
 // api/author-updates.ts
 import Parser from "rss-parser";
+// import type { VercelRequest, VercelResponse } from '@vercel/node'  // optional types if you add @vercel/node
 
-export const config = { runtime: "nodejs" }; // ensure Node runtime on Vercel
+// Ensure Node runtime on Vercel (NOT edge)
+export const config = { runtime: "nodejs" };
 
 // -----------------------------
 // Tunables
@@ -25,7 +27,6 @@ type CacheValue = {
   source?: string;
   author_url?: string;
 };
-
 type CacheEntry = { expiresAt: number; value: CacheValue };
 const CACHE = new Map<string, CacheEntry>();
 
@@ -47,17 +48,12 @@ function makeCacheKey(author: string, urls: string[], lookback: number, hints?: 
     : "";
   return `${author.trim().toLowerCase()}::${lookback}::${urlKey}::${hintKey}`;
 }
-
 function getCached(key: string): CacheValue | null {
   const hit = CACHE.get(key);
   if (!hit) return null;
-  if (Date.now() > hit.expiresAt) {
-    CACHE.delete(key);
-    return null;
-  }
+  if (Date.now() > hit.expiresAt) { CACHE.delete(key); return null; }
   return hit.value;
 }
-
 function setCached(key: string, value: CacheValue) {
   CACHE.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
 }
@@ -66,15 +62,8 @@ function setCached(key: string, value: CacheValue) {
 // Utilities
 // -----------------------------
 const parser = new Parser();
-
-function daysAgo(d: Date) {
-  return (Date.now() - d.getTime()) / 86_400_000;
-}
-
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n));
-}
-
+function daysAgo(d: Date) { return (Date.now() - d.getTime()) / 86_400_000; }
+function clamp(n: number, min: number, max: number) { return Math.max(min, Math.min(max, n)); }
 function sourceFromUrl(url?: string) {
   if (!url) return "unknown";
   const u = url.toLowerCase();
@@ -85,65 +74,36 @@ function sourceFromUrl(url?: string) {
   if (u.includes("wordpress")) return "wordpress";
   return "rss";
 }
-
 function guessFeedsFromSite(site: string): string[] {
   const clean = site.replace(/\/+$/, "");
-  return [
-    `${clean}/feed`,
-    `${clean}/rss.xml`,
-    `${clean}/atom.xml`,
-    `${clean}/index.xml`,
-    `${clean}/?feed=rss2`
-  ];
+  return [`${clean}/feed`, `${clean}/rss.xml`, `${clean}/atom.xml`, `${clean}/index.xml`, `${clean}/?feed=rss2`];
 }
-
-// very light RSS <link> discovery
 function extractRssLinks(html: string, base: string): string[] {
-  const links = Array.from(html.matchAll(/<link[^>]+rel=["']alternate["'][^>]*>/gi))
-    .map(m => m[0]);
+  const links = Array.from(html.matchAll(/<link[^>]+rel=["']alternate["'][^>]*>/gi)).map(m => m[0]);
   const hrefs = links.flatMap((tag: string) => {
     const href = /href=["']([^"']+)["']/i.exec(tag)?.[1];
     const type = /type=["']([^"']+)["']/i.exec(tag)?.[1] ?? "";
-    const looksRss =
-      /rss|atom|application\/(rss|atom)\+xml/i.test(type) ||
-      /rss|atom/i.test(href ?? "");
+    const looksRss = /rss|atom|application\/(rss|atom)\+xml/i.test(type) || /rss|atom/i.test(href ?? "");
     if (!href || !looksRss) return [];
     try { return [new URL(href, base).toString()]; } catch { return []; }
   });
   return Array.from(new Set(hrefs));
 }
-
-// fetch with timeout
 async function fetchWithTimeout(url: string, init?: RequestInit, ms = FETCH_TIMEOUT_MS) {
   const ctrl = new AbortController();
   const id = setTimeout(() => ctrl.abort(), ms);
   try {
-    const res = await fetch(url, {
-      ...init,
-      signal: ctrl.signal,
-      headers: { "User-Agent": USER_AGENT, ...(init?.headers || {}) }
-    });
+    const res = await fetch(url, { ...init, signal: ctrl.signal, headers: { "User-Agent": USER_AGENT, ...(init?.headers || {}) } });
     return res;
-  } finally {
-    clearTimeout(id);
-  }
+  } finally { clearTimeout(id); }
 }
-
 async function parseFeedURL(feedUrl: string) {
   const res = await fetchWithTimeout(feedUrl);
   if (!res || !res.ok) return null;
   const xml = await res.text();
-  try {
-    return await parser.parseString(xml);
-  } catch {
-    return null;
-  }
+  try { return await parser.parseString(xml); } catch { return null; }
 }
-
-// Explicit item type to keep TS happy under `strict`
 type FeedItem = { title: string; link: string; date: Date };
-
-// FIXED: explicit param types for .filter and .sort
 function pickFreshest(feed: unknown, lookback: number) {
   const rawItems: any[] = (feed as any)?.items ?? [];
   const items: FeedItem[] = rawItems
@@ -153,68 +113,37 @@ function pickFreshest(feed: unknown, lookback: number) {
     })
     .filter((x: FeedItem) => x.link && !isNaN(x.date.getTime()))
     .sort((a: FeedItem, b: FeedItem) => b.date.getTime() - a.date.getTime());
-
   if (!items.length) return null;
   const latest = items[0];
   return daysAgo(latest.date) <= lookback ? latest : null;
 }
-
-function normalizeAuthor(s: string) {
-  return s.normalize("NFKC").replace(/\s+/g, " ").trim();
-}
-
-function isHttpUrl(s: string) {
-  try {
-    const u = new URL(s);
-    return u.protocol === "http:" || u.protocol === "https:";
-  } catch { return false; }
-}
+function normalizeAuthor(s: string) { return s.normalize("NFKC").replace(/\s+/g, " ").trim(); }
+function isHttpUrl(s: string) { try { const u = new URL(s); return u.protocol === "http:" || u.protocol === "https:"; } catch { return false; } }
 
 // -----------------------------
 // Feed candidate generation
 // -----------------------------
 type PlatformHints = {
   platform?: "substack" | "medium" | "wordpress" | "ghost" | "blogger";
-  handle?: string;           // e.g., substack/medium handle
-  feed_url?: string;         // exact feed, if known
-  site_url?: string;         // base site, if known
+  handle?: string;
+  feed_url?: string;
+  site_url?: string;
 };
-
-async function findFeeds(
-  author: string,
-  knownUrls: string[] = [],
-  hints?: PlatformHints
-): Promise<string[]> {
+async function findFeeds(author: string, knownUrls: string[] = [], hints?: PlatformHints): Promise<string[]> {
   const candidates = new Set<string>();
-
-  // 0) Trust explicit hint URLs first
   if (hints?.feed_url && isHttpUrl(hints.feed_url)) candidates.add(hints.feed_url);
-  if (hints?.site_url && isHttpUrl(hints.site_url)) {
-    for (const f of guessFeedsFromSite(hints.site_url)) candidates.add(f);
-  }
-
-  // 1) Known platform patterns via hints
+  if (hints?.site_url && isHttpUrl(hints.site_url)) for (const f of guessFeedsFromSite(hints.site_url)) candidates.add(f);
   if (hints?.platform && hints?.handle) {
     const h = hints.handle.replace(/^@/, "");
     if (hints.platform === "substack") candidates.add(`https://${h}.substack.com/feed`);
-    if (hints.platform === "medium") {
-      candidates.add(`https://medium.com/feed/@${h}`);
-      candidates.add(`https://medium.com/feed/${h}`);
-    }
+    if (hints.platform === "medium") { candidates.add(`https://medium.com/feed/@${h}`); candidates.add(`https://medium.com/feed/${h}`); }
   }
-
-  // 2) Heuristics from author name → likely handles (best-effort)
-  const handles = [
-    author.toLowerCase().replace(/\s+/g, ""),
-    author.toLowerCase().replace(/\s+/g, "-")
-  ];
+  const handles = [author.toLowerCase().replace(/\s+/g, ""), author.toLowerCase().replace(/\s+/g, "-")];
   for (const h of handles) {
     candidates.add(`https://${h}.substack.com/feed`);
     candidates.add(`https://medium.com/feed/@${h}`);
     candidates.add(`https://medium.com/feed/${h}`);
   }
-
-  // 3) From known sites: feed patterns + discovery
   for (const site of knownUrls) {
     if (!isHttpUrl(site)) continue;
     for (const f of guessFeedsFromSite(site)) candidates.add(f);
@@ -224,143 +153,115 @@ async function findFeeds(
         const text = await html.text();
         for (const u of extractRssLinks(text, site)) candidates.add(u);
       }
-    } catch {
-      // ignore site fetch errors
-    }
+    } catch { /* ignore site fetch errors */ }
   }
-
   return Array.from(candidates).slice(0, 15);
 }
 
 // -----------------------------
-// Handler
+// Node-style handler for Vercel
 // -----------------------------
-async function toJsonSafe(req: Request): Promise<any> {
-  try { return await req.json(); } catch { return {}; }
+function cors(res: any, origin?: string) {
+  res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Auth");
 }
 
-function corsHeaders(origin?: string) {
-  return {
-    "Access-Control-Allow-Origin": origin || "*",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
-  };
-}
+export default async function handler(req: any, res: any) {
+  try {
+    cors(res, req.headers?.origin);
 
-export default async function handler(req: Request): Promise<Response> {
-  const origin = (req.headers.get("origin") || undefined);
+    if (req.method === "OPTIONS") return res.status(204).end();
 
-  if (req.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: corsHeaders(origin) });
+    if (req.method !== "POST") {
+      return res.status(405).json({ error: "POST required" });
     }
 
-  if (req.method !== "POST") {
-    return new Response(JSON.stringify({ error: "POST required" }), {
-      status: 405,
-      headers: { "content-type": "application/json", ...corsHeaders(origin) }
-    });
-  }
+    // Optional shared-secret auth
+    const expect = process.env.AUTHOR_UPDATES_SECRET;
+    const got = (req.headers["x-auth"] || req.headers["X-Auth"] || "") as string;
+    if (expect && got !== expect) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
 
-  // Parse & validate input
-  const body = await toJsonSafe(req);
-  const rawAuthor = (body.author_name ?? "").toString();
-  const author = normalizeAuthor(rawAuthor);
-  const lookback = clamp(Number(body.lookback_days ?? LOOKBACK_DEFAULT), LOOKBACK_MIN, LOOKBACK_MAX);
+    // Parse body (Vercel usually parses JSON; fall back if string)
+    const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
+    const rawAuthor = (body.author_name ?? "").toString();
+    const author = normalizeAuthor(rawAuthor);
+    const lookback = clamp(Number(body.lookback_days ?? LOOKBACK_DEFAULT), LOOKBACK_MIN, LOOKBACK_MAX);
+    if (!author) return res.status(400).json({ error: "author_name required" });
 
-  if (!author) {
-    return new Response(JSON.stringify({ error: "author_name required" }), {
-      status: 400,
-      headers: { "content-type": "application/json", ...corsHeaders(origin) }
-    });
-  }
+    let knownUrls: string[] = Array.isArray(body.known_urls) ? body.known_urls : [];
+    knownUrls = knownUrls.map((u: unknown) => String(u).trim()).filter(isHttpUrl).slice(0, 5);
 
-  let knownUrls: string[] = Array.isArray(body.known_urls) ? body.known_urls : [];
-  knownUrls = knownUrls
-    .map((u: unknown) => String(u).trim())
-    .filter(isHttpUrl)
-    .slice(0, 5); // cap to avoid abuse
-
-  const hints: PlatformHints | undefined = body.hints && typeof body.hints === "object"
-    ? {
-        platform: (body.hints.platform as PlatformHints["platform"]),
-        handle: typeof body.hints.handle === "string" ? body.hints.handle : undefined,
-        feed_url: typeof body.hints.feed_url === "string" ? body.hints.feed_url : undefined,
-        site_url: typeof body.hints.site_url === "string" ? body.hints.site_url : undefined
-      }
-    : undefined;
-
-  // Cache check
-  const key = makeCacheKey(author, knownUrls, lookback, hints);
-  const cached = getCached(key);
-  if (cached) {
-    return new Response(JSON.stringify(cached), {
-      status: 200,
-      headers: {
-        "content-type": "application/json",
-        "x-cache": "HIT",
-        ...corsHeaders(origin)
-      }
-    });
-  }
-
-  // Find candidate feeds
-  const feeds = await findFeeds(author, knownUrls, hints);
-
-  // Try feeds in order
-  for (const feedUrl of feeds) {
-    try {
-      const feed = await parseFeedURL(feedUrl);
-      if (!feed) continue;
-
-      const authorUrl = (feed as any)?.link?.startsWith?.("http")
-        ? (feed as any).link
-        : new URL(feedUrl).origin;
-
-      const latest = pickFreshest(feed, lookback);
-      let payload: CacheValue;
-
-      if (latest) {
-        payload = {
-          author_name: author,
-          has_recent: true,
-          latest_title: latest.title,
-          latest_url: latest.link,
-          published_at: latest.date.toISOString(),
-          source: sourceFromUrl(feedUrl),
-          author_url: authorUrl
-        };
-      } else {
-        payload = {
-          author_name: author,
-          has_recent: false,
-          source: sourceFromUrl(feedUrl),
-          author_url: authorUrl
-        };
-      }
-
-      setCached(key, payload);
-      return new Response(JSON.stringify(payload), {
-        status: 200,
-        headers: {
-          "content-type": "application/json",
-          "x-cache": "MISS",
-          ...corsHeaders(origin)
+    const hints: PlatformHints | undefined = body.hints && typeof body.hints === "object"
+      ? {
+          platform: (body.hints.platform as PlatformHints["platform"]),
+          handle: typeof body.hints.handle === "string" ? body.hints.handle : undefined,
+          feed_url: typeof body.hints.feed_url === "string" ? body.hints.feed_url : undefined,
+          site_url: typeof body.hints.site_url === "string" ? body.hints.site_url : undefined
         }
-      });
-    } catch {
-      // try next candidate
-    }
-  }
+      : undefined;
 
-  // Nothing found
-  const empty: CacheValue = { author_name: author, has_recent: false };
-  setCached(key, empty);
-  return new Response(JSON.stringify(empty), {
-    status: 200,
-    headers: {
-      "content-type": "application/json",
-      "x-cache": "MISS",
-      ...corsHeaders(origin)
+    // Cache
+    const key = makeCacheKey(author, knownUrls, lookback, hints);
+    const cached = getCached(key);
+    if (cached) {
+      res.setHeader("x-cache", "HIT");
+      return res.status(200).json(cached);
     }
-  });
+
+    // Resolve feeds
+    const feeds = await findFeeds(author, knownUrls, hints);
+
+    // Try feeds
+    for (const feedUrl of feeds) {
+      try {
+        const feed = await parseFeedURL(feedUrl);
+        if (!feed) continue;
+
+        const authorUrl = (feed as any)?.link?.startsWith?.("http")
+          ? (feed as any).link
+          : new URL(feedUrl).origin;
+
+        const latest = pickFreshest(feed, lookback);
+        let payload: CacheValue;
+
+        if (latest) {
+          payload = {
+            author_name: author,
+            has_recent: true,
+            latest_title: latest.title,
+            latest_url: latest.link,
+            published_at: latest.date.toISOString(),
+            source: sourceFromUrl(feedUrl),
+            author_url: authorUrl
+          };
+        } else {
+          payload = {
+            author_name: author,
+            has_recent: false,
+            source: sourceFromUrl(feedUrl),
+            author_url: authorUrl
+          };
+        }
+
+        setCached(key, payload);
+        res.setHeader("x-cache", "MISS");
+        return res.status(200).json(payload);
+      } catch (e) {
+        // Try next candidate
+        console.error("feed_error", feedUrl, e);
+      }
+    }
+
+    // Nothing found
+    const empty: CacheValue = { author_name: author, has_recent: false };
+    setCached(key, empty);
+    res.setHeader("x-cache", "MISS");
+    return res.status(200).json(empty);
+  } catch (err: any) {
+    console.error("handler_error", err?.stack || err);
+    return res.status(500).json({ error: "internal_error" });
+  }
 }
