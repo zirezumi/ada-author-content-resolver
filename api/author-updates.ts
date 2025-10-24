@@ -48,7 +48,7 @@ const LOOKBACK_MIN = 1;
 const LOOKBACK_MAX = 90;
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;     // 24h
 const FETCH_TIMEOUT_MS = 4500;                // per network call
-const USER_AGENT = "AuthorUpdates/1.6 (+https://example.com)";
+const USER_AGENT = "AuthorUpdates/1.7 (+https://example.com)";
 const CONCURRENCY = 4;                        // feed checks in parallel (bounded)
 const MAX_FEED_CANDIDATES = 15;               // latency guard
 const MAX_KNOWN_URLS = 5;                     // abuse guard
@@ -270,6 +270,51 @@ function itemText(it: any): string {
 }
 
 /* =============================
+   NEW: URL heuristics (demote homepages; prefer article-like)
+   ============================= */
+function isLikelyHomepage(u: string): boolean {
+  try {
+    const { pathname, search } = new URL(u);
+    const clean = pathname.replace(/\/+$/, "");
+    const depth = clean.split("/").filter(Boolean).length;
+    return (clean === "" || depth <= 1) && (!search || search === "");
+  } catch { return false; }
+}
+
+function urlLooksArticleLike(u: string): boolean {
+  try {
+    const { pathname } = new URL(u);
+    const parts = pathname.split("/").filter(Boolean);
+    const depth = parts.length;
+    const hasDateSeg = /\b(20\d{2})[\/\-]/.test(pathname);
+    const longSlug = parts.some((p) => p.length >= 12);
+    return depth >= 2 || hasDateSeg || longSlug;
+  } catch { return false; }
+}
+
+function extractPublishDateISO(html: string): string | undefined {
+  const meta = [
+    /<meta[^>]+property=["']article:published_time["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+name=["']pubdate["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+itemprop=["']datePublished["'][^>]+content=["']([^"']+)["']/i,
+    /<time[^>]+datetime=["']([^"']+)["']/i,
+  ];
+  for (const rx of meta) {
+    const m = html.match(rx);
+    if (m?.[1]) {
+      const iso = new Date(m[1]).toISOString();
+      if (!isNaN(new Date(iso).getTime())) return iso;
+    }
+  }
+  const m2 = html.match(/\b(20\d{2})[-\/](0[1-9]|1[0-2])[-\/](0[1-9]|[12]\d|3[01])\b/);
+  if (m2) {
+    const iso = new Date(m2[0]).toISOString();
+    if (!isNaN(new Date(iso).getTime())) return iso;
+  }
+  return undefined;
+}
+
+/* =============================
    Feed candidates
    ============================= */
 async function findFeeds(author: string, knownUrls: string[] = [], hints?: PlatformHints): Promise<string[]> {
@@ -477,11 +522,17 @@ function scoreWebHit(hit: WebHit, authorName: string, bookTitle: string, lookbac
   const bookMatch = tBook.length && (jaccard(tBook, tCombined) >= 0.3 || containsAll(tCombined, tBook));
   if (bookMatch) { score += 0.35; reasons.push("book_in_title_or_snippet"); }
 
-  // domain whitelist bonus
   const host = hit.host.toLowerCase();
   if (DOMAIN_WHITELIST.includes(host)) { score += 0.15; reasons.push(`domain_whitelist:${host}`); }
 
-  // CSE rarely gives dates → we rely on dateRestrict + whitelist + content verification below
+  // NEW: homepage penalty / shallow path penalty
+  if (isLikelyHomepage(hit.url)) {
+    score -= 0.25;
+    reasons.push("penalty_homepage");
+  } else if (!urlLooksArticleLike(hit.url)) {
+    score -= 0.1;
+    reasons.push("penalty_not_article_like");
+  }
 
   hit.confidence = Math.max(0, Math.min(1, score));
   hit.reason = reasons;
@@ -520,10 +571,10 @@ async function webSearchGoogleCSE(authorName: string, bookTitle: string, lookbac
 }
 
 // Fetch page HTML -> plain text for token checks
-async function fetchPageText(url: string): Promise<string> {
+async function fetchPageText(url: string): Promise<{ html: string; text: string }> {
   try {
     const r = await fetchWithTimeout(url, undefined, FETCH_TIMEOUT_MS);
-    if (!r?.ok) return "";
+    if (!r?.ok) return { html: "", text: "" };
     const html = await r.text();
     const text = html
       .replace(/<script[\s\S]*?<\/script>/gi, " ")
@@ -531,8 +582,8 @@ async function fetchPageText(url: string): Promise<string> {
       .replace(/<[^>]+>/g, " ")
       .replace(/\s+/g, " ")
       .slice(0, 200_000);
-    return text;
-  } catch { return ""; }
+    return { html, text };
+  } catch { return { html: "", text: "" }; }
 }
 
 function boostIfContentMatches(hit: WebHit, authorName: string, bookTitle: string, pageText: string): WebHit {
@@ -629,24 +680,35 @@ export default async function handler(req: any, res: any) {
       return res.status(200).json(cached);
     }
 
-    // Build RSS/Atom candidates
+    // Build RSS/Atom candidates (kept as fallback)
     const baseFeeds = await findFeeds(author, knownUrls, hints);
     const feeds = Array.from(new Set(baseFeeds));
 
-    // Google CSE search + page-content verification
+    // Google CSE search + page-content verification (with homepage/article heuristics)
     let bestSearch: WebHit | null = null;
     if (includeSearch && USE_SEARCH && bookTitle) {
       const hits = await webSearchGoogleCSE(author, bookTitle, lookback);
       let top = hits[0];
       if (top) {
-        // Verify by page content (presence of author + book in body text)
-        const bodyText = await fetchPageText(top.url);
-        top = boostIfContentMatches(top, author, bookTitle, bodyText);
+        // Pull full HTML and text once
+        const { html, text } = await fetchPageText(top.url);
+        // Boost confidence by body-content match
+        top = boostIfContentMatches(top, author, bookTitle, text);
 
-        // Accept if domain whitelisted and confidence clears bar; if not whitelisted, require slightly higher bar
+        // Try extracting publish date from page content
+        const pageISO = html ? extractPublishDateISO(html) : undefined;
+        const pageDate = pageISO ? new Date(pageISO) : undefined;
+        const pageFresh = pageDate && !isNaN(pageDate.getTime()) ? daysAgo(pageDate) <= lookback : false;
+
         const whitelisted = DOMAIN_WHITELIST.includes(top.host);
-        if ((whitelisted && top.confidence >= minSearchConfidence) ||
-            (!whitelisted && top.confidence >= (minSearchConfidence + 0.1))) {
+        const articleLike = urlLooksArticleLike(top.url) && !isLikelyHomepage(top.url);
+        const confOK = top.confidence >= (whitelisted ? minSearchConfidence : (minSearchConfidence + 0.1));
+
+        // Accept policy:
+        //   - Must be article-like (not homepage)
+        //   - Confidence passes threshold (higher if not whitelisted)
+        //   - Freshness: page date within window OR (no date but on whitelisted domain)
+        if (articleLike && confOK && (pageFresh || (!pageISO && whitelisted))) {
           bestSearch = top;
         }
       }
@@ -658,8 +720,7 @@ export default async function handler(req: any, res: any) {
         has_recent: true,
         latest_title: bestSearch.title,
         latest_url: bestSearch.url,
-        // CSE rarely provides reliable published date; omit or keep undefined
-        published_at: bestSearch.publishedAt,
+        published_at: bestSearch.publishedAt, // often undefined with CSE
         source: "web",
         author_url: `https://${bestSearch.host}`
       };
@@ -669,7 +730,7 @@ export default async function handler(req: any, res: any) {
           ok: true,
           source: "web",
           latest: bestSearch.publishedAt || null,
-          recentWithinWindow: true, // enforced via dateRestrict + domain + content
+          recentWithinWindow: true,
           confidence: Number(bestSearch.confidence.toFixed(2)),
           reason: bestSearch.reason,
           siteTitle: null,
@@ -682,7 +743,7 @@ export default async function handler(req: any, res: any) {
       return res.status(200).json(payload);
     }
 
-    // Evaluate feeds and identity scoring
+    // Evaluate feeds and identity scoring as fallback
     const { choice, results } = await evaluateFeeds(feeds, lookback, ctx);
 
     // Strict author matching gate
