@@ -29,16 +29,21 @@ type CacheValue = {
 type CacheEntry = { expiresAt: number; value: CacheValue };
 const CACHE = new Map<string, CacheEntry>();
 
-function makeCacheKey(author: string, urls: string[], lookback: number, hints?: any) {
+function makeCacheKey(author: string, urls: string[], lookback: number, hints?: unknown) {
   const urlKey = urls
     .map(u => u.trim().toLowerCase())
     .filter(Boolean)
     .sort()
     .join("|");
   const hintKey = hints
-    ? JSON.stringify(Object.keys(hints)
-        .sort()
-        .reduce((o: any, k) => (o[k] = hints[k], o), {}))
+    ? JSON.stringify(
+        Object.keys(hints as Record<string, unknown>)
+          .sort()
+          .reduce((o: Record<string, unknown>, k: string) => {
+            o[k] = (hints as Record<string, unknown>)[k];
+            return o;
+          }, {})
+      )
     : "";
   return `${author.trim().toLowerCase()}::${lookback}::${urlKey}::${hintKey}`;
 }
@@ -96,7 +101,7 @@ function guessFeedsFromSite(site: string): string[] {
 function extractRssLinks(html: string, base: string): string[] {
   const links = Array.from(html.matchAll(/<link[^>]+rel=["']alternate["'][^>]*>/gi))
     .map(m => m[0]);
-  const hrefs = links.flatMap(tag => {
+  const hrefs = links.flatMap((tag: string) => {
     const href = /href=["']([^"']+)["']/i.exec(tag)?.[1];
     const type = /type=["']([^"']+)["']/i.exec(tag)?.[1] ?? "";
     const looksRss =
@@ -125,7 +130,6 @@ async function fetchWithTimeout(url: string, init?: RequestInit, ms = FETCH_TIME
 }
 
 async function parseFeedURL(feedUrl: string) {
-  // We fetch the XML ourselves (to control timeout/headers) then parse string
   const res = await fetchWithTimeout(feedUrl);
   if (!res || !res.ok) return null;
   const xml = await res.text();
@@ -136,14 +140,19 @@ async function parseFeedURL(feedUrl: string) {
   }
 }
 
-function pickFreshest(feed: any, lookback: number) {
-  const items = (feed?.items ?? [])
+// Explicit item type to keep TS happy under `strict`
+type FeedItem = { title: string; link: string; date: Date };
+
+// FIXED: explicit param types for .filter and .sort
+function pickFreshest(feed: unknown, lookback: number) {
+  const rawItems: any[] = (feed as any)?.items ?? [];
+  const items: FeedItem[] = rawItems
     .map((it: any) => {
       const d = new Date(it.isoDate || it.pubDate || it.published || it.date || 0);
-      return { title: it.title, link: it.link, date: d };
+      return { title: String(it.title ?? ""), link: String(it.link ?? ""), date: d };
     })
-    .filter(x => x.link && !isNaN(x.date.getTime()))
-    .sort((a, b) => b.date.getTime() - a.date.getTime());
+    .filter((x: FeedItem) => x.link && !isNaN(x.date.getTime()))
+    .sort((a: FeedItem, b: FeedItem) => b.date.getTime() - a.date.getTime());
 
   if (!items.length) return null;
   const latest = items[0];
@@ -220,14 +229,13 @@ async function findFeeds(
     }
   }
 
-  // Limit to a reasonable number to keep latency bounded
   return Array.from(candidates).slice(0, 15);
 }
 
 // -----------------------------
 // Handler
 // -----------------------------
-async function toJsonSafe(req: Request) {
+async function toJsonSafe(req: Request): Promise<any> {
   try { return await req.json(); } catch { return {}; }
 }
 
@@ -244,7 +252,7 @@ export default async function handler(req: Request): Promise<Response> {
 
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders(origin) });
-  }
+    }
 
   if (req.method !== "POST") {
     return new Response(JSON.stringify({ error: "POST required" }), {
@@ -268,16 +276,16 @@ export default async function handler(req: Request): Promise<Response> {
 
   let knownUrls: string[] = Array.isArray(body.known_urls) ? body.known_urls : [];
   knownUrls = knownUrls
-    .map((u: any) => String(u).trim())
+    .map((u: unknown) => String(u).trim())
     .filter(isHttpUrl)
     .slice(0, 5); // cap to avoid abuse
 
   const hints: PlatformHints | undefined = body.hints && typeof body.hints === "object"
     ? {
-        platform: body.hints.platform,
-        handle: body.hints.handle,
-        feed_url: body.hints.feed_url,
-        site_url: body.hints.site_url
+        platform: (body.hints.platform as PlatformHints["platform"]),
+        handle: typeof body.hints.handle === "string" ? body.hints.handle : undefined,
+        feed_url: typeof body.hints.feed_url === "string" ? body.hints.feed_url : undefined,
+        site_url: typeof body.hints.site_url === "string" ? body.hints.site_url : undefined
       }
     : undefined;
 
@@ -304,7 +312,10 @@ export default async function handler(req: Request): Promise<Response> {
       const feed = await parseFeedURL(feedUrl);
       if (!feed) continue;
 
-      const authorUrl = feed?.link?.startsWith("http") ? feed.link : new URL(feedUrl).origin;
+      const authorUrl = (feed as any)?.link?.startsWith?.("http")
+        ? (feed as any).link
+        : new URL(feedUrl).origin;
+
       const latest = pickFreshest(feed, lookback);
       let payload: CacheValue;
 
