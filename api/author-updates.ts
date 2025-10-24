@@ -276,6 +276,23 @@ function itemText(it: any): string {
   return String(bits.join(" ").slice(0, 5000));
 }
 
+function lastName(s: string): string {
+  const parts = tokens(s);
+  return parts.length ? parts[parts.length - 1] : "";
+}
+
+function contentHasAuthorAndBook(pageText: string, authorName: string, bookTitle: string): boolean {
+  const t = tokens(pageText);
+  const tAuthor = tokens(authorName);
+  const tBook = tokens(bookTitle);
+  if (!t.length || !tAuthor.length || !tBook.length) return false;
+
+  const authorOK = jaccard(tAuthor, t) >= 0.25 || containsAll(t, tAuthor);
+  const bookOK   = jaccard(tBook, t)   >= 0.25 || containsAll(t, tBook);
+  return authorOK && bookOK;
+}
+
+
 /* =============================
    URL heuristics (home/index/article detection)
    ============================= */
@@ -818,10 +835,34 @@ export default async function handler(req: any, res: any) {
         const confOK = boosted.confidence >= (whitelisted ? minSearchConfidence : (minSearchConfidence + 0.1));
         const bylineOK = html ? authorAppearsAsByline(html, author) : false;
 
-        // Accept strictly content BY the author
+        // TIER A: strictly content BY the author
         if (bylineOK && confOK && (pageFresh || (!pageISO && whitelisted))) {
           bestSearch = boosted;
-          break; // stop at first acceptable article
+          break;
+          }
+         
+        // TIER B: participation (author featured, not credited as author)
+        // Requirements:
+        // - whitelisted domain
+        // - article-like, not homepage/index (already screened above)
+        // - pageFresh (must have a publish date within window; stricter than Tier A)
+        // - page text contains author AND book
+        // - title includes author last name (cheap sanity)
+        const titleHasLastName = (() => {
+          const ln = lastName(author);
+          return !!ln && tokens(boosted.title).includes(ln);
+        })();
+        
+        const participationOK =
+          whitelisted &&
+          pageFresh &&
+          titleHasLastName &&
+          contentHasAuthorAndBook(text, author, bookTitle) &&
+          confOK; // keep confidence threshold
+         
+        if (participationOK) {
+          bestSearch = boosted;
+          break;
         }
       }
     }
