@@ -4,15 +4,19 @@
 import Parser from "rss-parser";
 import pLimit from "p-limit";
 
+// Ensure Node runtime on Vercel (NOT edge)
 export const config = { runtime: "nodejs" } as const;
 
 /* =============================
-   Auth (same as before)
+   Auth
    ============================= */
+// Comma-separated secrets allowed: "s1,s2"
 const AUTH_SECRETS = (process.env.AUTHOR_UPDATES_SECRET || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
+
+// In local dev you can set SKIP_AUTH=true to bypass auth checks.
 const SKIP_AUTH = (process.env.SKIP_AUTH || "").toLowerCase() === "true";
 
 function headerCI(req: any, name: string): string | undefined {
@@ -28,7 +32,8 @@ function requireAuth(req: any, res: any): boolean {
     return false;
   }
   const provided = (headerCI(req, "x-auth") || "").trim();
-  if (!provided || !AUTH_SECRETS.includes(provided)) {
+  const ok = provided && AUTH_SECRETS.includes(provided);
+  if (!ok) {
     res.status(401).json({ error: "unauthorized" });
     return false;
   }
@@ -38,17 +43,26 @@ function requireAuth(req: any, res: any): boolean {
 /* =============================
    Tunables
    ============================= */
-const LOOKBACK_DEFAULT = 30;
+const LOOKBACK_DEFAULT = 30;                  // days
 const LOOKBACK_MIN = 1;
 const LOOKBACK_MAX = 90;
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const FETCH_TIMEOUT_MS = 4500;
-const USER_AGENT = "AuthorUpdates/1.3 (+https://example.com)";
-const CONCURRENCY = 4;
-const MAX_FEED_CANDIDATES = 15;
-const MAX_KNOWN_URLS = 5;
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;     // 24h
+const FETCH_TIMEOUT_MS = 4500;                // per network call
+const USER_AGENT = "AuthorUpdates/1.4 (+https://example.com)";
+const CONCURRENCY = 4;                        // feed checks in parallel (bounded)
+const MAX_FEED_CANDIDATES = 15;               // latency guard
+const MAX_KNOWN_URLS = 5;                     // abuse guard
 
-/* Identity scoring tunables */
+/* ===== Web search tunables (Bing) ===== */
+const USE_SEARCH = !!process.env.BING_SEARCH_KEY; // enabled if key present
+const DEFAULT_MIN_SEARCH_CONFIDENCE = 0.7;
+const SEARCH_MAX_RESULTS = 10;
+const DOMAIN_WHITELIST = (process.env.SEARCH_DOMAIN_WHITELIST || "")
+  .split(",")
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
+/* ===== Identity scoring tunables ===== */
 const DEFAULT_MIN_CONFIDENCE = 0.6; // 0..1
 const STRICT_REJECT_PAYLOAD = { error: "no_confident_author_match" };
 
@@ -61,9 +75,8 @@ type CacheValue = {
   latest_title?: string;
   latest_url?: string;
   published_at?: string;
-  source?: string;
-  author_url?: string;
-  // Debug
+  source?: string;      // "rss" | "substack" | "medium" | "web" | etc.
+  author_url?: string;  // best site/feed homepage
   _debug?: Array<{
     feedUrl: string;
     ok: boolean;
@@ -82,9 +95,9 @@ type CacheEntry = { expiresAt: number; value: CacheValue };
 
 type PlatformHints = {
   platform?: "substack" | "medium" | "wordpress" | "ghost" | "blogger";
-  handle?: string;
-  feed_url?: string;
-  site_url?: string;
+  handle?: string;     // e.g., substack/medium handle
+  feed_url?: string;   // exact feed, if known
+  site_url?: string;   // base site, if known
 };
 
 type FeedItem = { title: string; link: string; date: Date };
@@ -111,6 +124,16 @@ type EvalResult = {
   error?: string;
 };
 
+type WebHit = {
+  title: string;
+  url: string;
+  snippet?: string;
+  publishedAt?: string; // ISO
+  host: string;
+  confidence: number;   // 0..1
+  reason: string[];
+};
+
 /* =============================
    Cache
    ============================= */
@@ -124,7 +147,9 @@ function makeCacheKey(
   minConf?: number,
   bookTitle?: string,
   publisher?: string,
-  isbn?: string
+  isbn?: string,
+  includeSearch?: boolean,
+  minSearchConf?: number
 ) {
   const urlKey = urls.map(u => u.trim().toLowerCase()).filter(Boolean).sort().join("|");
   const hintKey = hints
@@ -139,7 +164,9 @@ function makeCacheKey(
     String(minConf ?? DEFAULT_MIN_CONFIDENCE),
     (bookTitle || "").toLowerCase().trim(),
     (publisher || "").toLowerCase().trim(),
-    (isbn || "").replace(/[-\s]/g, "")
+    (isbn || "").replace(/[-\s]/g, ""),
+    includeSearch ? "search" : "nosearch",
+    String(minSearchConf ?? DEFAULT_MIN_SEARCH_CONFIDENCE)
   ].join("::");
 }
 function getCached(key: string): CacheValue | null {
@@ -169,7 +196,6 @@ function sourceFromUrl(url?: string) {
   return "rss";
 }
 function hostOf(u: string) { try { return new URL(u).host.toLowerCase(); } catch { return ""; } }
-
 function guessFeedsFromSite(site: string): string[] {
   const clean = site.replace(/\/+$/, "");
   return [`${clean}/feed`, `${clean}/rss.xml`, `${clean}/atom.xml`, `${clean}/index.xml`, `${clean}/?feed=rss2`];
@@ -185,7 +211,6 @@ function extractRssLinks(html: string, base: string): string[] {
   });
   return Array.from(new Set(hrefs));
 }
-
 async function fetchWithTimeout(url: string, init?: RequestInit, ms = FETCH_TIMEOUT_MS) {
   const ctrl = new AbortController();
   const id = setTimeout(() => ctrl.abort(), ms);
@@ -194,14 +219,12 @@ async function fetchWithTimeout(url: string, init?: RequestInit, ms = FETCH_TIME
     return res;
   } finally { clearTimeout(id); }
 }
-
 async function parseFeedURL(feedUrl: string) {
   const res = await fetchWithTimeout(feedUrl);
   if (!res || !res.ok) return null;
   const xml = await res.text();
   try { return await parser.parseString(xml); } catch { return null; }
 }
-
 function newestItem(feed: unknown): FeedItem | null {
   const raw: any[] = (feed as any)?.items ?? [];
   const items: FeedItem[] = raw.map((it: any) => {
@@ -212,11 +235,9 @@ function newestItem(feed: unknown): FeedItem | null {
     .sort((a: FeedItem, b: FeedItem) => b.date.getTime() - a.date.getTime());
   return items.length ? items[0] : null;
 }
-
 function normalizeAuthor(s: string) { return s.normalize("NFKC").replace(/\s+/g, " ").trim(); }
 function isHttpUrl(s: string) { try { const u = new URL(s); return u.protocol === "http:" || u.protocol === "https:"; } catch { return false; } }
 
-/* ===== Identity helpers ===== */
 function tokens(s: string): string[] {
   return s.toLowerCase().normalize("NFKC").replace(/[^\p{L}\p{N}\s.-]/gu, " ").split(/[\s.-]+/).filter(Boolean);
 }
@@ -226,16 +247,76 @@ function jaccard(a: string[], b: string[]) {
   const uni = new Set([...A, ...B]).size;
   return uni ? inter / uni : 0;
 }
+function containsAll(hay: string[], needles: string[]) {
+  const H = new Set(hay);
+  return needles.every(n => H.has(n));
+}
 function startsWithAll(hay: string[], needles: string[]) {
   const h = hay.join(" ");
   const n = needles.join(" ");
   return h.startsWith(n);
 }
-function containsAll(hay: string[], needles: string[]) {
-  const H = new Set(hay);
-  return needles.every(n => H.has(n));
+function itemText(it: any): string {
+  const bits = [
+    it?.title,
+    it?.contentSnippet,
+    it?.content,
+    it?.["content:encodedSnippet"],
+    it?.["content:encoded"],
+    it?.summary
+  ].filter(Boolean);
+  return String(bits.join(" ").slice(0, 5000));
 }
 
+/* =============================
+   Feed candidates
+   ============================= */
+async function findFeeds(author: string, knownUrls: string[] = [], hints?: PlatformHints): Promise<string[]> {
+  const candidates = new Set<string>();
+
+  // 0) Precise hints first
+  if (hints?.feed_url && isHttpUrl(hints.feed_url)) candidates.add(hints.feed_url);
+  if (hints?.site_url && isHttpUrl(hints.site_url)) {
+    for (const f of guessFeedsFromSite(hints.site_url)) candidates.add(f);
+  }
+
+  // 1) Platform hints (handle)
+  if (hints?.platform && hints?.handle) {
+    const h = hints.handle.replace(/^@/, "");
+    if (hints.platform === "substack") candidates.add(`https://${h}.substack.com/feed`);
+    if (hints.platform === "medium") {
+      candidates.add(`https://medium.com/feed/@${h}`);
+      candidates.add(`https://medium.com/feed/${h}`);
+    }
+  }
+
+  // 2) Heuristics from author name
+  const handles = [author.toLowerCase().replace(/\s+/g, ""), author.toLowerCase().replace(/\s+/g, "-")];
+  for (const h of handles) {
+    candidates.add(`https://${h}.substack.com/feed`);
+    candidates.add(`https://medium.com/feed/@${h}`);
+    candidates.add(`https://medium.com/feed/${h}`);
+  }
+
+  // 3) From known sites: feed patterns + discovery
+  for (const site of knownUrls) {
+    if (!isHttpUrl(site)) continue;
+    for (const f of guessFeedsFromSite(site)) candidates.add(f);
+    try {
+      const html = await fetchWithTimeout(site);
+      if (html?.ok) {
+        const text = await html.text();
+        for (const u of extractRssLinks(text, site)) candidates.add(u);
+      }
+    } catch {/* ignore */}
+  }
+
+  return Array.from(candidates).slice(0, MAX_FEED_CANDIDATES);
+}
+
+/* =============================
+   Identity scoring + evaluation
+   ============================= */
 async function fetchSiteTitle(url: string): Promise<string | null> {
   try {
     const origin = new URL(url).origin;
@@ -248,48 +329,6 @@ async function fetchSiteTitle(url: string): Promise<string | null> {
   } catch { return null; }
 }
 
-/* =============================
-   Candidates
-   ============================= */
-async function findFeeds(author: string, knownUrls: string[] = [], hints?: PlatformHints): Promise<string[]> {
-  const candidates = new Set<string>();
-  if (hints?.feed_url && isHttpUrl(hints.feed_url)) candidates.add(hints.feed_url);
-  if (hints?.site_url && isHttpUrl(hints.site_url)) for (const f of guessFeedsFromSite(hints.site_url)) candidates.add(f);
-
-  if (hints?.platform && hints?.handle) {
-    const h = hints.handle.replace(/^@/, "");
-    if (hints.platform === "substack") candidates.add(`https://${h}.substack.com/feed`);
-    if (hints.platform === "medium") {
-      candidates.add(`https://medium.com/feed/@${h}`);
-      candidates.add(`https://medium.com/feed/${h}`);
-    }
-  }
-
-  const handles = [author.toLowerCase().replace(/\s+/g, ""), author.toLowerCase().replace(/\s+/g, "-")];
-  for (const h of handles) {
-    candidates.add(`https://${h}.substack.com/feed`);
-    candidates.add(`https://medium.com/feed/@${h}`);
-    candidates.add(`https://medium.com/feed/${h}`);
-  }
-
-  for (const site of knownUrls) {
-    if (!isHttpUrl(site)) continue;
-    for (const f of guessFeedsFromSite(site)) candidates.add(f);
-    try {
-      const html = await fetchWithTimeout(site);
-      if (html?.ok) {
-        const text = await html.text();
-        for (const u of extractRssLinks(text, site)) candidates.add(u);
-      }
-    } catch {}
-  }
-
-  return Array.from(candidates).slice(0, MAX_FEED_CANDIDATES);
-}
-
-/* =============================
-   Identity scoring + evaluation
-   ============================= */
 async function evaluateFeed(feedUrl: string, lookback: number, ctx: Context): Promise<EvalResult> {
   try {
     const feed = await parseFeedURL(feedUrl);
@@ -323,7 +362,7 @@ async function evaluateFeed(feedUrl: string, lookback: number, ctx: Context): Pr
     if (jSite >= 0.5) { score += 0.25; reasons.push(`site_name_sim:${jSite.toFixed(2)}`); }
     if (jFeed >= 0.5) { score += 0.25; reasons.push(`feed_title_sim:${jFeed.toFixed(2)}`); }
 
-    // 3) Strong string inclusion (“Firstname Lastname …” in title)
+    // 3) Strong string inclusion
     if (startsWithAll(siteTokens, authorTokens) || containsAll(siteTokens, authorTokens)) {
       score += 0.15; reasons.push("site_contains_author");
     }
@@ -339,11 +378,30 @@ async function evaluateFeed(feedUrl: string, lookback: number, ctx: Context): Pr
       if (jHandle >= 0.5) { score += 0.2; reasons.push(`handle_sim:${jHandle.toFixed(2)}`); }
     }
 
-    // 5) Book/publisher tokens show up (extra confidence)
-    const contentTokens = tokens((latest?.title || "") + " " + (feedTitle || "") + " " + (siteTitle || ""));
-    const hasBook = ctx.bookTitleTokens.length ? jaccard(ctx.bookTitleTokens, contentTokens) >= 0.2 : false;
-    const hasPub  = ctx.publisherTokens.length ? jaccard(ctx.publisherTokens, contentTokens) >= 0.2 : false;
-    if (hasBook) { score += 0.1; reasons.push("book_term_presence"); }
+    // 5) Book/Publisher tokens in latest ITEM text (title + summary/body)
+    const latestText = latest ? itemText((feed as any).items?.[0] ?? {}) : "";
+    const contentTokens = tokens([
+      latest?.title || "",
+      latestText || "",
+      feedTitle || "",
+      siteTitle || ""
+    ].join(" "));
+
+    const hasBook = ctx.bookTitleTokens.length
+      ? jaccard(ctx.bookTitleTokens, contentTokens) >= 0.2 || containsAll(contentTokens, ctx.bookTitleTokens)
+      : false;
+
+    const hasPub  = ctx.publisherTokens.length
+      ? jaccard(ctx.publisherTokens, contentTokens) >= 0.2
+      : false;
+
+    const authorInItem = authorTokens.length
+      ? jaccard(authorTokens, contentTokens) >= 0.3 || containsAll(contentTokens, authorTokens)
+      : false;
+
+    if (hasBook && authorInItem) { score += 0.3; reasons.push("item_mentions_author_and_book"); }
+    else if (hasBook) { score += 0.15; reasons.push("item_mentions_book"); }
+
     if (hasPub)  { score += 0.05; reasons.push("publisher_term_presence"); }
 
     // Cap to [0,1]
@@ -371,13 +429,13 @@ async function evaluateFeeds(feeds: string[], lookback: number, ctx: Context) {
   const limit = pLimit(CONCURRENCY);
   const results = await Promise.all(feeds.map(f => limit(() => evaluateFeed(f, lookback, ctx))));
 
-  // 1) Any recent within window? choose the one with highest confidence among those; tie-break by newest
+  // 1) Any recent within window? choose highest confidence; tie-break by newest
   const recent = results
     .filter(r => r.ok && r.recentWithinWindow && r.latest)
     .sort((a, b) => (b.confidence - a.confidence) || (b.latest!.date.getTime() - a.latest!.date.getTime()));
   if (recent.length) return { choice: recent[0], results };
 
-  // 2) Otherwise, pick the highest confidence overall; tie-break by freshest latest
+  // 2) Otherwise, pick highest confidence overall; tie-break by freshest latest
   const byConf = results
     .filter(r => r.ok && (r.authorUrl || r.latest))
     .sort((a, b) => (b.confidence - a.confidence) || ((b.latest?.date.getTime() || 0) - (a.latest?.date.getTime() || 0)));
@@ -389,6 +447,79 @@ async function evaluateFeeds(feeds: string[], lookback: number, ctx: Context) {
 
   // 4) Nothing usable
   return { choice: null, results };
+}
+
+/* =============================
+   Web Search (Bing) Integration
+   ============================= */
+function scoreWebHit(hit: WebHit, authorName: string, bookTitle: string, lookbackDays: number): WebHit {
+  const reasons: string[] = [];
+  let score = 0;
+
+  const tTitle = tokens(hit.title || "");
+  const tSnippet = tokens(hit.snippet || "");
+  const tCombined = Array.from(new Set([...tTitle, ...tSnippet]));
+  const tAuthor = tokens(authorName);
+  const tBook = tokens(bookTitle);
+
+  // author presence
+  const authorMatch = tAuthor.length && (jaccard(tAuthor, tCombined) >= 0.3 || containsAll(tCombined, tAuthor));
+  if (authorMatch) { score += 0.35; reasons.push("author_in_title_or_snippet"); }
+
+  // book presence
+  const bookMatch = tBook.length && (jaccard(tBook, tCombined) >= 0.3 || containsAll(tCombined, tBook));
+  if (bookMatch) { score += 0.35; reasons.push("book_in_title_or_snippet"); }
+
+  // domain whitelist bonus
+  const host = hit.host.toLowerCase();
+  if (DOMAIN_WHITELIST.includes(host)) { score += 0.15; reasons.push(`domain_whitelist:${host}`); }
+
+  // recency bonus
+  let within = false;
+  if (hit.publishedAt) {
+    const d = new Date(hit.publishedAt);
+    if (!isNaN(d.getTime()) && daysAgo(d) <= lookbackDays) { score += 0.25; reasons.push("fresh_within_window"); within = true; }
+  }
+
+  hit.confidence = Math.max(0, Math.min(1, score));
+  hit.reason = reasons;
+  return hit;
+}
+
+async function webSearchBing(authorName: string, bookTitle: string, lookbackDays: number): Promise<WebHit[]> {
+  if (!process.env.BING_SEARCH_KEY) return [];
+  const q = `"${authorName}" "${bookTitle}"`;
+  const freshness = lookbackDays <= 7 ? "Week" : "Month";
+
+  const url = new URL("https://api.bing.microsoft.com/v7.0/news/search");
+  url.searchParams.set("q", q);
+  url.searchParams.set("mkt", "en-US");
+  url.searchParams.set("freshness", freshness);
+  url.searchParams.set("count", String(SEARCH_MAX_RESULTS));
+  url.searchParams.set("textDecorations", "false");
+  url.searchParams.set("textFormat", "Raw");
+
+  const resp = await fetchWithTimeout(url.toString(), {
+    headers: { "Ocp-Apim-Subscription-Key": process.env.BING_SEARCH_KEY! }
+  }, FETCH_TIMEOUT_MS);
+
+  if (!resp?.ok) return [];
+  const data: any = await resp.json();
+  const items: any[] = Array.isArray(data?.value) ? data.value : [];
+
+  const hits: WebHit[] = items.map((it: any) => {
+    const title = String(it.name || "");
+    const url = String(it.url || "");
+    const publishedAt = it.datePublished ? new Date(it.datePublished).toISOString() : undefined;
+    const snippet = String(it.description || "");
+    const host = hostOf(url);
+    return { title, url, snippet, publishedAt, host, confidence: 0, reason: [] };
+  });
+
+  return hits
+    .map(h => scoreWebHit(h, authorName, bookTitle, lookbackDays))
+    .sort((a, b) => b.confidence - a.confidence)
+    .slice(0, SEARCH_MAX_RESULTS);
 }
 
 /* =============================
@@ -420,20 +551,26 @@ export default async function handler(req: any, res: any) {
     let knownUrls: string[] = Array.isArray(body.known_urls) ? body.known_urls : [];
     knownUrls = knownUrls.map((u: unknown) => String(u).trim()).filter(isHttpUrl).slice(0, MAX_KNOWN_URLS);
 
-    const hints: PlatformHints | undefined = body.hints && typeof body.hints === "object"
-      ? {
-          platform: body.hints.platform as PlatformHints["platform"],
-          handle: typeof body.hints.handle === "string" ? body.hints.handle : undefined,
-          feed_url: typeof body.hints.feed_url === "string" ? body.hints.feed_url : undefined,
-          site_url: typeof body.hints.site_url === "string" ? body.hints.site_url : undefined
-        }
-      : undefined;
+    const hints: PlatformHints | undefined =
+      body.hints && typeof body.hints === "object"
+        ? {
+            platform: body.hints.platform as PlatformHints["platform"],
+            handle: typeof body.hints.handle === "string" ? body.hints.handle : undefined,
+            feed_url: typeof body.hints.feed_url === "string" ? body.hints.feed_url : undefined,
+            site_url: typeof body.hints.site_url === "string" ? body.hints.site_url : undefined,
+          }
+        : undefined;
 
     const debug: boolean = body.debug === true;
     const strictAuthorMatch: boolean = body.strict_author_match === true;
     const minConfidence: number = typeof body.min_confidence === "number"
       ? Math.max(0, Math.min(1, body.min_confidence))
       : DEFAULT_MIN_CONFIDENCE;
+
+    const includeSearch: boolean = body.include_search === true;
+    const minSearchConfidence: number = typeof body.min_search_confidence === "number"
+      ? Math.max(0, Math.min(1, body.min_search_confidence))
+      : DEFAULT_MIN_SEARCH_CONFIDENCE;
 
     const bookTitle = typeof body.book_title === "string" ? body.book_title : "";
     const publisher = typeof body.publisher === "string" ? body.publisher : "";
@@ -447,23 +584,85 @@ export default async function handler(req: any, res: any) {
       isbn
     };
 
-    const cacheKey = makeCacheKey(author, knownUrls, lookback, hints, strictAuthorMatch, minConfidence, bookTitle, publisher, isbn);
+    const cacheKey = makeCacheKey(
+      author, knownUrls, lookback, hints,
+      strictAuthorMatch, minConfidence,
+      bookTitle, publisher, isbn,
+      includeSearch, minSearchConfidence
+    );
     const cached = getCached(cacheKey);
     if (cached && !debug) {
       res.setHeader("x-cache", "HIT");
       return res.status(200).json(cached);
     }
 
-    const feeds = await findFeeds(author, knownUrls, hints);
+    // Build candidates
+    const baseFeeds = await findFeeds(author, knownUrls, hints);
+    const feeds = Array.from(new Set(baseFeeds));
+
+    // Optional web search (Bing) for author+book
+    let bestSearch: WebHit | null = null;
+    if (includeSearch && USE_SEARCH && bookTitle) {
+      const hits = await webSearchBing(author, bookTitle, lookback);
+      const top = hits[0];
+      if (top && top.confidence >= minSearchConfidence) {
+        // validate recency if publish date present
+        let recentOk = false;
+        if (top.publishedAt) {
+          const d = new Date(top.publishedAt);
+          recentOk = !isNaN(d.getTime()) && daysAgo(d) <= lookback;
+        }
+        // Even if publishedAt absent, you might still accept based on signals — we enforce recency when date exists.
+        if (recentOk || !top.publishedAt) {
+          bestSearch = top;
+        }
+      }
+    }
+
+    // If search produced a confident, recent hit, return it as the "latest"
+    if (bestSearch && bestSearch.publishedAt) {
+      const d = new Date(bestSearch.publishedAt);
+      const within = !isNaN(d.getTime()) && daysAgo(d) <= lookback;
+      if (within) {
+        const payload: CacheValue = {
+          author_name: author,
+          has_recent: true,
+          latest_title: bestSearch.title,
+          latest_url: bestSearch.url,
+          published_at: bestSearch.publishedAt,
+          source: "web",
+          author_url: `https://${bestSearch.host}`
+        };
+        if (debug) {
+          payload._debug = [{
+            feedUrl: bestSearch.url,
+            ok: true,
+            source: "web",
+            latest: bestSearch.publishedAt || null,
+            recentWithinWindow: true,
+            confidence: Number(bestSearch.confidence.toFixed(2)),
+            reason: bestSearch.reason,
+            siteTitle: null,
+            feedTitle: null,
+            error: null
+          }];
+        }
+        setCached(cacheKey, payload);
+        res.setHeader("x-cache", "MISS");
+        return res.status(200).json(payload);
+      }
+    }
+
+    // Evaluate feeds and identity scoring
     const { choice, results } = await evaluateFeeds(feeds, lookback, ctx);
 
-    // If strict and we didn't meet confidence threshold, refuse
+    // Strict author matching gate
     if (strictAuthorMatch && (!choice || choice.confidence < minConfidence)) {
       res.setHeader("x-cache", "MISS");
       return res.status(200).json(STRICT_REJECT_PAYLOAD);
     }
 
-    // Build payloads with debug identity info
+    // Build debug helper
     const buildDebug = (list: EvalResult[]) => list.slice(0, 5).map(r => ({
       feedUrl: r.feedUrl,
       ok: r.ok,
