@@ -436,24 +436,21 @@ async function evaluateFeeds(feeds: string[], lookback: number, ctx: Context) {
       (b.confidence - a.confidence) ||
       (b.latest!.date.getTime() - a.latest!.date.getTime())
     );
-  if (recent.length) return { choice: recent[0], results };
   
-  // 2) Otherwise, pick highest confidence overall; tie-break by freshest latest
   const byConf = results
     .filter((r: EvalResult) => r.ok && (r.authorUrl || r.latest))
     .sort((a: EvalResult, b: EvalResult) =>
       (b.confidence - a.confidence) ||
       ((b.latest?.date.getTime() || 0) - (a.latest?.date.getTime() || 0))
     );
-  if (byConf.length) return { choice: byConf[0], results };
-
+   
   // 3) Fallback any OK result
   const anyOk = results.find(r => r.ok);
   if (anyOk) return { choice: anyOk, results };
-
+ 
   // 4) Nothing usable
   return { choice: null, results };
-}
+ }
 
 /* =============================
    Web Search (Bing) Integration
