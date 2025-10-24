@@ -215,7 +215,8 @@ async function fetchWithTimeout(url: string, init?: RequestInit, ms = FETCH_TIME
   const ctrl = new AbortController();
   const id = setTimeout(() => ctrl.abort(), ms);
   try {
-    const res = await fetch(url, { ...init, signal: ctrl.signal, headers: { "User-Agent": USER_AGENT, ...(init?.headers || {}) } });
+    const headers: HeadersInit = { "User-Agent": USER_AGENT, ...(init?.headers as any) };
+    const res = await fetch(url, { ...init, headers, signal: ctrl.signal });
     return res;
   } finally { clearTimeout(id); }
 }
@@ -427,7 +428,7 @@ async function evaluateFeed(feedUrl: string, lookback: number, ctx: Context): Pr
 
 async function evaluateFeeds(feeds: string[], lookback: number, ctx: Context) {
   const limit = pLimit(CONCURRENCY);
-  const results = await Promise.all(feeds.map(f => limit(() => evaluateFeed(f, lookback, ctx))));
+  const results: EvalResult[] = await Promise.all(feeds.map((f: string) => limit(() => evaluateFeed(f, lookback, ctx))));
 
   // 1) Any recent within window? choose highest confidence; tie-break by newest
   const recent = results
@@ -436,21 +437,24 @@ async function evaluateFeeds(feeds: string[], lookback: number, ctx: Context) {
       (b.confidence - a.confidence) ||
       (b.latest!.date.getTime() - a.latest!.date.getTime())
     );
-  
+  if (recent.length) return { choice: recent[0], results };
+
+  // 2) Otherwise, pick highest confidence overall; tie-break by freshest latest
   const byConf = results
     .filter((r: EvalResult) => r.ok && (r.authorUrl || r.latest))
     .sort((a: EvalResult, b: EvalResult) =>
       (b.confidence - a.confidence) ||
       ((b.latest?.date.getTime() || 0) - (a.latest?.date.getTime() || 0))
     );
-   
+  if (byConf.length) return { choice: byConf[0], results };
+
   // 3) Fallback any OK result
-  const anyOk = results.find(r => r.ok);
+  const anyOk = results.find((r: EvalResult) => r.ok);
   if (anyOk) return { choice: anyOk, results };
- 
+
   // 4) Nothing usable
   return { choice: null, results };
- }
+}
 
 /* =============================
    Web Search (Bing) Integration
@@ -478,10 +482,9 @@ function scoreWebHit(hit: WebHit, authorName: string, bookTitle: string, lookbac
   if (DOMAIN_WHITELIST.includes(host)) { score += 0.15; reasons.push(`domain_whitelist:${host}`); }
 
   // recency bonus
-  let within = false;
   if (hit.publishedAt) {
     const d = new Date(hit.publishedAt);
-    if (!isNaN(d.getTime()) && daysAgo(d) <= lookbackDays) { score += 0.25; reasons.push("fresh_within_window"); within = true; }
+    if (!isNaN(d.getTime()) && daysAgo(d) <= lookbackDays) { score += 0.25; reasons.push("fresh_within_window"); }
   }
 
   hit.confidence = Math.max(0, Math.min(1, score));
@@ -521,7 +524,7 @@ async function webSearchBing(authorName: string, bookTitle: string, lookbackDays
 
   return hits
     .map(h => scoreWebHit(h, authorName, bookTitle, lookbackDays))
-    .sort((a, b) => b.confidence - a.confidence)
+    .sort((a: WebHit, b: WebHit) => b.confidence - a.confidence)
     .slice(0, SEARCH_MAX_RESULTS);
 }
 
