@@ -492,6 +492,37 @@ function scoreWebHit(hit: WebHit, authorName: string, bookTitle: string, lookbac
   return hit;
 }
 
+async function webSearchBingWeb(authorName: string, bookTitle: string, lookbackDays: number): Promise<WebHit[]> {
+  if (!process.env.BING_SEARCH_KEY) return [];
+  const q = `"${authorName}" "${bookTitle}"`;
+  const url = new URL("https://api.bing.microsoft.com/v7.0/search");
+  url.searchParams.set("q", q);
+  url.searchParams.set("mkt", "en-US");
+  url.searchParams.set("count", String(SEARCH_MAX_RESULTS));
+
+  const resp = await fetchWithTimeout(url.toString(), {
+    headers: { "Ocp-Apim-Subscription-Key": process.env.BING_SEARCH_KEY! }
+  }, FETCH_TIMEOUT_MS);
+
+  if (!resp?.ok) return [];
+  const data: any = await resp.json();
+  const web: any[] = Array.isArray(data?.webPages?.value) ? data.webPages.value : [];
+
+  const hits: WebHit[] = web.map((it: any) => {
+    const title = String(it.name || "");
+    const url = String(it.url || "");
+    // web search often lacks reliable date; we’ll verify via content
+    const snippet = String(it.snippet || "");
+    const host = hostOf(url);
+    return { title, url, snippet, publishedAt: undefined, host, confidence: 0, reason: [] };
+  });
+
+  return hits
+    .map(h => scoreWebHit(h, authorName, bookTitle, lookbackDays))
+    .sort((a, b) => b.confidence - a.confidence)
+    .slice(0, SEARCH_MAX_RESULTS);
+}
+
 async function webSearchBing(authorName: string, bookTitle: string, lookbackDays: number): Promise<WebHit[]> {
   if (!process.env.BING_SEARCH_KEY) return [];
   const q = `"${authorName}" "${bookTitle}"`;
@@ -609,18 +640,23 @@ export default async function handler(req: any, res: any) {
     // Optional web search (Bing) for author+book
     let bestSearch: WebHit | null = null;
     if (includeSearch && USE_SEARCH && bookTitle) {
-      const hits = await webSearchBing(author, bookTitle, lookback);
-      const top = hits[0];
-      if (top && top.confidence >= minSearchConfidence) {
-        // validate recency if publish date present
-        let recentOk = false;
+      let hits = await webSearchBing(author, bookTitle, lookback);
+      if (!hits.length || hits[0].confidence < minSearchConfidence) {
+        const webHits = await webSearchBingWeb(author, bookTitle, lookback);
+        if (webHits.length) hits = webHits;
+      }
+      let top = hits[0];
+      if (top) {
+        const bodyText = await fetchPageText(top.url);
+        top = boostIfContentMatches(top, author, bookTitle, bodyText);
         if (top.publishedAt) {
           const d = new Date(top.publishedAt);
-          recentOk = !isNaN(d.getTime()) && daysAgo(d) <= lookback;
-        }
-        // Even if publishedAt absent, you might still accept based on signals — we enforce recency when date exists.
-        if (recentOk || !top.publishedAt) {
-          bestSearch = top;
+          const within = !isNaN(d.getTime()) && daysAgo(d) <= lookback;
+          if (within && top.confidence >= minSearchConfidence) bestSearch = top;
+        } else {
+          // No date — accept if content verified + domain whitelisted
+          const whitelisted = DOMAIN_WHITELIST.includes(top.host);
+          if (whitelisted && top.confidence >= minSearchConfidence) bestSearch = top;
         }
       }
     }
