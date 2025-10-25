@@ -1,7 +1,6 @@
 // api/author-updates.ts
 /// <reference types="node" />
 
-import Parser from "rss-parser";
 import pLimit from "p-limit";
 
 /* =============================
@@ -43,40 +42,36 @@ function requireAuth(req: any, res: any): boolean {
 /* =============================
    Tunables
    ============================= */
-const LOOKBACK_DEFAULT = 30; // days
-const LOOKBACK_MIN = 1;
-const LOOKBACK_MAX = 120;
-
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 const FETCH_TIMEOUT_MS = 5500;
-const USER_AGENT = "AuthorUpdates/2.2 (+https://example.com)";
+const USER_AGENT = "AuthorWebsite/1.0 (+https://example.com)";
 
 const CONCURRENCY = 4;
-
-const MAX_FEED_CANDIDATES = 15;
-const MAX_KNOWN_URLS = 6;
 
 /* ====== Google CSE config ====== */
 const CSE_KEY = process.env.GOOGLE_CSE_KEY || "";
 const CSE_ID = process.env.GOOGLE_CSE_ID || process.env.GOOGLE_CSE_CX || "";
 const USE_SEARCH_BASE = !!(CSE_KEY && CSE_ID);
 
-/* ====== Search scoring defaults ====== */
-const DEFAULT_MIN_CONFIDENCE = 0.5;
-const DEFAULT_MIN_SEARCH_CONFIDENCE = 0.5;
+/* ====== Scoring defaults ====== */
+const DEFAULT_MIN_SITE_CONFIDENCE = 0.55;
 
-/* ====== Domain filters ====== */
-const DEFAULT_DOMAIN_BLOCKLIST = [
-  // social / video
+/* ====== Domain filters (for website finding) ======
+   We block obvious non-home sites but ALLOW platforms many authors use
+   (Substack/Medium/WordPress), scoring them slightly lower than custom domains. */
+const WEBSITE_BLOCKLIST = [
+  // social / aggregators
   "x.com",
   "twitter.com",
   "facebook.com",
   "instagram.com",
   "tiktok.com",
   "linkedin.com",
-  "youtube.com",
-  "youtu.be",
-  // shopping
+  "goodreads.com",
+  "imdb.com",
+  "wikipedia.org",
+  "wikidata.org",
+  // shopping / retailers
   "amazon.",
   "ebay.",
   "barnesandnoble.com",
@@ -91,98 +86,42 @@ const DEFAULT_DOMAIN_BLOCKLIST = [
   "podbean.com",
   "simplecast.com",
   "megaphone.fm",
-  // newsletters often not “hosted content by author” (can be toggled off)
-  "substack.com",
+  // newsrooms and general magazines (typically not "the author's site")
+  "nytimes.com",
+  "theguardian.com",
+  "wsj.com",
+  "washingtonpost.com",
+  "newyorker.com",
 ];
 
-const PARTICIPATION_PHRASES = [
-  "interview with",
-  "in conversation",
-  "q&a",
-  "q & a",
-  "talks to",
-  "talks with",
-  "speaks to",
-  "speaks with",
-  "byline",
-  "by ",
-];
-
-/* =============================
-   Types
-   ============================= */
 type CacheValue = {
   author_name: string;
-  has_recent: boolean;
-  latest_title?: string;
-  latest_url?: string;
-  published_at?: string;
-  source?: string; // "web" | "rss" | platform guess
-  author_url?: string;
-  _debug?: Array<{
-    feedUrl: string;
-    ok: boolean;
-    source: string;
-    latest: string | null;
-    recentWithinWindow: boolean;
-    confidence: number;
-    reason: string[];
-    siteTitle?: string | null;
-    feedTitle?: string | null;
-    error: string | null;
-  }>;
-  _search_diag?: any;
+  author_url?: string;        // The best guess at the author's official site (origin or canonical)
+  site_title?: string | null;
+  canonical_url?: string | null;
+  confidence: number;         // 0..1 confidence score
+  source: "web";
+  _diag?: any;                // optional debugging info
 };
 
 type CacheEntry = { expiresAt: number; value: CacheValue };
 
-type PlatformHints = {
-  platform?: "substack" | "medium" | "wordpress" | "ghost" | "blogger";
-  handle?: string;
-  feed_url?: string;
-  site_url?: string;
-};
-
-type FeedItem = { title: string; link: string; date: Date };
-
-type EvalResult = {
-  feedUrl: string;
-  authorUrl?: string;
-  siteTitle?: string | null;
-  feedTitle?: string | null;
-  latest?: FeedItem;
-  recentWithinWindow: boolean;
-  source: string;
-  ok: boolean;
-  confidence: number;
-  reason: string[];
-  error?: string;
-};
-
 type WebHit = {
   title: string;
   url: string;
-  snippet?: string;
   host: string;
-  publishedAt?: string;
+  snippet?: string;
   confidence: number;
-  reason: string[];
+  reasons: string[];
 };
 
 type Context = {
   authorName: string;
   authorTokens: string[];
   bookTokens: string[];
-  lookbackDays: number;
-  requireBookMatch: boolean;
-  fallbackAuthorOnly: boolean;
   unsafeDisableDomainFilters: boolean;
-  unsafeDisableParticipationFilter: boolean;
 };
 
-/* =============================
-   Cache
-   ============================= */
 const CACHE = new Map<string, CacheEntry>();
 
 function makeCacheKey(parts: Record<string, any>) {
@@ -208,14 +147,26 @@ function setCached(key: string, value: CacheValue) {
 /* =============================
    Utils
    ============================= */
-const parser = new Parser();
-
-function daysAgo(d: Date) {
-  return (Date.now() - d.getTime()) / 86_400_000;
+function tokens(s: string): string[] {
+  return s
+    .toLowerCase()
+    .normalize("NFKC")
+    .replace(/[^\p{L}\p{N}\s'-]/gu, " ")
+    .split(/\s+/)
+    .filter(Boolean);
 }
 
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n));
+function containsAll(hay: string[], needles: string[]) {
+  const H = new Set(hay);
+  return needles.every((n) => H.has(n));
+}
+
+function jaccard(a: string[], b: string[]) {
+  const A = new Set(a);
+  const B = new Set(b);
+  const inter = [...A].filter((x) => B.has(x)).length;
+  const uni = new Set([...A, ...B]).size;
+  return uni ? inter / uni : 0;
 }
 
 function isHttpUrl(s: string) {
@@ -227,10 +178,6 @@ function isHttpUrl(s: string) {
   }
 }
 
-function normalizeAuthor(s: string) {
-  return s.normalize("NFKC").replace(/\s+/g, " ").trim();
-}
-
 function hostOf(u: string): string {
   try {
     return new URL(u).host.toLowerCase();
@@ -239,30 +186,12 @@ function hostOf(u: string): string {
   }
 }
 
-function tokens(s: string): string[] {
-  return s
-    .toLowerCase()
-    .normalize("NFKC")
-    .replace(/[^\p{L}\p{N}\s'-]/gu, " ")
-    .split(/\s+/)
-    .filter(Boolean);
-}
-
-function jaccard(a: string[], b: string[]) {
-  const A = new Set(a);
-  const B = new Set(b);
-  const inter = [...A].filter((x) => B.has(x)).length;
-  const uni = new Set([...A, ...B]).size;
-  return uni ? inter / uni : 0;
-}
-
-function containsAll(hay: string[], needles: string[]) {
-  const H = new Set(hay);
-  return needles.every((n) => H.has(n));
-}
-
-function hasContiguousPhrase(text: string, phrase: string) {
-  return new RegExp(`\\b${phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(text);
+function originOf(u: string): string | null {
+  try {
+    return new URL(u).origin;
+  } catch {
+    return null;
+  }
 }
 
 async function fetchWithTimeout(url: string, init?: RequestInit, ms = FETCH_TIMEOUT_MS) {
@@ -280,216 +209,73 @@ async function fetchWithTimeout(url: string, init?: RequestInit, ms = FETCH_TIME
   }
 }
 
-function sourceFromUrl(url?: string) {
-  if (!url) return "rss";
-  const u = url.toLowerCase();
-  if (u.includes("substack.com")) return "substack";
-  if (u.includes("medium.com")) return "medium";
-  if (u.includes("blogspot.") || u.includes("blogger.")) return "blogger";
-  if (u.includes("wordpress")) return "wordpress";
-  return "rss";
-}
-
-/* =============================
-   RSS helpers (fallback)
-   ============================= */
-function guessFeedsFromSite(site: string): string[] {
-  const clean = site.replace(/\/+$/, "");
-  return [
-    `${clean}/feed`,
-    `${clean}/rss.xml`,
-    `${clean}/atom.xml`,
-    `${clean}/index.xml`,
-    `${clean}/?feed=rss2`,
-  ];
-}
-
-function extractRssLinks(html: string, base: string): string[] {
-  const links = Array.from(
-    html.matchAll(/<link[^>]+rel=["']alternate["'][^>]*>/gi)
-  ).map((m) => m[0]);
-  const hrefs = links.flatMap((tag: string) => {
-    const href = /href=["']([^"']+)["']/i.exec(tag)?.[1];
-    const type = /type=["']([^"']+)["']/i.exec(tag)?.[1] ?? "";
-    const looksRss =
-      /rss|atom|application\/(rss|atom)\+xml/i.test(type) || /rss|atom/i.test(href ?? "");
-    if (!href || !looksRss) return [];
-    try {
-      return [new URL(href, base).toString()];
-    } catch {
-      return [];
-    }
-  });
-  return Array.from(new Set(hrefs));
-}
-
-async function parseFeedURL(feedUrl: string) {
-  const res = await fetchWithTimeout(feedUrl);
-  if (!res?.ok) return null;
-  const xml = await res.text();
-  try {
-    return await parser.parseString(xml);
-  } catch {
-    return null;
-  }
-}
-
-function newestItem(feed: unknown): FeedItem | null {
-  const raw: any[] = (feed as any)?.items ?? [];
-  const items: FeedItem[] = raw
-    .map((it: any) => {
-      const d = new Date(it.isoDate || it.pubDate || it.published || it.date || 0);
-      return { title: String(it.title ?? ""), link: String(it.link ?? ""), date: d };
-    })
-    .filter((x) => x.link && !isNaN(x.date.getTime()))
-    .sort((a, b) => b.date.getTime() - a.date.getTime());
-  return items.length ? items[0] : null;
-}
-
-async function fetchSiteTitle(url: string): Promise<string | null> {
-  try {
-    const origin = new URL(url).origin;
-    const res = await fetchWithTimeout(origin);
-    if (!res?.ok) return null;
-    const html = await res.text();
-    const mTitle = html.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1]?.trim();
-    const mOG = html.match(/<meta[^>]+property=["']og:site_name["'][^>]+content=["']([^"']+)["']/i)?.[1]?.trim();
-    return mOG || mTitle || null;
-  } catch {
-    return null;
-  }
-}
-
-async function evaluateFeed(feedUrl: string, lookback: number, authorTokens: string[]): Promise<EvalResult> {
-  try {
-    const feed = await parseFeedURL(feedUrl);
-    if (!feed) {
-      return {
-        feedUrl,
-        ok: false,
-        recentWithinWindow: false,
-        source: sourceFromUrl(feedUrl),
-        confidence: 0,
-        reason: ["parse_failed"],
-        error: "parse_failed",
-      };
-    }
-
-    const authorUrl =
-      (feed as any)?.link?.startsWith?.("http") ? (feed as any).link : new URL(feedUrl).origin;
-    const siteTitle = await fetchSiteTitle(feedUrl);
-    const feedTitle = (feed as any)?.title ? String((feed as any).title) : null;
-
-    const latest = newestItem(feed) || undefined;
-    const recentWithinWindow = !!(latest && daysAgo(latest.date) <= lookback);
-
-    let score = 0;
-    const reasons: string[] = [];
-    const siteTokens = tokens(siteTitle || "");
-    const feedTokens = tokens(feedTitle || "");
-
-    const jSite = jaccard(authorTokens, siteTokens);
-    const jFeed = jaccard(authorTokens, feedTokens);
-    if (jSite >= 0.5) {
-      score += 0.25;
-      reasons.push(`site_name_sim:${jSite.toFixed(2)}`);
-    }
-    if (jFeed >= 0.5) {
-      score += 0.25;
-      reasons.push(`feed_title_sim:${jFeed.toFixed(2)}`);
-    }
-
-    score = Math.max(0, Math.min(1, score));
-
-    return {
-      feedUrl,
-      authorUrl,
-      siteTitle,
-      feedTitle,
-      latest,
-      recentWithinWindow,
-      source: sourceFromUrl(feedUrl),
-      ok: true,
-      confidence: score,
-      reason: reasons,
-    };
-  } catch (e: unknown) {
-    const msg = (e as Error)?.message || "error";
-    return {
-      feedUrl,
-      ok: false,
-      recentWithinWindow: false,
-      source: sourceFromUrl(feedUrl),
-      confidence: 0,
-      reason: ["exception"],
-      error: msg,
-    };
-  }
-}
-
-async function findFeeds(author: string, knownUrls: string[] = [], hints?: PlatformHints): Promise<string[]> {
-  const candidates = new Set<string>();
-
-  if (hints?.feed_url && isHttpUrl(hints.feed_url)) candidates.add(hints.feed_url);
-  if (hints?.site_url && isHttpUrl(hints.site_url)) {
-    for (const f of guessFeedsFromSite(hints.site_url)) candidates.add(f);
-  }
-
-  if (hints?.platform && hints?.handle) {
-    const h = hints.handle.replace(/^@/, "");
-    if (hints.platform === "substack") candidates.add(`https://${h}.substack.com/feed`);
-    if (hints.platform === "medium") {
-      candidates.add(`https://medium.com/feed/@${h}`);
-      candidates.add(`https://medium.com/feed/${h}`);
-    }
-  }
-
-  const handles = [
-    author.toLowerCase().replace(/\s+/g, ""),
-    author.toLowerCase().replace(/\s+/g, "-"),
-  ];
-  for (const h of handles) {
-    candidates.add(`https://${h}.substack.com/feed`);
-    candidates.add(`https://medium.com/feed/@${h}`);
-    candidates.add(`https://medium.com/feed/${h}`);
-  }
-
-  for (const site of knownUrls) {
-    if (!isHttpUrl(site)) continue;
-    for (const f of guessFeedsFromSite(site)) candidates.add(f);
-    try {
-      const html = await fetchWithTimeout(site);
-      if (html?.ok) {
-        const text = await html.text();
-        for (const u of extractRssLinks(text, site)) candidates.add(u);
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-
-  return Array.from(candidates).slice(0, MAX_FEED_CANDIDATES);
-}
-
-/* =============================
-   Google CSE Search
-   ============================= */
 function isBlockedHost(host: string, disableFilters: boolean): boolean {
   if (disableFilters) return false;
   const h = host.toLowerCase();
-  return DEFAULT_DOMAIN_BLOCKLIST.some((bad) => h.includes(bad));
+  return WEBSITE_BLOCKLIST.some((bad) => h.includes(bad));
 }
 
-async function googleCSE(
-  query: string,
-  lookbackDays: number
-): Promise<{ items: any[]; raw: any }> {
+function normalizeAuthor(s: string) {
+  return s.normalize("NFKC").replace(/\s+/g, " ").trim();
+}
+
+/* =============================
+   HTML signals
+   ============================= */
+async function fetchHtmlSignals(url: string, ctx: Context): Promise<{
+  titleTokens: string[];
+  hasCopyrightName: boolean;
+  hasSchemaPerson: boolean;
+  hasOfficialWords: boolean;
+  bookMentioned: boolean;
+}> {
+  try {
+    const res = await fetchWithTimeout(url);
+    if (!res?.ok) {
+      return { titleTokens: [], hasCopyrightName: false, hasSchemaPerson: false, hasOfficialWords: false, bookMentioned: false };
+    }
+    const html = await res.text();
+    const head = html.slice(0, 100_000); // examine only head/early body
+
+    const title = /<title[^>]*>([^<]*)<\/title>/i.exec(head)?.[1] ?? "";
+    const tt = tokens(title);
+
+    const lower = head.toLowerCase();
+
+    const copyrightName =
+      /\u00A9|&copy;|copyright/i.test(head) &&
+      ctx.authorTokens.length > 0 &&
+      (containsAll(tokens(head), ctx.authorTokens) || head.toLowerCase().includes(normalizeAuthor(ctx.authorName).toLowerCase()));
+
+    const schemaPerson = /"@type"\s*:\s*"(?:Person|Author)"/i.test(head);
+
+    const officialWords = /\bofficial (site|website)\b/i.test(title) || /\bofficial (site|website)\b/i.test(head);
+
+    const bookMentioned =
+      ctx.bookTokens.length > 0 &&
+      (containsAll(tokens(head), ctx.bookTokens) || jaccard(tokens(head), ctx.bookTokens) >= 0.25);
+
+    return {
+      titleTokens: tt,
+      hasCopyrightName: !!copyrightName,
+      hasSchemaPerson: !!schemaPerson,
+      hasOfficialWords: !!officialWords,
+      bookMentioned: !!bookMentioned,
+    };
+  } catch {
+    return { titleTokens: [], hasCopyrightName: false, hasSchemaPerson: false, hasOfficialWords: false, bookMentioned: false };
+  }
+}
+
+/* =============================
+   Google CSE
+   ============================= */
+async function googleCSE(query: string): Promise<any[]> {
   const url = new URL("https://www.googleapis.com/customsearch/v1");
   url.searchParams.set("key", CSE_KEY);
   url.searchParams.set("cx", CSE_ID);
   url.searchParams.set("q", query);
   url.searchParams.set("num", "10");
-  url.searchParams.set("dateRestrict", `d${Math.max(1, Math.min(365, lookbackDays))}`);
 
   const resp = await fetchWithTimeout(url.toString());
   if (!resp?.ok) {
@@ -497,155 +283,172 @@ async function googleCSE(
     throw new Error(`cse_http_${resp?.status}: ${text || ""}`.slice(0, 240));
   }
   const data: any = await resp.json();
-  const items: any[] = Array.isArray(data?.items) ? data.items : [];
-  return { items, raw: data };
+  return Array.isArray(data?.items) ? data.items : [];
 }
 
-async function fetchHtmlAndValidate(url: string, ctx: Context): Promise<{
-  authorInHtml: boolean;
-  bookInHtml: boolean;
-  participationHit: boolean;
-  textSample: string;
-}> {
-  try {
-    const res = await fetchWithTimeout(url, {}, FETCH_TIMEOUT_MS);
-    if (!res?.ok) return { authorInHtml: false, bookInHtml: false, participationHit: false, textSample: "" };
-    const html = await res.text();
-    const plain = html.replace(/\s+/g, " ").slice(0, 20000);
-    const t = tokens(plain);
-
-    const authorIn = containsAll(t, ctx.authorTokens) || jaccard(t, ctx.authorTokens) >= 0.25;
-    const bookIn = ctx.bookTokens.length
-      ? containsAll(t, ctx.bookTokens) || jaccard(t, ctx.bookTokens) >= 0.2
-      : false;
-
-    const lower = plain.toLowerCase();
-    const authorFullLower = ctx.authorTokens.join(" ");
-    const participation =
-      PARTICIPATION_PHRASES.some((p) => lower.includes(p)) ||
-      hasContiguousPhrase(lower, `by ${authorFullLower}`) ||
-      hasContiguousPhrase(lower, `${authorFullLower} in conversation`) ||
-      hasContiguousPhrase(lower, `${authorFullLower} interviewed`);
-
-    return {
-      authorInHtml: authorIn,
-      bookInHtml: bookIn,
-      participationHit: participation,
-      textSample: plain.slice(0, 400),
-    };
-  } catch {
-    return { authorInHtml: false, bookInHtml: false, participationHit: false, textSample: "" };
-  }
+/* =============================
+   Website search & scoring
+   ============================= */
+function baseHit(it: any): WebHit {
+  const url = String(it.link || "");
+  return {
+    title: String(it.title || ""),
+    url,
+    host: hostOf(url),
+    snippet: String(it.snippet || it.htmlSnippet || ""),
+    confidence: 0,
+    reasons: [],
+  };
 }
 
-function scoreHitBase(hit: WebHit, ctx: Context): WebHit {
+function scoreBaseSignals(hit: WebHit, ctx: Context): WebHit {
   let score = 0;
   const reasons: string[] = [];
 
-  const titleT = tokens(hit.title || "");
-  const snipT = tokens(hit.snippet || "");
-  const combined = Array.from(new Set([...titleT, ...snipT]));
-
-  if (containsAll(combined, ctx.authorTokens) || jaccard(combined, ctx.authorTokens) >= 0.35) {
+  // Title/snippet contain full author name
+  const t = tokens(hit.title + " " + (hit.snippet || ""));
+  if (containsAll(t, ctx.authorTokens) || jaccard(t, ctx.authorTokens) >= 0.35) {
     score += 0.35;
     reasons.push("author_in_title_or_snippet");
   }
+
+  // If book tokens exist and appear, small boost (helps disambiguate same-name authors)
   if (ctx.bookTokens.length) {
-    if (containsAll(combined, ctx.bookTokens) || jaccard(combined, ctx.bookTokens) >= 0.3) {
-      score += 0.35;
+    if (containsAll(t, ctx.bookTokens) || jaccard(t, ctx.bookTokens) >= 0.25) {
+      score += 0.15;
       reasons.push("book_in_title_or_snippet");
     }
   }
 
-  if (!ctx.unsafeDisableDomainFilters && isBlockedHost(hit.host, false)) {
-    score -= 1.0; // hard block
+  // Block obvious non-home hosts
+  if (isBlockedHost(hit.host, false)) {
+    score -= 1.0;
     reasons.push("blocked_domain");
   }
 
+  // Prefer likely author-owned domains (vanity domains—name matches host sans TLD)
+  const compactName = normalizeAuthor(ctx.authorName).toLowerCase().replace(/\s+/g, "");
+  const hostBare = hit.host.replace(/^www\./, "");
+  if (hostBare.startsWith(compactName) || hostBare.includes(compactName)) {
+    score += 0.25;
+    reasons.push("vanity_domain_match");
+  }
+
+  // Slight preference for custom domains over platforms
+  if (
+    !/substack\.com|medium\.com|wordpress\.com|blogspot\.|ghost\.io/i.test(hit.host)
+  ) {
+    score += 0.05;
+    reasons.push("custom_domain_preferred");
+  } else {
+    reasons.push("platform_host");
+  }
+
   hit.confidence = Math.max(0, Math.min(1, score));
-  hit.reason = reasons;
+  hit.reasons = reasons;
   return hit;
 }
 
-async function enrichWithHtmlSignals(hit: WebHit, ctx: Context): Promise<WebHit> {
-  const { authorInHtml, bookInHtml, participationHit } = await fetchHtmlAndValidate(hit.url, ctx);
+async function enrichWithHtml(hit: WebHit, ctx: Context): Promise<WebHit> {
+  const origin = originOf(hit.url);
+  if (!origin) return hit;
 
-  if (authorInHtml) {
-    hit.confidence = Math.min(1, hit.confidence + 0.25);
-    hit.reason.push("content_contains_author");
-  }
-  if (ctx.bookTokens.length && bookInHtml) {
-    hit.confidence = Math.min(1, hit.confidence + 0.25);
-    hit.reason.push("content_contains_book");
-  }
-  if (!ctx.unsafeDisableParticipationFilter && participationHit) {
-    hit.confidence = Math.min(1, hit.confidence + 0.20);
-    hit.reason.push("accept_participation");
+  const [home, about] = await Promise.all([
+    fetchHtmlSignals(origin, ctx),
+    fetchHtmlSignals(origin + "/about", ctx),
+  ]);
+
+  const signals = [
+    home,
+    about, // reading /about often yields clearer "official" hints
+  ];
+
+  for (const s of signals) {
+    if (!s) continue;
+    if (containsAll(s.titleTokens, ctx.authorTokens) || jaccard(s.titleTokens, ctx.authorTokens) >= 0.4) {
+      hit.confidence = Math.min(1, hit.confidence + 0.15);
+      hit.reasons.push("title_matches_author");
+    }
+    if (s.hasOfficialWords) {
+      hit.confidence = Math.min(1, hit.confidence + 0.20);
+      hit.reasons.push("official_wording");
+    }
+    if (s.hasCopyrightName) {
+      hit.confidence = Math.min(1, hit.confidence + 0.15);
+      hit.reasons.push("copyright_name_match");
+    }
+    if (s.hasSchemaPerson) {
+      hit.confidence = Math.min(1, hit.confidence + 0.10);
+      hit.reasons.push("schema_person_present");
+    }
+    if (s.bookMentioned) {
+      hit.confidence = Math.min(1, hit.confidence + 0.10);
+      hit.reasons.push("book_mentioned_on_site");
+    }
   }
 
   return hit;
 }
 
-async function searchAuthorContent(
-  authorName: string,
-  bookTitle: string | "",
-  ctx: Context,
-  debug: boolean
-) {
-  const authorPhrase = `"${authorName}"`;
+async function searchAuthorWebsite(authorName: string, bookTitle: string, ctx: Context, debug: boolean) {
+  const quotedAuthor = `"${authorName}"`;
   const bookPart = bookTitle ? ` "${bookTitle}"` : "";
-  const participationBoost = `(interview OR "in conversation" OR "Q&A" OR conversation)`;
 
-  // Domain removals in the query (still also enforced by code)
-  const minusSites = DEFAULT_DOMAIN_BLOCKLIST
-    .map((d) => (d.endsWith(".") ? `-site:${d}*` : `-site:${d}`))
-    .join(" ");
+  // Try multiple phrasings; union results (de-duped by URL)
+  const queries = [
+    `${quotedAuthor}${bookPart} official site`,
+    `${quotedAuthor}${bookPart} official website`,
+    `${quotedAuthor}${bookPart} author website`,
+    `${quotedAuthor} site`,
+    `${quotedAuthor} website`,
+  ];
 
-  const baseQ = `${authorPhrase}${bookPart} ${participationBoost} ${minusSites}`.trim();
+  const diag: any = { queries, rawCounts: [] as number[], picked: undefined };
 
-  const diag: any = { query: baseQ };
+  const limit = pLimit(CONCURRENCY);
+  const allItems: any[] = (
+    await Promise.all(
+      queries.map((q) =>
+        limit(async () => {
+          const items = USE_SEARCH_BASE ? await googleCSE(q) : [];
+          diag.rawCounts.push(items.length);
+          return items;
+        })
+      )
+    )
+  ).flat();
 
-  const { items, raw } = await googleCSE(baseQ, ctx.lookbackDays);
-  diag.totalResults = Number(raw?.searchInformation?.totalResults || 0);
-  diag.returned = items.length;
+  // Deduplicate by URL
+  const seen = new Set<string>();
+  const prelim: WebHit[] = [];
+  for (const it of allItems) {
+    const hit = baseHit(it);
+    if (!isHttpUrl(hit.url)) continue;
+    if (seen.has(hit.url)) continue;
+    seen.add(hit.url);
+    prelim.push(scoreBaseSignals(hit, ctx));
+  }
 
-  const prelim: WebHit[] = items.map((it: any) => {
-    const url = String(it.link || "");
-    return scoreHitBase(
-      {
-        title: String(it.title || ""),
-        url,
-        snippet: String(it.snippet || it.htmlSnippet || ""),
-        host: hostOf(url),
-        publishedAt: undefined,
-        confidence: 0,
-        reason: [],
-      },
-      ctx
-    );
-  });
-
-  // Filter out blocked hosts after base score
+  // Remove blocked after scoring
   const filtered = prelim.filter((h) =>
     ctx.unsafeDisableDomainFilters ? true : !isBlockedHost(h.host, false)
   );
 
-  // Enrich with HTML signals (author/book/participation)
-  const limit = pLimit(CONCURRENCY);
-  const enriched = await Promise.all(filtered.map((h) => limit(() => enrichWithHtmlSignals(h, ctx))));
+  // Enrich with HTML signals (home + /about)
+  const enriched = await Promise.all(filtered.map((h) => limit(() => enrichWithHtml(h, ctx))));
+  enriched.sort((a, b) => b.confidence - a.confidence);
 
-  // If require book match, drop those that don't contain the book anywhere
-  const finalHits = enriched.filter((h) => {
-    if (!ctx.requireBookMatch) return true;
-    const hasBook =
-      containsAll(tokens(h.title + " " + (h.snippet || "")), ctx.bookTokens) ||
-      h.reason.includes("content_contains_book");
-    return hasBook;
-  });
+  if (debug) diag.candidates = enriched.slice(0, 10).map((h) => ({
+    url: h.url,
+    host: h.host,
+    confidence: Number(h.confidence.toFixed(2)),
+    reasons: h.reasons,
+  }));
 
-  finalHits.sort((a, b) => b.confidence - a.confidence);
+  const best = enriched[0] || null;
+  if (debug && best) diag.picked = { url: best.url, confidence: Number(best.confidence.toFixed(2)), reasons: best.reasons };
 
-  return { hits: finalHits, _diag: diag };
+  return { best, _diag: debug ? diag : undefined };
 }
 
 /* =============================
@@ -674,44 +477,17 @@ export default async function handler(req: any, res: any) {
     if (!author) return res.status(400).json({ error: "author_name required" });
 
     const bookTitle: string = typeof body.book_title === "string" ? body.book_title : "";
-    let lookback = Number(body.lookback_days ?? LOOKBACK_DEFAULT);
-    lookback = clamp(isFinite(lookback) ? lookback : LOOKBACK_DEFAULT, LOOKBACK_MIN, LOOKBACK_MAX);
-
-    let knownUrls: string[] = Array.isArray(body.known_urls) ? body.known_urls : [];
-    knownUrls = knownUrls.map((u) => String(u).trim()).filter(isHttpUrl).slice(0, MAX_KNOWN_URLS);
-
-    const hints: PlatformHints | undefined =
-      body.hints && typeof body.hints === "object"
-        ? {
-            platform: body.hints.platform as PlatformHints["platform"],
-            handle: typeof body.hints.handle === "string" ? body.hints.handle : undefined,
-            feed_url: typeof body.hints.feed_url === "string" ? body.hints.feed_url : undefined,
-            site_url: typeof body.hints.site_url === "string" ? body.hints.site_url : undefined,
-          }
-        : undefined;
-
     const debug: boolean = body.debug === true;
-    const includeSearchRequested: boolean = body.include_search === true;
 
-    const strictAuthorMatch: boolean = body.strict_author_match === true;
-    const requireBookMatch: boolean = body.require_book_match === true;
-    const fallbackAuthorOnly: boolean = body.fallback_author_only === true;
-
-    const minConfidence: number =
-      typeof body.min_confidence === "number"
-        ? Math.max(0, Math.min(1, body.min_confidence))
-        : DEFAULT_MIN_CONFIDENCE;
-
-    const minSearchConfidence: number =
-      typeof body.min_search_confidence === "number"
-        ? Math.max(0, Math.min(1, body.min_search_confidence))
-        : DEFAULT_MIN_SEARCH_CONFIDENCE;
+    const minSiteConfidence: number =
+      typeof body.min_site_confidence === "number"
+        ? Math.max(0, Math.min(1, body.min_site_confidence))
+        : DEFAULT_MIN_SITE_CONFIDENCE;
 
     const unsafeDisableDomainFilters: boolean = body.unsafe_disable_domain_filters === true;
-    const unsafeDisableParticipationFilter: boolean =
-      body.unsafe_disable_participation_filter === true;
 
-    // set header diagnostics about search env
+    // search enablement
+    const includeSearchRequested: boolean = body.include_search !== false; // default true
     const USE_SEARCH = includeSearchRequested && USE_SEARCH_BASE;
     res.setHeader("x-use-search", String(USE_SEARCH));
     res.setHeader("x-cse-id-present", String(!!CSE_ID));
@@ -724,176 +500,86 @@ export default async function handler(req: any, res: any) {
       authorName: author,
       authorTokens,
       bookTokens,
-      lookbackDays: lookback,
-      requireBookMatch,
-      fallbackAuthorOnly,
       unsafeDisableDomainFilters,
-      unsafeDisableParticipationFilter,
     };
 
-    // cache key
     const cacheKey = makeCacheKey({
-      author,
-      bookTitle,
-      lookback,
-      knownUrls,
-      hints,
-      strictAuthorMatch,
-      requireBookMatch,
-      fallbackAuthorOnly,
-      minConfidence,
-      minSearchConfidence,
-      USE_SEARCH,
-      unsafeDisableDomainFilters,
-      unsafeDisableParticipationFilter,
+      author, bookTitle, minSiteConfidence, USE_SEARCH, unsafeDisableDomainFilters,
     });
 
-    const hit = getCached(cacheKey);
-    if (hit && !debug) {
+    const cached = getCached(cacheKey);
+    if (cached && !debug) {
       res.setHeader("x-cache", "HIT");
-      return res.status(200).json(hit);
+      return res.status(200).json(cached);
     }
 
-    /* ---------- Primary path: Google CSE ---------- */
-    let bestSearch: WebHit | null = null;
-    let searchDiag: any = undefined;
-
-    if (USE_SEARCH) {
-      try {
-        const { hits, _diag } = await searchAuthorContent(author, bookTitle, ctx, debug);
-        searchDiag = _diag;
-
-        // Filter by thresholds with fallbacks
-        const accepted = hits.find((h) => h.confidence >= minSearchConfidence);
-        if (accepted) {
-          bestSearch = accepted;
-        } else if (!requireBookMatch && fallbackAuthorOnly) {
-          const fallback = hits.find(
-            (h) =>
-              h.confidence >= Math.min(minSearchConfidence, 0.4) &&
-              h.reason.includes("author_in_title_or_snippet")
-          );
-          if (fallback) bestSearch = fallback;
-        }
-      } catch (e: any) {
-        searchDiag = { error: String(e?.message || e) };
-      }
-    }
-
-    if (bestSearch) {
-      const payload: CacheValue = {
+    if (!USE_SEARCH) {
+      const fail: CacheValue = {
         author_name: author,
-        has_recent: true,
-        latest_title: bestSearch.title,
-        latest_url: bestSearch.url,
+        author_url: undefined,
+        site_title: undefined,
+        canonical_url: undefined,
+        confidence: 0,
         source: "web",
-        author_url: `https://${bestSearch.host}`,
+        _diag: debug ? { reason: "search_disabled_or_not_configured" } : undefined,
       };
-      if (debug) {
-        payload._search_diag = {
-          use_search: USE_SEARCH,
-          cse_id_present: !!CSE_ID,
-          cse_key_present: !!CSE_KEY,
-          ...searchDiag,
-          picked: {
-            url: bestSearch.url,
-            confidence: Number(bestSearch.confidence.toFixed(2)),
-            reason: bestSearch.reason,
-          },
-        };
-      }
-      setCached(cacheKey, payload);
+      setCached(cacheKey, fail);
       res.setHeader("x-cache", "MISS");
-      return res.status(200).json(payload);
+      return res.status(200).json(fail);
     }
 
-    /* ---------- Fallback: RSS discovery (best-effort) ---------- */
-    const feeds = await findFeeds(author, knownUrls, hints);
-    const limit = pLimit(CONCURRENCY);
-    const results = await Promise.all(
-      feeds.map((f) => limit(() => evaluateFeed(f, lookback, authorTokens)))
-    );
+    const { best, _diag } = await searchAuthorWebsite(author, bookTitle, ctx, debug);
 
-    const recent = results
-      .filter((r) => r.ok && r.recentWithinWindow && r.latest)
-      .sort(
-        (a, b) =>
-          (b.latest!.date.getTime() - a.latest!.date.getTime()) ||
-          (b.confidence - a.confidence)
-      );
-
-    const buildDebug = (list: EvalResult[]) =>
-      list.slice(0, 10).map((r) => ({
-        feedUrl: r.feedUrl,
-        ok: r.ok,
-        source: r.source,
-        latest: r.latest ? r.latest.date.toISOString() : null,
-        recentWithinWindow: r.recentWithinWindow,
-        confidence: Number(r.confidence.toFixed(2)),
-        reason: r.reason,
-        siteTitle: r.siteTitle || null,
-        feedTitle: r.feedTitle || null,
-        error: r.error || null,
-      }));
-
-    if (recent.length) {
-      const top = recent[0];
+    if (!best || best.confidence < minSiteConfidence) {
       const payload: CacheValue = {
         author_name: author,
-        has_recent: true,
-        latest_title: top.latest!.title,
-        latest_url: top.latest!.link,
-        published_at: top.latest!.date.toISOString(),
-        source: top.source,
-        author_url: top.authorUrl,
+        author_url: undefined,
+        site_title: undefined,
+        canonical_url: undefined,
+        confidence: best ? Number(best.confidence.toFixed(2)) : 0,
+        source: "web",
+        _diag,
       };
-      if (debug) {
-        payload._debug = buildDebug(results);
-        if (searchDiag) payload._search_diag = { use_search: USE_SEARCH, ...searchDiag };
-      }
       setCached(cacheKey, payload);
       res.setHeader("x-cache", "MISS");
       return res.status(200).json(payload);
     }
 
-    // If strict author match requested and nothing qualified, return explicit error
-    if (strictAuthorMatch) {
-      const fail: CacheValue = { author_name: author, has_recent: false };
-      if (debug) {
-        (fail as any)._debug = buildDebug(results);
-        if (searchDiag) (fail as any)._search_diag = { use_search: USE_SEARCH, ...searchDiag };
+    // Normalize to origin, fetch canonical & title for nicety
+    const origin = originOf(best.url)!;
+
+    let siteTitle: string | null = null;
+    let canonical: string | null = null;
+    try {
+      const resp = await fetchWithTimeout(origin);
+      if (resp?.ok) {
+        const html = await resp.text();
+        siteTitle = /<title[^>]*>([^<]*)<\/title>/i.exec(html)?.[1]?.trim() || null;
+        const mCanon = html.match(/<link[^>]+rel=["']canonical["'][^>]*>/i)?.[0] || "";
+        canonical =
+          /href=["']([^"']+)["']/i.exec(mCanon)?.[1] ||
+          null;
+        if (canonical && !isHttpUrl(canonical)) {
+          canonical = new URL(canonical, origin).toString();
+        }
       }
-      res.setHeader("x-cache", "MISS");
-      return res.status(200).json({ error: "no_confident_author_match", ...(debug ? fail : {}) });
+    } catch {
+      /* ignore */
     }
 
-    // Soft fallback: not recent, but we can still hand back an author_url if any
-    const anyOk = results.find((r) => r.ok && r.authorUrl);
-    if (anyOk) {
-      const payload: CacheValue = {
-        author_name: author,
-        has_recent: false,
-        source: anyOk.source,
-        author_url: anyOk.authorUrl,
-      };
-      if (debug) {
-        payload._debug = buildDebug(results);
-        if (searchDiag) payload._search_diag = { use_search: USE_SEARCH, ...searchDiag };
-      }
-      setCached(cacheKey, payload);
-      res.setHeader("x-cache", "MISS");
-      return res.status(200).json(payload);
-    }
+    const payload: CacheValue = {
+      author_name: author,
+      author_url: origin,
+      site_title: siteTitle,
+      canonical_url: canonical || origin,
+      confidence: Number(best.confidence.toFixed(2)),
+      source: "web",
+      _diag,
+    };
 
-    // Nothing
-    const empty: CacheValue = { author_name: author, has_recent: false };
-    if (debug) {
-      (empty as any)._debug = buildDebug(results);
-      if (searchDiag) (empty as any)._search_diag = { use_search: USE_SEARCH, ...searchDiag };
-    }
-    setCached(cacheKey, empty);
+    setCached(cacheKey, payload);
     res.setHeader("x-cache", "MISS");
-    return res.status(200).json(empty);
+    return res.status(200).json(payload);
   } catch (err: unknown) {
     const message = (err as Error)?.message || "internal_error";
     console.error("handler_error", message);
