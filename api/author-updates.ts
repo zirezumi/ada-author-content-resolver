@@ -1,5 +1,31 @@
-// api/author-updates.ts
+// api/book-author-website.ts
 /// <reference types="node" />
+
+/**
+ * Endpoint: POST
+ * Body:
+ * {
+ *   "book_title": "The Art of War",
+ *   "include_search": true,                  // optional, defaults true (requires CSE env)
+ *   "min_author_confidence": 0.55,           // optional, 0..1
+ *   "min_site_confidence": 0.55,             // optional, 0..1
+ *   "debug": true,                           // optional
+ *   "unsafe_disable_domain_filters": false   // optional
+ * }
+ *
+ * Response (200):
+ * {
+ *   "book_title": "The Art of War",
+ *   "inferred_author": "Sun Tzu",
+ *   "author_url": "https://www.suntzuofficial.example",
+ *   "site_title": "Sun Tzu — Official Site",
+ *   "canonical_url": "https://www.suntzuofficial.example/",
+ *   "confidence": 0.87,                      // site confidence
+ *   "author_confidence": 0.91,               // author confidence
+ *   "source": "web",
+ *   "_diag": { ... }                         // if debug=true
+ * }
+ */
 
 import pLimit from "p-limit";
 
@@ -44,21 +70,43 @@ function requireAuth(req: any, res: any): boolean {
    ============================= */
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 const FETCH_TIMEOUT_MS = 5500;
-const USER_AGENT = "AuthorWebsite/1.0 (+https://example.com)";
+const USER_AGENT = "BookAuthorWebsite/1.0 (+https://example.com)";
 
 const CONCURRENCY = 4;
+
+const DEFAULT_MIN_AUTHOR_CONFIDENCE = 0.55;
+const DEFAULT_MIN_SITE_CONFIDENCE = 0.55;
 
 /* ====== Google CSE config ====== */
 const CSE_KEY = process.env.GOOGLE_CSE_KEY || "";
 const CSE_ID = process.env.GOOGLE_CSE_ID || process.env.GOOGLE_CSE_CX || "";
 const USE_SEARCH_BASE = !!(CSE_KEY && CSE_ID);
 
-/* ====== Scoring defaults ====== */
-const DEFAULT_MIN_SITE_CONFIDENCE = 0.55;
+/* =============================
+   Domain strategy
+   ============================= */
+/** Sites we trust for *author discovery* (extracting the correct human author). */
+const AUTHOR_DISCOVERY_ALLOW = [
+  "wikipedia.org",
+  "britannica.com",
+  "books.google.com",
+  "goodreads.com",
+  "penguinrandomhouse.com",
+  "harpercollins.com",
+  "simonandschuster.com",
+  "macmillan.com",
+  "hachettebookgroup.com",
+  "us.macmillan.com",
+  "panmacmillan.com",
+  "bloomsbury.com",
+  "faber.co.uk",
+  "worldcat.org",
+  "librarything.com",
+  "loc.gov",
+  "openlibrary.org",
+];
 
-/* ====== Domain filters (for website finding) ======
-   We block obvious non-home sites but ALLOW platforms many authors use
-   (Substack/Medium/WordPress), scoring them slightly lower than custom domains. */
+/** We block obvious non-home sites when picking the *official website*. */
 const WEBSITE_BLOCKLIST = [
   // social / aggregators
   "x.com",
@@ -94,14 +142,19 @@ const WEBSITE_BLOCKLIST = [
   "newyorker.com",
 ];
 
+/* =============================
+   Types
+   ============================= */
 type CacheValue = {
-  author_name: string;
-  author_url?: string;        // The best guess at the author's official site (origin or canonical)
+  book_title: string;
+  inferred_author?: string;
+  author_url?: string;
   site_title?: string | null;
   canonical_url?: string | null;
-  confidence: number;         // 0..1 confidence score
+  confidence: number;           // site confidence (0..1)
+  author_confidence: number;    // author discovery confidence (0..1)
   source: "web";
-  _diag?: any;                // optional debugging info
+  _diag?: any;
 };
 
 type CacheEntry = { expiresAt: number; value: CacheValue };
@@ -115,13 +168,21 @@ type WebHit = {
   reasons: string[];
 };
 
+type AuthorCandidate = {
+  name: string;
+  score: number;      // confidence 0..1
+  reasons: string[];
+};
+
 type Context = {
-  authorName: string;
-  authorTokens: string[];
+  bookTitle: string;
   bookTokens: string[];
   unsafeDisableDomainFilters: boolean;
 };
 
+/* =============================
+   Cache
+   ============================= */
 const CACHE = new Map<string, CacheEntry>();
 
 function makeCacheKey(parts: Record<string, any>) {
@@ -167,6 +228,10 @@ function jaccard(a: string[], b: string[]) {
   const inter = [...A].filter((x) => B.has(x)).length;
   const uni = new Set([...A, ...B]).size;
   return uni ? inter / uni : 0;
+}
+
+function normalizeBook(s: string) {
+  return s.normalize("NFKC").replace(/\s+/g, " ").trim();
 }
 
 function isHttpUrl(s: string) {
@@ -215,67 +280,20 @@ function isBlockedHost(host: string, disableFilters: boolean): boolean {
   return WEBSITE_BLOCKLIST.some((bad) => h.includes(bad));
 }
 
-function normalizeAuthor(s: string) {
-  return s.normalize("NFKC").replace(/\s+/g, " ").trim();
-}
-
-/* =============================
-   HTML signals
-   ============================= */
-async function fetchHtmlSignals(url: string, ctx: Context): Promise<{
-  titleTokens: string[];
-  hasCopyrightName: boolean;
-  hasSchemaPerson: boolean;
-  hasOfficialWords: boolean;
-  bookMentioned: boolean;
-}> {
-  try {
-    const res = await fetchWithTimeout(url);
-    if (!res?.ok) {
-      return { titleTokens: [], hasCopyrightName: false, hasSchemaPerson: false, hasOfficialWords: false, bookMentioned: false };
-    }
-    const html = await res.text();
-    const head = html.slice(0, 100_000); // examine only head/early body
-
-    const title = /<title[^>]*>([^<]*)<\/title>/i.exec(head)?.[1] ?? "";
-    const tt = tokens(title);
-
-    const lower = head.toLowerCase();
-
-    const copyrightName =
-      /\u00A9|&copy;|copyright/i.test(head) &&
-      ctx.authorTokens.length > 0 &&
-      (containsAll(tokens(head), ctx.authorTokens) || head.toLowerCase().includes(normalizeAuthor(ctx.authorName).toLowerCase()));
-
-    const schemaPerson = /"@type"\s*:\s*"(?:Person|Author)"/i.test(head);
-
-    const officialWords = /\bofficial (site|website)\b/i.test(title) || /\bofficial (site|website)\b/i.test(head);
-
-    const bookMentioned =
-      ctx.bookTokens.length > 0 &&
-      (containsAll(tokens(head), ctx.bookTokens) || jaccard(tokens(head), ctx.bookTokens) >= 0.25);
-
-    return {
-      titleTokens: tt,
-      hasCopyrightName: !!copyrightName,
-      hasSchemaPerson: !!schemaPerson,
-      hasOfficialWords: !!officialWords,
-      bookMentioned: !!bookMentioned,
-    };
-  } catch {
-    return { titleTokens: [], hasCopyrightName: false, hasSchemaPerson: false, hasOfficialWords: false, bookMentioned: false };
-  }
+function isAllowedDiscoveryHost(host: string): boolean {
+  const h = host.toLowerCase();
+  return AUTHOR_DISCOVERY_ALLOW.some((good) => h.includes(good));
 }
 
 /* =============================
    Google CSE
    ============================= */
-async function googleCSE(query: string): Promise<any[]> {
+async function googleCSE(query: string, num = 10): Promise<any[]> {
   const url = new URL("https://www.googleapis.com/customsearch/v1");
   url.searchParams.set("key", CSE_KEY);
   url.searchParams.set("cx", CSE_ID);
   url.searchParams.set("q", query);
-  url.searchParams.set("num", "10");
+  url.searchParams.set("num", String(Math.max(1, Math.min(10, num))));
 
   const resp = await fetchWithTimeout(url.toString());
   if (!resp?.ok) {
@@ -287,7 +305,138 @@ async function googleCSE(query: string): Promise<any[]> {
 }
 
 /* =============================
-   Website search & scoring
+   Phase 1: Discover the author from the book title
+   ============================= */
+function extractAuthorNamesFromText(text: string): string[] {
+  const t = text.replace(/\s+/g, " ");
+  const candidates = new Set<string>();
+
+  // Common patterns: "by John Smith", "Author: John Smith", "Written by John Smith"
+  const byRegex = /\bby\s+([A-Z][\p{L}'\-]+(?:\s+[A-Z][\p{L}'\-]+){0,3})\b/giu;
+  const authorLabelRegex = /\b(?:author|writer)\s*:\s*([A-Z][\p{L}'\-]+(?:\s+[A-Z][\p{L}'\-]+){0,3})\b/giu;
+  const writtenByRegex = /\bwritten\s+by\s+([A-Z][\p{L}'\-]+(?:\s+[A-Z][\p{L}'\-]+){0,3})\b/giu;
+
+  for (const m of t.matchAll(byRegex)) candidates.add(m[1].trim());
+  for (const m of t.matchAll(authorLabelRegex)) candidates.add(m[1].trim());
+  for (const m of t.matchAll(writtenByRegex)) candidates.add(m[1].trim());
+
+  return Array.from(candidates);
+}
+
+function scoreAuthorCandidate(name: string, host: string, title: string, snippet: string, ctx: Context): AuthorCandidate {
+  let score = 0;
+  const reasons: string[] = [];
+  const nameTokens = tokens(name);
+  const textToks = tokens((title || "") + " " + (snippet || ""));
+
+  // If the book title appears strongly in the hit, that’s good.
+  if (containsAll(textToks, ctx.bookTokens) || jaccard(textToks, ctx.bookTokens) >= 0.35) {
+    score += 0.25;
+    reasons.push("book_match");
+  }
+
+  // Trusted discovery hosts boost
+  if (isAllowedDiscoveryHost(host)) {
+    score += 0.25;
+    reasons.push("trusted_discovery_domain");
+  }
+
+  // Full "by <name>" style extraction is strong
+  const text = `${title} ${snippet}`;
+  const foundBy = new RegExp(`\\bby\\s+${name.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\b`, "i").test(text);
+  if (foundBy) {
+    score += 0.25;
+    reasons.push("by_phrase_match");
+  }
+
+  // If the candidate name is repeated or the snippet clearly centers on the person
+  const nameJac = jaccard(tokens(text), nameTokens);
+  if (nameJac >= 0.25) {
+    score += 0.15;
+    reasons.push(`name_similarity:${nameJac.toFixed(2)}`);
+  }
+
+  // Publisher domains get a small extra bump
+  if (
+    /penguinrandomhouse\.com|harpercollins\.com|simonandschuster\.com|macmillan\.com|hachettebookgroup\.com|bloomsbury\.com|panmacmillan\.com|faber\.co\.uk/i.test(
+      host
+    )
+  ) {
+    score += 0.10;
+    reasons.push("publisher_domain");
+  }
+
+  return { name, score: Math.max(0, Math.min(1, score)), reasons };
+}
+
+async function discoverAuthorFromBook(bookTitle: string, ctx: Context, debug: boolean) {
+  const quoted = `"${bookTitle}"`;
+
+  // Multiple queries to stabilize author detection.
+  const queries = [
+    `${quoted} author`,
+    `${quoted} book author`,
+    `${quoted} novel author`,
+    `${quoted} site:wikipedia.org`,
+    `${quoted} site:books.google.com`,
+    `${quoted} site:goodreads.com`,
+  ];
+
+  const diag: any = { queries, hits: [], candidates: [] as any[], picked: undefined };
+
+  const limit = pLimit(CONCURRENCY);
+  const allItems: any[] = (
+    await Promise.all(
+      queries.map((q) =>
+        limit(async () => {
+          const items = USE_SEARCH_BASE ? await googleCSE(q) : [];
+          return items;
+        })
+      )
+    )
+  ).flat();
+
+  const authorScores = new Map<string, AuthorCandidate>();
+
+  for (const it of allItems) {
+    const url = String(it.link || "");
+    if (!isHttpUrl(url)) continue;
+    const host = hostOf(url);
+    const title = String(it.title || "");
+    const snippet = String(it.snippet || it.htmlSnippet || "");
+
+    // Only tally names from trusted discovery hosts (reduces noise)
+    if (!isAllowedDiscoveryHost(host)) continue;
+
+    // Pull names from title/snippet via patterns
+    const names = new Set<string>([
+      ...extractAuthorNamesFromText(title),
+      ...extractAuthorNamesFromText(snippet),
+    ]);
+
+    for (const name of names) {
+      if (!name) continue;
+      const cand = scoreAuthorCandidate(name, host, title, snippet, ctx);
+      const prev = authorScores.get(name);
+      if (!prev || cand.score > prev.score) {
+        authorScores.set(name, cand);
+      }
+    }
+
+    if (debug) diag.hits.push({ title, url, host });
+  }
+
+  // Rank candidates by score; also merge duplicates differing only by accents/case
+  const ranked = Array.from(authorScores.values()).sort((a, b) => b.score - a.score);
+  if (debug) diag.candidates = ranked.slice(0, 10);
+
+  const best = ranked[0] || null;
+  if (debug) diag.picked = best;
+  return { best, _diag: debug ? diag : undefined };
+}
+
+/* =============================
+   Phase 2: Find the author's official website
    ============================= */
 function baseHit(it: any): WebHit {
   const url = String(it.link || "");
@@ -301,23 +450,17 @@ function baseHit(it: any): WebHit {
   };
 }
 
-function scoreBaseSignals(hit: WebHit, ctx: Context): WebHit {
+function scoreBaseWebsiteSignals(hit: WebHit, authorName: string): WebHit {
   let score = 0;
   const reasons: string[] = [];
 
-  // Title/snippet contain full author name
   const t = tokens(hit.title + " " + (hit.snippet || ""));
-  if (containsAll(t, ctx.authorTokens) || jaccard(t, ctx.authorTokens) >= 0.35) {
+  const authorTokens = tokens(authorName);
+
+  // Author mentioned in title/snippet
+  if (containsAll(t, authorTokens) || jaccard(t, authorTokens) >= 0.35) {
     score += 0.35;
     reasons.push("author_in_title_or_snippet");
-  }
-
-  // If book tokens exist and appear, small boost (helps disambiguate same-name authors)
-  if (ctx.bookTokens.length) {
-    if (containsAll(t, ctx.bookTokens) || jaccard(t, ctx.bookTokens) >= 0.25) {
-      score += 0.15;
-      reasons.push("book_in_title_or_snippet");
-    }
   }
 
   // Block obvious non-home hosts
@@ -326,18 +469,16 @@ function scoreBaseSignals(hit: WebHit, ctx: Context): WebHit {
     reasons.push("blocked_domain");
   }
 
-  // Prefer likely author-owned domains (vanity domains—name matches host sans TLD)
-  const compactName = normalizeAuthor(ctx.authorName).toLowerCase().replace(/\s+/g, "");
+  // Vanity domain preference (e.g., firstname-lastname.com)
+  const compact = authorName.toLowerCase().replace(/\s+/g, "");
   const hostBare = hit.host.replace(/^www\./, "");
-  if (hostBare.startsWith(compactName) || hostBare.includes(compactName)) {
+  if (hostBare.startsWith(compact) || hostBare.includes(compact)) {
     score += 0.25;
     reasons.push("vanity_domain_match");
   }
 
   // Slight preference for custom domains over platforms
-  if (
-    !/substack\.com|medium\.com|wordpress\.com|blogspot\.|ghost\.io/i.test(hit.host)
-  ) {
+  if (!/substack\.com|medium\.com|wordpress\.com|blogspot\.|ghost\.io/i.test(hit.host)) {
     score += 0.05;
     reasons.push("custom_domain_preferred");
   } else {
@@ -349,23 +490,59 @@ function scoreBaseSignals(hit: WebHit, ctx: Context): WebHit {
   return hit;
 }
 
-async function enrichWithHtml(hit: WebHit, ctx: Context): Promise<WebHit> {
+async function fetchHtmlSignals(url: string, authorName: string, bookTokens: string[]): Promise<{
+  titleTokens: string[];
+  hasCopyrightName: boolean;
+  hasSchemaPerson: boolean;
+  hasOfficialWords: boolean;
+  bookMentioned: boolean;
+}> {
+  try {
+    const res = await fetchWithTimeout(url);
+    if (!res?.ok) {
+      return { titleTokens: [], hasCopyrightName: false, hasSchemaPerson: false, hasOfficialWords: false, bookMentioned: false };
+    }
+    const html = await res.text();
+    const head = html.slice(0, 120_000);
+
+    const title = /<title[^>]*>([^<]*)<\/title>/i.exec(head)?.[1] ?? "";
+    const tt = tokens(title);
+
+    const lower = head.toLowerCase();
+    const authorLower = authorName.toLowerCase();
+
+    const hasOfficialWords = /\bofficial (site|website)\b/i.test(title) || /\bofficial (site|website)\b/i.test(head);
+    const hasSchemaPerson = /"@type"\s*:\s*"(?:Person|Author)"/i.test(head);
+
+    const hasCopyrightName =
+      (/\u00A9|&copy;|copyright/i.test(head)) &&
+      (lower.includes(authorLower) || jaccard(tokens(head), tokens(authorName)) >= 0.25);
+
+    const bookMentioned =
+      bookTokens.length > 0 &&
+      (containsAll(tokens(head), bookTokens) || jaccard(tokens(head), bookTokens) >= 0.25);
+
+    return { titleTokens: tt, hasCopyrightName, hasSchemaPerson, hasOfficialWords, bookMentioned };
+  } catch {
+    return { titleTokens: [], hasCopyrightName: false, hasSchemaPerson: false, hasOfficialWords: false, bookMentioned: false };
+  }
+}
+
+async function enrichWebsiteHit(hit: WebHit, authorName: string, bookTokens: string[]): Promise<WebHit> {
   const origin = originOf(hit.url);
   if (!origin) return hit;
 
   const [home, about] = await Promise.all([
-    fetchHtmlSignals(origin, ctx),
-    fetchHtmlSignals(origin + "/about", ctx),
+    fetchHtmlSignals(origin, authorName, bookTokens),
+    fetchHtmlSignals(origin + "/about", authorName, bookTokens),
   ]);
 
-  const signals = [
-    home,
-    about, // reading /about often yields clearer "official" hints
-  ];
+  const authorTokens = tokens(authorName);
 
-  for (const s of signals) {
+  for (const s of [home, about]) {
     if (!s) continue;
-    if (containsAll(s.titleTokens, ctx.authorTokens) || jaccard(s.titleTokens, ctx.authorTokens) >= 0.4) {
+
+    if (containsAll(s.titleTokens, authorTokens) || jaccard(s.titleTokens, authorTokens) >= 0.4) {
       hit.confidence = Math.min(1, hit.confidence + 0.15);
       hit.reasons.push("title_matches_author");
     }
@@ -390,20 +567,18 @@ async function enrichWithHtml(hit: WebHit, ctx: Context): Promise<WebHit> {
   return hit;
 }
 
-async function searchAuthorWebsite(authorName: string, bookTitle: string, ctx: Context, debug: boolean) {
+async function searchAuthorWebsite(authorName: string, ctx: Context, debug: boolean) {
   const quotedAuthor = `"${authorName}"`;
-  const bookPart = bookTitle ? ` "${bookTitle}"` : "";
 
-  // Try multiple phrasings; union results (de-duped by URL)
   const queries = [
-    `${quotedAuthor}${bookPart} official site`,
-    `${quotedAuthor}${bookPart} official website`,
-    `${quotedAuthor}${bookPart} author website`,
+    `${quotedAuthor} official site`,
+    `${quotedAuthor} official website`,
+    `${quotedAuthor} author website`,
     `${quotedAuthor} site`,
     `${quotedAuthor} website`,
   ];
 
-  const diag: any = { queries, rawCounts: [] as number[], picked: undefined };
+  const diag: any = { queries, candidates: [] as any[], picked: undefined };
 
   const limit = pLimit(CONCURRENCY);
   const allItems: any[] = (
@@ -411,7 +586,6 @@ async function searchAuthorWebsite(authorName: string, bookTitle: string, ctx: C
       queries.map((q) =>
         limit(async () => {
           const items = USE_SEARCH_BASE ? await googleCSE(q) : [];
-          diag.rawCounts.push(items.length);
           return items;
         })
       )
@@ -426,16 +600,16 @@ async function searchAuthorWebsite(authorName: string, bookTitle: string, ctx: C
     if (!isHttpUrl(hit.url)) continue;
     if (seen.has(hit.url)) continue;
     seen.add(hit.url);
-    prelim.push(scoreBaseSignals(hit, ctx));
+    prelim.push(scoreBaseWebsiteSignals(hit, authorName));
   }
 
-  // Remove blocked after scoring
+  // Filter out blocked hosts (unless unsafe)
   const filtered = prelim.filter((h) =>
     ctx.unsafeDisableDomainFilters ? true : !isBlockedHost(h.host, false)
   );
 
-  // Enrich with HTML signals (home + /about)
-  const enriched = await Promise.all(filtered.map((h) => limit(() => enrichWithHtml(h, ctx))));
+  // Enrich with HTML signals
+  const enriched = await Promise.all(filtered.map((h) => limit(() => enrichWebsiteHit(h, authorName, ctx.bookTokens))));
   enriched.sort((a, b) => b.confidence - a.confidence);
 
   if (debug) diag.candidates = enriched.slice(0, 10).map((h) => ({
@@ -473,11 +647,16 @@ export default async function handler(req: any, res: any) {
     const bodyRaw = req.body ?? {};
     const body = typeof bodyRaw === "string" ? JSON.parse(bodyRaw || "{}") : bodyRaw;
 
-    const author = normalizeAuthor(String(body.author_name || ""));
-    if (!author) return res.status(400).json({ error: "author_name required" });
+    // Require ONLY a book title; author input is not accepted.
+    const bookTitleInput = String(body.book_title || "");
+    const bookTitle = normalizeBook(bookTitleInput);
+    if (!bookTitle) return res.status(400).json({ error: "book_title required" });
 
-    const bookTitle: string = typeof body.book_title === "string" ? body.book_title : "";
     const debug: boolean = body.debug === true;
+    const minAuthorConfidence: number =
+      typeof body.min_author_confidence === "number"
+        ? Math.max(0, Math.min(1, body.min_author_confidence))
+        : DEFAULT_MIN_AUTHOR_CONFIDENCE;
 
     const minSiteConfidence: number =
       typeof body.min_site_confidence === "number"
@@ -493,18 +672,15 @@ export default async function handler(req: any, res: any) {
     res.setHeader("x-cse-id-present", String(!!CSE_ID));
     res.setHeader("x-cse-key-present", String(!!CSE_KEY));
 
-    const authorTokens = tokens(author);
     const bookTokens = tokens(bookTitle);
-
-    const ctx: Context = {
-      authorName: author,
-      authorTokens,
-      bookTokens,
-      unsafeDisableDomainFilters,
-    };
+    const ctx: Context = { bookTitle, bookTokens, unsafeDisableDomainFilters };
 
     const cacheKey = makeCacheKey({
-      author, bookTitle, minSiteConfidence, USE_SEARCH, unsafeDisableDomainFilters,
+      bookTitle,
+      minAuthorConfidence,
+      minSiteConfidence,
+      USE_SEARCH,
+      unsafeDisableDomainFilters,
     });
 
     const cached = getCached(cacheKey);
@@ -515,11 +691,13 @@ export default async function handler(req: any, res: any) {
 
     if (!USE_SEARCH) {
       const fail: CacheValue = {
-        author_name: author,
+        book_title: bookTitle,
+        inferred_author: undefined,
         author_url: undefined,
         site_title: undefined,
         canonical_url: undefined,
         confidence: 0,
+        author_confidence: 0,
         source: "web",
         _diag: debug ? { reason: "search_disabled_or_not_configured" } : undefined,
       };
@@ -528,17 +706,40 @@ export default async function handler(req: any, res: any) {
       return res.status(200).json(fail);
     }
 
-    const { best, _diag } = await searchAuthorWebsite(author, bookTitle, ctx, debug);
+    /* ---------- Phase 1: Author discovery ---------- */
+    const { best: authorBest, _diag: authorDiag } = await discoverAuthorFromBook(bookTitle, ctx, debug);
 
-    if (!best || best.confidence < minSiteConfidence) {
+    if (!authorBest || authorBest.score < minAuthorConfidence) {
       const payload: CacheValue = {
-        author_name: author,
+        book_title: bookTitle,
+        inferred_author: authorBest?.name,
         author_url: undefined,
         site_title: undefined,
         canonical_url: undefined,
-        confidence: best ? Number(best.confidence.toFixed(2)) : 0,
+        confidence: 0,
+        author_confidence: authorBest ? Number(authorBest.score.toFixed(2)) : 0,
         source: "web",
-        _diag,
+        _diag: debug ? { author: authorDiag } : undefined,
+      };
+      setCached(cacheKey, payload);
+      res.setHeader("x-cache", "MISS");
+      return res.status(200).json(payload);
+    }
+
+    /* ---------- Phase 2: Find official website ---------- */
+    const { best: siteBest, _diag: siteDiag } = await searchAuthorWebsite(authorBest.name, ctx, debug);
+
+    if (!siteBest || siteBest.confidence < minSiteConfidence) {
+      const payload: CacheValue = {
+        book_title: bookTitle,
+        inferred_author: authorBest.name,
+        author_url: undefined,
+        site_title: undefined,
+        canonical_url: undefined,
+        confidence: siteBest ? Number(siteBest.confidence.toFixed(2)) : 0,
+        author_confidence: Number(authorBest.score.toFixed(2)),
+        source: "web",
+        _diag: debug ? { author: authorDiag, site: siteDiag } : undefined,
       };
       setCached(cacheKey, payload);
       res.setHeader("x-cache", "MISS");
@@ -546,7 +747,7 @@ export default async function handler(req: any, res: any) {
     }
 
     // Normalize to origin, fetch canonical & title for nicety
-    const origin = originOf(best.url)!;
+    const origin = originOf(siteBest.url)!;
 
     let siteTitle: string | null = null;
     let canonical: string | null = null;
@@ -568,13 +769,15 @@ export default async function handler(req: any, res: any) {
     }
 
     const payload: CacheValue = {
-      author_name: author,
+      book_title: bookTitle,
+      inferred_author: authorBest.name,
       author_url: origin,
       site_title: siteTitle,
       canonical_url: canonical || origin,
-      confidence: Number(best.confidence.toFixed(2)),
+      confidence: Number(siteBest.confidence.toFixed(2)),
+      author_confidence: Number(authorBest.score.toFixed(2)),
       source: "web",
-      _diag,
+      _diag: debug ? { author: authorDiag, site: siteDiag } : undefined,
     };
 
     setCached(cacheKey, payload);
