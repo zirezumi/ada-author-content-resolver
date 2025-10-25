@@ -7,7 +7,7 @@
  *   "book_title": "Educated",
  *   "include_search": true,                 // default true (requires GOOGLE_CSE_* env)
  *   "min_author_confidence": 0.55,          // optional 0..1
- *   "min_site_confidence": 0.55,            // optional 0..1
+ *   "min_site_confidence": 0.65,            // optional 0..1 (default tightened)
  *   "allow_estate_sites": false,            // optional, default false
  *   "debug": true,                          // optional
  *   "unsafe_disable_domain_filters": false  // optional
@@ -59,11 +59,11 @@ function requireAuth(req: any, res: any): boolean {
    ============================= */
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 const FETCH_TIMEOUT_MS = 5500;
-const USER_AGENT = "BookAuthorWebsite/1.3 (+https://example.com)";
+const USER_AGENT = "BookAuthorWebsite/1.4 (+https://example.com)";
 const CONCURRENCY = 4;
 
 const DEFAULT_MIN_AUTHOR_CONFIDENCE = 0.55;
-const DEFAULT_MIN_SITE_CONFIDENCE = 0.55;
+const DEFAULT_MIN_SITE_CONFIDENCE = 0.65; // slightly stricter by default
 
 /* ====== Google CSE config (trim to avoid whitespace/newlines) ====== */
 const CSE_KEY = (process.env.GOOGLE_CSE_KEY || "").trim();
@@ -138,6 +138,17 @@ const WEBSITE_BLOCKLIST = [
   "wsj.com",
   "washingtonpost.com",
   "newyorker.com",
+];
+
+// plain-language negatives to avoid obvious wrong-site types
+const WEBSITE_NEGATIVE_KEYWORDS = [
+  // venues / locations
+  "stadium","field","park","arena","ballpark","amphitheater","theatre","theater","museum",
+  // services / businesses unrelated to authors
+  "beauty","salon","spa","boutique","realtor","plumbing","roofing","hvac","law firm","attorney",
+  "restaurant","cafe","bar","grill","hotel","resort","casino","real estate","accounting",
+  // media that often hijacks book queries
+  "trailer","soundtrack","screenplay","director","filmography","cinematography"
 ];
 
 /* =============================
@@ -343,6 +354,37 @@ async function googleCSE(query: string, num = 10): Promise<any[]> {
 /* =============================
    Phase 1: Discover the author from the book title
    ============================= */
+
+// OpenLibrary anchor to get canonical author & first publish year reliably (no API key required)
+async function olLookupTitle(title: string): Promise<{ author?: string; year?: number } | null> {
+  try {
+    const url = new URL("https://openlibrary.org/search.json");
+    url.searchParams.set("title", title);
+    url.searchParams.set("limit", "10");
+    const r = await fetchWithTimeout(url.toString());
+    if (!r?.ok) return null;
+    const j: any = await r.json();
+    const docs = Array.isArray(j?.docs) ? j.docs : [];
+    const scored = docs
+      .filter((d: any) => d?.author_name)
+      .map((d: any) => {
+        const author = String((d.author_name || [])[0] || "").trim();
+        const year = typeof d.first_publish_year === "number" ? d.first_publish_year : null;
+        const t = String(d?.title || "");
+        const sim = jaccard(tokens(t), tokens(title));
+        let score = sim;
+        if (year) score += 0.05;
+        return { author, year, score };
+      })
+      .sort((a: any, b: any) => b.score - a.score);
+    const top = scored[0];
+    if (!top?.author) return null;
+    return { author: sanitizeAuthorName(top.author), year: top.year ?? undefined };
+  } catch {
+    return null;
+  }
+}
+
 function extractAuthorNamesFromText(text: string): string[] {
   const t = text.replace(/\s+/g, " ");
   const candidates = new Set<string>();
@@ -392,7 +434,7 @@ function scoreAuthorCandidate(name: string, host: string, title: string, snippet
     reasons.push(`name_similarity:${nameJac.toFixed(2)}`);
   }
 
-  // NEW: penalize polluted labels (e.g., "American author Tara Westover")
+  // penalize polluted labels (e.g., "American author Tara Westover")
   if (/\b(american|british|canadian|author|writer|novelist|journalist|poet|historian|professor)\b/i.test(name)) {
     score -= 0.15;
     reasons.push("name_contains_descriptor");
@@ -414,16 +456,20 @@ function scoreAuthorCandidate(name: string, host: string, title: string, snippet
 async function discoverAuthorFromBook(bookTitle: string, ctx: Context, debug: boolean) {
   const quoted = `"${bookTitle}"`;
 
+  // Prefer book contexts; downrank film/movie pages up front
   const queries = [
-    `${quoted} author`,
-    `${quoted} book author`,
-    `${quoted} novel author`,
-    `${quoted} site:wikipedia.org`,
-    `${quoted} site:books.google.com`,
-    `${quoted} site:goodreads.com`,
+    `${quoted} book author -film -movie -screenplay -director`,
+    `${quoted} novel author -film -movie`,
+    `${quoted} author site:wikipedia.org -film -movie`,
+    `${quoted} author site:books.google.com`,
+    `${quoted} author site:goodreads.com`,
   ];
 
   const diag: any = { queries, hits: [], candidates: [] as any[], picked: undefined };
+
+  // OpenLibrary anchor — get a strong initial author guess + year
+  const ol = await olLookupTitle(bookTitle);
+  if (debug) diag.openlibrary = ol || null;
 
   const limit = pLimit(CONCURRENCY);
   const allItems: any[] = (
@@ -467,9 +513,14 @@ async function discoverAuthorFromBook(bookTitle: string, ctx: Context, debug: bo
 
   const ranked = Array.from(authorScores.values())
     .map(a => {
-      // sanitize each candidate for fair comparison
+      // sanitize each candidate for fair comparison; boost if matching OL
       const clean = sanitizeAuthorName(a.name);
-      return clean && clean !== a.name ? { ...a, name: clean, score: Math.min(1, a.score + 0.05), reasons: [...a.reasons, "sanitized"] } : a;
+      const boost =
+        ol?.author && jaccard(tokens(clean), tokens(ol.author)) >= 0.7 ? 0.20 :
+        ol?.author && jaccard(tokens(clean), tokens(ol.author)) >= 0.5 ? 0.10 : 0;
+      return clean && clean !== a.name
+        ? { ...a, name: clean, score: Math.min(1, a.score + 0.05 + boost), reasons: [...a.reasons, "sanitized", ...(boost ? ["ol_anchor_boost"] : [])] }
+        : { ...a, score: Math.min(1, a.score + boost), reasons: [...a.reasons, ...(boost ? ["ol_anchor_boost"] : [])] };
     })
     .sort((a, b) => b.score - a.score);
 
@@ -513,9 +564,9 @@ async function discoverOriginalPubYear(bookTitle: string, authorName: string, ct
   const quotedBook = `"${bookTitle}"`;
   const quotedAuthor = `"${authorName}"`;
   const qA = [
-    `${quotedBook} ${quotedAuthor} first published`,
-    `${quotedBook} ${quotedAuthor} original publication date`,
-    `${quotedBook} ${quotedAuthor} publication date`,
+    `${quotedBook} ${quotedAuthor} first published -film -movie`,
+    `${quotedBook} ${quotedAuthor} original publication date -film -movie`,
+    `${quotedBook} ${quotedAuthor} publication date -film -movie`,
     `${quotedBook} ${quotedAuthor} site:wikipedia.org`,
     `${quotedBook} ${quotedAuthor} site:books.google.com`,
     `${quotedBook} ${quotedAuthor} site:openlibrary.org`,
@@ -572,6 +623,27 @@ async function discoverOriginalPubYear(bookTitle: string, authorName: string, ct
     .sort((a,b) => b.score - a.score || a.year - b.year);
   const best = ranked[0] ? { year: ranked[0].year } : null;
   if (debug) { diag.candidates = ranked.slice(0, 10); diag.picked = best; }
+
+  // If still no year, fall back to OpenLibrary anchor (author-aware)
+  if (!best?.year) {
+    try {
+      const url = new URL("https://openlibrary.org/search.json");
+      url.searchParams.set("title", bookTitle);
+      url.searchParams.set("author", authorName);
+      url.searchParams.set("limit", "5");
+      const r = await fetchWithTimeout(url.toString());
+      if (r?.ok) {
+        const j: any = await r.json();
+        const yrs = (j?.docs || []).map((d: any) => d?.first_publish_year).filter((y: any) => typeof y === "number");
+        if (yrs.length) {
+          const y = Math.min(...yrs);
+          if (debug) diag.openlibrary_year = y;
+          return { best: { year: y }, _diag: debug ? diag : undefined };
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
   return { best, _diag: debug ? diag : undefined };
 }
 
@@ -685,10 +757,8 @@ function evaluateAuthorViability(
         ? { viable: true, reason: "pubyear_1900_1950_estate_allowed" }
         : { viable: false, reason: "pubyear_1900_1950_estate_not_allowed" };
     } else if (pubYear < 1995) {
-      // 1950–1994: possible living author, but stricter — require strong site signals later
       return { viable: true, reason: "pubyear_1950_1994_cautious" };
     } else {
-      // 1995+: very likely a living/modern author
       return { viable: true, reason: "pubyear_ge_1995_likely_living" };
     }
   }
@@ -757,11 +827,15 @@ async function fetchHtmlSignals(url: string, authorName: string, bookTokens: str
   hasOfficialWords: boolean;
   bookMentioned: boolean;
   estateWording: boolean;
+  isPublisherAuthorPage: boolean;
+  isClearlyFilmOrDirector: boolean;
+  hasAuthorialNav: boolean; // presence of "Books" or "Writing" sections
+  negativeKeywordHit: string | null;
 }> {
   try {
     const res = await fetchWithTimeout(url);
     if (!res?.ok) {
-      return { titleTokens: [], hasCopyrightName: false, hasSchemaPerson: false, hasOfficialWords: false, bookMentioned: false, estateWording: false };
+      return { titleTokens: [], hasCopyrightName: false, hasSchemaPerson: false, hasOfficialWords: false, bookMentioned: false, estateWording: false, isPublisherAuthorPage: false, isClearlyFilmOrDirector: false, hasAuthorialNav: false, negativeKeywordHit: null };
     }
     const html = await res.text();
     const head = html.slice(0, 120_000);
@@ -785,9 +859,23 @@ async function fetchHtmlSignals(url: string, authorName: string, bookTokens: str
 
     const estateWording = /\b(Estate\s+of\s+|Official\s+Estate\s+of\s+)/i.test(head);
 
-    return { titleTokens: tt, hasCopyrightName, hasSchemaPerson, hasOfficialWords, bookMentioned, estateWording };
+    const isPublisherAuthorPage =
+      /\b(author|authors)\/[a-z0-9-]+/i.test(head) || /\brel=["']author["']/i.test(head);
+
+    const isClearlyFilmOrDirector =
+      /\b(film|movie|director|screenplay|trailer|cinematography|production company)\b/i.test(head);
+
+    const hasAuthorialNav =
+      /\b(books|novels|writing|bio|about)\b/i.test(head);
+
+    let negativeKeywordHit: string | null = null;
+    for (const w of WEBSITE_NEGATIVE_KEYWORDS) {
+      if (new RegExp(`\\b${w}\\b`, "i").test(head)) { negativeKeywordHit = w; break; }
+    }
+
+    return { titleTokens: tt, hasCopyrightName, hasSchemaPerson, hasOfficialWords, bookMentioned, estateWording, isPublisherAuthorPage, isClearlyFilmOrDirector, hasAuthorialNav, negativeKeywordHit };
   } catch {
-    return { titleTokens: [], hasCopyrightName: false, hasSchemaPerson: false, hasOfficialWords: false, bookMentioned: false, estateWording: false };
+    return { titleTokens: [], hasCopyrightName: false, hasSchemaPerson: false, hasOfficialWords: false, bookMentioned: false, estateWording: false, isPublisherAuthorPage: false, isClearlyFilmOrDirector: false, hasAuthorialNav: false, negativeKeywordHit: null };
   }
 }
 
@@ -828,20 +916,105 @@ async function enrichWebsiteHit(hit: WebHit, authorName: string, bookTokens: str
     if (s.estateWording) {
       hit.reasons.push("estate_wording_detected");
     }
+    if (s.isPublisherAuthorPage) {
+      hit.confidence = Math.min(1, hit.confidence + 0.15);
+      hit.reasons.push("publisher_author_page");
+    }
+    if (s.hasAuthorialNav) {
+      hit.confidence = Math.min(1, hit.confidence + 0.05);
+      hit.reasons.push("authorial_nav_present");
+    }
+    if (s.isClearlyFilmOrDirector) {
+      hit.confidence = Math.max(0, hit.confidence - 0.35);
+      hit.reasons.push("film_director_context");
+    }
+    if (s.negativeKeywordHit) {
+      hit.confidence = Math.max(0, hit.confidence - 0.50);
+      hit.reasons.push(`negative_keyword:${s.negativeKeywordHit}`);
+    }
   }
 
   return hit;
 }
 
+// ---- Book+Author fast-path queries (new) ----
+function buildBookAuthorSiteQueries(bookTitle: string, authorName: string): string[] {
+  const qBook = `"${bookTitle}"`;
+  const qAuthor = `"${authorName}"`;
+  const tail = "-film -movie -director -trailer";
+  return [
+    `${qBook} ${qAuthor} official website ${tail}`,
+    `${qBook} ${qAuthor} author website ${tail}`,
+    `${qBook} ${qAuthor} official site ${tail}`,
+    // Publisher context sometimes points to a personal domain via the author page:
+    `${qBook} ${qAuthor} site:penguinrandomhouse.com ${tail}`,
+    `${qBook} ${qAuthor} site:harpercollins.com ${tail}`,
+    `${qBook} ${qAuthor} site:simonandschuster.com ${tail}`,
+    `${qBook} ${qAuthor} site:macmillan.com ${tail}`,
+    `${qBook} ${qAuthor} site:hachettebookgroup.com ${tail}`,
+  ];
+}
+
+async function searchAuthorWebsiteWithBookContext(
+  authorName: string,
+  bookTitle: string,
+  ctx: Context,
+  debug: boolean
+) {
+  const queries = buildBookAuthorSiteQueries(bookTitle, authorName);
+  const diag: any = { queries, candidates: [], picked: undefined };
+
+  const limit = pLimit(CONCURRENCY);
+  const items = (await Promise.all(
+    queries.map(q => limit(() => (USE_SEARCH_BASE ? googleCSE(q) : [])))
+  )).flat();
+
+  const seen = new Set<string>();
+  const prelim = items
+    .map(baseHit)
+    .filter(h => isHttpUrl(h.url))
+    .filter(h => !seen.has(h.url) && seen.add(h.url))
+    .map(h => scoreBaseWebsiteSignals(h, authorName))
+    .filter(h => (ctx.unsafeDisableDomainFilters ? true : !isBlockedHost(h.host, false)));
+
+  const enriched = await Promise.all(prelim.map(h => limit(() => enrichWebsiteHit(h, authorName, ctx.bookTokens))));
+
+  // Require strong author-site signals
+  const accepted = enriched.filter(h => {
+    if (!ctx.allowEstateSites && h.reasons.includes("estate_wording_detected")) return false;
+
+    const strong =
+      h.reasons.includes("vanity_domain_match") ||
+      h.reasons.includes("schema_person_present") ||
+      h.reasons.includes("publisher_author_page") ||
+      h.reasons.includes("copyright_name_match") ||
+      h.reasons.includes("title_matches_author");
+
+    return strong && !h.reasons.includes("blocked_domain");
+  });
+
+  accepted.sort((a, b) => b.confidence - a.confidence);
+
+  if (debug) {
+    diag.candidates = accepted.slice(0, 10).map(h => ({
+      url: h.url, host: h.host, confidence: Number(h.confidence.toFixed(2)), reasons: h.reasons
+    }));
+    if (accepted[0]) diag.picked = { url: accepted[0].url, confidence: Number(accepted[0].confidence.toFixed(2)), reasons: accepted[0].reasons };
+  }
+
+  return { best: accepted[0] || null, _diag: debug ? diag : undefined };
+}
+
+// ---- Generic author-only search (existing) ----
 async function searchAuthorWebsite(authorName: string, ctx: Context, debug: boolean) {
   const quotedAuthor = `"${authorName}"`;
 
   const queries = [
-    `${quotedAuthor} official site`,
-    `${quotedAuthor} official website`,
-    `${quotedAuthor} author website`,
-    `${quotedAuthor} site`,
-    `${quotedAuthor} website`,
+    `${quotedAuthor} official site -film -movie -director`,
+    `${quotedAuthor} official website -film -movie -director`,
+    `${quotedAuthor} author website -film -movie`,
+    `${quotedAuthor} site -film -movie`,
+    `${quotedAuthor} website -film -movie`,
   ];
 
   const diag: any = { queries, candidates: [] as any[], picked: undefined };
@@ -875,8 +1048,15 @@ async function searchAuthorWebsite(authorName: string, ctx: Context, debug: bool
   const enriched = await Promise.all(filtered.map((h) => limit(() => enrichWebsiteHit(h, authorName, ctx.bookTokens))));
 
   const postFiltered = enriched.filter((h) => {
-    if (ctx.allowEstateSites) return true;
-    return !h.reasons.includes("estate_wording_detected");
+    if (!ctx.allowEstateSites && h.reasons.includes("estate_wording_detected")) return false;
+    // Acceptance guard: require one of these strong conditions
+    const strongSignals =
+      h.reasons.includes("vanity_domain_match") ||
+      h.reasons.includes("schema_person_present") ||
+      h.reasons.includes("publisher_author_page") ||
+      h.reasons.includes("copyright_name_match") ||
+      h.reasons.includes("title_matches_author");
+    return strongSignals && !h.reasons.includes("blocked_domain");
   });
 
   postFiltered.sort((a, b) => b.confidence - a.confidence);
@@ -1048,7 +1228,20 @@ export default async function handler(req: any, res: any) {
     }
 
     /* ---------- Phase 2: Author website search ---------- */
-    const { best: siteBest, _diag: siteDiag } = await searchAuthorWebsite(authorName, ctx, debug);
+
+    // 2a) Book+Author fast path (new)
+    const fast = await searchAuthorWebsiteWithBookContext(authorName, bookTitle, ctx, debug);
+    let siteBest = fast.best;
+    const siteDiagAll: any = { book_author_firstpass: fast._diag };
+
+    // 2b) Fallback to generic author-only search (existing) if needed
+    if (!siteBest || siteBest.confidence < minSiteConfidence) {
+      const generic = await searchAuthorWebsite(authorName, ctx, debug);
+      if (!siteBest || (generic.best && generic.best.confidence > siteBest.confidence)) {
+        siteBest = generic.best;
+      }
+      siteDiagAll.generic = generic._diag;
+    }
 
     if (!siteBest || siteBest.confidence < minSiteConfidence) {
       const payload: CacheValue = {
@@ -1064,7 +1257,7 @@ export default async function handler(req: any, res: any) {
         confidence: siteBest ? Number(siteBest.confidence.toFixed(2)) : 0,
         author_confidence: Number(authorBest.score.toFixed(2)),
         source: "web",
-        _diag: debug ? { author: authorDiag, pubyear: pubDiag, viability: { wikiUrl: life.wikiUrl, hasOfficialLink: life.hasOfficialLink, reason }, site: siteDiag } : undefined,
+        _diag: debug ? { author: authorDiag, pubyear: pubDiag, viability: { wikiUrl: life.wikiUrl, hasOfficialLink: life.hasOfficialLink, reason }, site: siteDiagAll } : undefined,
       };
       setCached(cacheKey, payload);
       res.setHeader("x-cache", "MISS");
@@ -1106,7 +1299,7 @@ export default async function handler(req: any, res: any) {
       confidence: Number(siteBest.confidence.toFixed(2)),
       author_confidence: Number(authorBest.score.toFixed(2)),
       source: "web",
-      _diag: debug ? { author: authorDiag, pubyear: pubDiag, viability: { wikiUrl: life.wikiUrl, hasOfficialLink: life.hasOfficialLink, reason }, site: siteDiag } : undefined,
+      _diag: debug ? { author: authorDiag, pubyear: pubDiag, viability: { wikiUrl: life.wikiUrl, hasOfficialLink: life.hasOfficialLink, reason }, site: siteDiagAll } : undefined,
     };
 
     setCached(cacheKey, payload);
