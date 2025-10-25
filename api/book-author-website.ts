@@ -9,11 +9,12 @@
  *   "min_author_confidence": 0.55,          // optional 0..1
  *   "min_site_confidence": 0.65,            // optional 0..1 (default tightened)
  *   "allow_estate_sites": false,            // optional, default false
- *   "debug": true,                          // optional
- *   "unsafe_disable_domain_filters": false  // optional
+ *   "exclude_publisher_sites": true,        // optional, default true (NEW)
+ *   "unsafe_disable_domain_filters": false, // optional
+ *   "debug": true                           // optional
  * }
  *
- * Returns the author's official website ONLY if the author is viable for a personal site.
+ * Returns an author's official/personal website ONLY if the author is viable for a personal site.
  */
 
 import pLimit from "p-limit";
@@ -59,7 +60,7 @@ function requireAuth(req: any, res: any): boolean {
    ============================= */
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 const FETCH_TIMEOUT_MS = 5500;
-const USER_AGENT = "BookAuthorWebsite/1.4 (+https://example.com)";
+const USER_AGENT = "BookAuthorWebsite/1.5 (+https://example.com)";
 const CONCURRENCY = 4;
 
 const DEFAULT_MIN_AUTHOR_CONFIDENCE = 0.55;
@@ -151,6 +152,31 @@ const WEBSITE_NEGATIVE_KEYWORDS = [
   "trailer","soundtrack","screenplay","director","filmography","cinematography"
 ];
 
+// publisher domains we may exclude from final site selection
+const PUBLISHER_DOMAINS = [
+  "penguinrandomhouse.com",
+  "prh.com",
+  "harpercollins.com",
+  "simonandschuster.com",
+  "macmillan.com",
+  "panmacmillan.com",
+  "us.macmillan.com",
+  "hachettebookgroup.com",
+  "bloomsbury.com",
+  "faber.co.uk",
+  "littlebrown.co.uk",
+  "randomhousebooks.com",
+  "viking",
+  "doubleday",
+  "anchorbooks",
+  "crownpublishing",
+];
+
+function isPublisherHost(host: string): boolean {
+  const h = host.toLowerCase();
+  return PUBLISHER_DOMAINS.some((d) => h.includes(d));
+}
+
 /* =============================
    Types
    ============================= */
@@ -200,6 +226,7 @@ type Context = {
   bookTokens: string[];
   unsafeDisableDomainFilters: boolean;
   allowEstateSites: boolean;
+  excludePublisherSites: boolean; // NEW
 };
 
 /* =============================
@@ -240,7 +267,6 @@ function tokens(s: string): string[] {
 }
 
 function sanitizeAuthorName(raw: string): string {
-  // Remove parentheticals & punctuation noise
   let s = raw.replace(/\([^)]*\)/g, " ").replace(/[,;:]+/g, " ").replace(/\s+/g, " ").trim();
   const BAD_LEADING = new Set([
     "american","british","canadian","australian","irish","nigerian","indian","chinese","japanese","korean",
@@ -354,8 +380,6 @@ async function googleCSE(query: string, num = 10): Promise<any[]> {
 /* =============================
    Phase 1: Discover the author from the book title
    ============================= */
-
-// OpenLibrary anchor to get canonical author & first publish year reliably (no API key required)
 async function olLookupTitle(title: string): Promise<{ author?: string; year?: number } | null> {
   try {
     const url = new URL("https://openlibrary.org/search.json");
@@ -388,8 +412,6 @@ async function olLookupTitle(title: string): Promise<{ author?: string; year?: n
 function extractAuthorNamesFromText(text: string): string[] {
   const t = text.replace(/\s+/g, " ");
   const candidates = new Set<string>();
-
-  // Common patterns: "by John Smith", "Author: John Smith", "Written by John Smith"
   const byRegex = /\bby\s+([A-Z][\p{L}'\-]+(?:\s+[A-Z][\p{L}'\-]+){0,3})\b/giu;
   const authorLabelRegex = /\b(?:author|writer)\s*:\s*([A-Z][\p{L}'\-]+(?:\s+[A-Z][\p{L}'\-]+){0,3})\b/giu;
   const writtenByRegex = /\bwritten\s+by\s+([A-Z][\p{L}'\-]+(?:\s+[A-Z][\p{L}'\-]+){0,3})\b/giu;
@@ -407,56 +429,38 @@ function scoreAuthorCandidate(name: string, host: string, title: string, snippet
   const nameTokens = tokens(name);
   const textToks = tokens((title || "") + " " + (snippet || ""));
 
-  // If the book title appears strongly in the hit, that’s good.
   if (containsAll(textToks, ctx.bookTokens) || jaccard(textToks, ctx.bookTokens) >= 0.35) {
     score += 0.25;
     reasons.push("book_match");
   }
-
-  // Trusted discovery hosts boost
   if (isAllowedDiscoveryHost(host)) {
     score += 0.25;
     reasons.push("trusted_discovery_domain");
   }
-
-  // Full "by <name>" style extraction is strong
   const text = `${title} ${snippet}`;
   const foundBy = new RegExp(`\\bby\\s+${name.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\b`, "i").test(text);
   if (foundBy) {
     score += 0.25;
     reasons.push("by_phrase_match");
   }
-
-  // If the candidate name is repeated or the snippet clearly centers on the person
   const nameJac = jaccard(tokens(text), nameTokens);
   if (nameJac >= 0.25) {
     score += 0.15;
     reasons.push(`name_similarity:${nameJac.toFixed(2)}`);
   }
-
-  // penalize polluted labels (e.g., "American author Tara Westover")
   if (/\b(american|british|canadian|author|writer|novelist|journalist|poet|historian|professor)\b/i.test(name)) {
     score -= 0.15;
     reasons.push("name_contains_descriptor");
   }
-
-  // Publisher domains get a small extra bump
-  if (
-    /penguinrandomhouse\.com|harpercollins\.com|simonandschuster\.com|macmillan\.com|hachettebookgroup\.com|bloomsbury\.com|panmacmillan\.com|faber\.co\.uk/i.test(
-      host
-    )
-  ) {
+  if (/penguinrandomhouse\.com|harpercollins\.com|simonandschuster\.com|macmillan\.com|hachettebookgroup\.com|bloomsbury\.com|panmacmillan\.com|faber\.co\.uk/i.test(host)) {
     score += 0.10;
     reasons.push("publisher_domain");
   }
-
   return { name, score: Math.max(0, Math.min(1, score)), reasons };
 }
 
 async function discoverAuthorFromBook(bookTitle: string, ctx: Context, debug: boolean) {
   const quoted = `"${bookTitle}"`;
-
-  // Prefer book contexts; downrank film/movie pages up front
   const queries = [
     `${quoted} book author -film -movie -screenplay -director`,
     `${quoted} novel author -film -movie`,
@@ -464,10 +468,8 @@ async function discoverAuthorFromBook(bookTitle: string, ctx: Context, debug: bo
     `${quoted} author site:books.google.com`,
     `${quoted} author site:goodreads.com`,
   ];
-
   const diag: any = { queries, hits: [], candidates: [] as any[], picked: undefined };
 
-  // OpenLibrary anchor — get a strong initial author guess + year
   const ol = await olLookupTitle(bookTitle);
   if (debug) diag.openlibrary = ol || null;
 
@@ -513,7 +515,6 @@ async function discoverAuthorFromBook(bookTitle: string, ctx: Context, debug: bo
 
   const ranked = Array.from(authorScores.values())
     .map(a => {
-      // sanitize each candidate for fair comparison; boost if matching OL
       const clean = sanitizeAuthorName(a.name);
       const boost =
         ol?.author && jaccard(tokens(clean), tokens(ol.author)) >= 0.7 ? 0.20 :
@@ -554,7 +555,7 @@ function scorePubYearHit(host: string, year: number, text: string, requireAuthor
   if (year < now - 1) s += 0.05;
   if (requireAuthorMention) {
     const ok = new RegExp(`\\b${authorName.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\b`, "i").test(text);
-    if (!ok) return 0; // reject hit if author isn't mentioned when required
+    if (!ok) return 0;
     s += 0.2;
   }
   return Math.max(0, Math.min(1, s));
@@ -624,7 +625,7 @@ async function discoverOriginalPubYear(bookTitle: string, authorName: string, ct
   const best = ranked[0] ? { year: ranked[0].year } : null;
   if (debug) { diag.candidates = ranked.slice(0, 10); diag.picked = best; }
 
-  // If still no year, fall back to OpenLibrary anchor (author-aware)
+  // If still no year, author-aware OpenLibrary fallback
   if (!best?.year) {
     try {
       const url = new URL("https://openlibrary.org/search.json");
@@ -647,7 +648,6 @@ async function discoverOriginalPubYear(bookTitle: string, authorName: string, ct
   return { best, _diag: debug ? diag : undefined };
 }
 
-// OpenLibrary fallback (no API key required)
 async function tryOpenLibraryPubYear(title: string, author: string): Promise<number | null> {
   try {
     const url = new URL("https://openlibrary.org/search.json");
@@ -726,12 +726,8 @@ function evaluateAuthorViability(
 ): { viable: boolean; reason: string } {
   const nowYear = new Date().getFullYear();
 
-  // If Wikipedia explicitly lists an Official website, accept.
-  if (hasOfficialLinkOnWiki) {
-    return { viable: true, reason: "official_link_listed_on_wikipedia" };
-  }
+  if (hasOfficialLinkOnWiki) return { viable: true, reason: "official_link_listed_on_wikipedia" };
 
-  // Life dates provided:
   if (typeof deathYear === "number") {
     if (deathYear < 1995) return { viable: false, reason: "deceased_pre_web_era" };
     if (deathYear < 2005 && !allowEstateSites) {
@@ -743,27 +739,18 @@ function evaluateAuthorViability(
   }
   if (typeof birthYear === "number") {
     const age = nowYear - birthYear;
-    if (age >= 0 && age < 120) {
-      return { viable: true, reason: "likely_living_author" };
-    }
+    if (age >= 0 && age < 120) return { viable: true, reason: "likely_living_author" };
   }
 
-  // No life dates: use original publication year heuristics
   if (typeof pubYear === "number") {
-    if (pubYear < 1900) {
-      return { viable: false, reason: "pubyear_lt_1900_not_viable" };
-    } else if (pubYear < 1950) {
-      return allowEstateSites
-        ? { viable: true, reason: "pubyear_1900_1950_estate_allowed" }
-        : { viable: false, reason: "pubyear_1900_1950_estate_not_allowed" };
-    } else if (pubYear < 1995) {
-      return { viable: true, reason: "pubyear_1950_1994_cautious" };
-    } else {
-      return { viable: true, reason: "pubyear_ge_1995_likely_living" };
-    }
+    if (pubYear < 1900) return { viable: false, reason: "pubyear_lt_1900_not_viable" };
+    if (pubYear < 1950) return allowEstateSites
+      ? { viable: true, reason: "pubyear_1900_1950_estate_allowed" }
+      : { viable: false, reason: "pubyear_1900_1950_estate_not_allowed" };
+    if (pubYear < 1995) return { viable: true, reason: "pubyear_1950_1994_cautious" };
+    return { viable: true, reason: "pubyear_ge_1995_likely_living" };
   }
 
-  // Nothing definitive: be conservative
   return { viable: false, reason: "unknown_life_and_pubyear_not_confident" };
 }
 
@@ -799,7 +786,6 @@ function scoreBaseWebsiteSignals(hit: WebHit, authorName: string): WebHit {
     reasons.push("blocked_domain");
   }
 
-  // Vanity domain preference
   const compact = authorName.toLowerCase().replace(/\s+/g, "");
   const hostBare = hit.host.replace(/^www\./, "");
   if (hostBare.startsWith(compact) || hostBare.includes(compact)) {
@@ -807,7 +793,6 @@ function scoreBaseWebsiteSignals(hit: WebHit, authorName: string): WebHit {
     reasons.push("vanity_domain_match");
   }
 
-  // Slight preference for custom domains over platforms
   if (!/substack\.com|medium\.com|wordpress\.com|blogspot\.|ghost\.io/i.test(hit.host)) {
     score += 0.05;
     reasons.push("custom_domain_preferred");
@@ -829,7 +814,7 @@ async function fetchHtmlSignals(url: string, authorName: string, bookTokens: str
   estateWording: boolean;
   isPublisherAuthorPage: boolean;
   isClearlyFilmOrDirector: boolean;
-  hasAuthorialNav: boolean; // presence of "Books" or "Writing" sections
+  hasAuthorialNav: boolean;
   negativeKeywordHit: string | null;
 }> {
   try {
@@ -937,7 +922,7 @@ async function enrichWebsiteHit(hit: WebHit, authorName: string, bookTokens: str
   return hit;
 }
 
-// ---- Book+Author fast-path queries (new) ----
+/* -------- Book+Author fast-path (uses both title & author) -------- */
 function buildBookAuthorSiteQueries(bookTitle: string, authorName: string): string[] {
   const qBook = `"${bookTitle}"`;
   const qAuthor = `"${authorName}"`;
@@ -946,7 +931,7 @@ function buildBookAuthorSiteQueries(bookTitle: string, authorName: string): stri
     `${qBook} ${qAuthor} official website ${tail}`,
     `${qBook} ${qAuthor} author website ${tail}`,
     `${qBook} ${qAuthor} official site ${tail}`,
-    // Publisher context sometimes points to a personal domain via the author page:
+    // Publisher context sometimes points to personal domains via author pages
     `${qBook} ${qAuthor} site:penguinrandomhouse.com ${tail}`,
     `${qBook} ${qAuthor} site:harpercollins.com ${tail}`,
     `${qBook} ${qAuthor} site:simonandschuster.com ${tail}`,
@@ -979,9 +964,9 @@ async function searchAuthorWebsiteWithBookContext(
 
   const enriched = await Promise.all(prelim.map(h => limit(() => enrichWebsiteHit(h, authorName, ctx.bookTokens))));
 
-  // Require strong author-site signals
   const accepted = enriched.filter(h => {
     if (!ctx.allowEstateSites && h.reasons.includes("estate_wording_detected")) return false;
+    if (ctx.excludePublisherSites && isPublisherHost(h.host)) return false;
 
     const strong =
       h.reasons.includes("vanity_domain_match") ||
@@ -1005,7 +990,7 @@ async function searchAuthorWebsiteWithBookContext(
   return { best: accepted[0] || null, _diag: debug ? diag : undefined };
 }
 
-// ---- Generic author-only search (existing) ----
+/* -------- Generic author-only search (fallback) -------- */
 async function searchAuthorWebsite(authorName: string, ctx: Context, debug: boolean) {
   const quotedAuthor = `"${authorName}"`;
 
@@ -1049,7 +1034,8 @@ async function searchAuthorWebsite(authorName: string, ctx: Context, debug: bool
 
   const postFiltered = enriched.filter((h) => {
     if (!ctx.allowEstateSites && h.reasons.includes("estate_wording_detected")) return false;
-    // Acceptance guard: require one of these strong conditions
+    if (ctx.excludePublisherSites && isPublisherHost(h.host)) return false;
+
     const strongSignals =
       h.reasons.includes("vanity_domain_match") ||
       h.reasons.includes("schema_person_present") ||
@@ -1093,7 +1079,6 @@ export default async function handler(req: any, res: any) {
     const bodyRaw = req.body ?? {};
     const body = typeof bodyRaw === "string" ? JSON.parse(bodyRaw || "{}") : bodyRaw;
 
-    // Require ONLY a book title
     const bookTitleInput = String(body.book_title || "");
     const bookTitle = normalizeBook(bookTitleInput);
     if (!bookTitle) return res.status(400).json({ error: "book_title required" });
@@ -1111,6 +1096,7 @@ export default async function handler(req: any, res: any) {
 
     const allowEstateSites: boolean = body.allow_estate_sites === true;
     const unsafeDisableDomainFilters: boolean = body.unsafe_disable_domain_filters === true;
+    const excludePublisherSites: boolean = body.exclude_publisher_sites !== false; // default true
 
     const includeSearchRequested: boolean = body.include_search !== false; // default true
     const USE_SEARCH = includeSearchRequested && USE_SEARCH_BASE;
@@ -1119,10 +1105,22 @@ export default async function handler(req: any, res: any) {
     res.setHeader("x-cse-key-present", String(!!CSE_KEY));
 
     const bookTokens = tokens(bookTitle);
-    const ctx: Context = { bookTitle, bookTokens, unsafeDisableDomainFilters, allowEstateSites };
+    const ctx: Context = {
+      bookTitle,
+      bookTokens,
+      unsafeDisableDomainFilters,
+      allowEstateSites,
+      excludePublisherSites,
+    };
 
     const cacheKey = makeCacheKey({
-      bookTitle, minAuthorConfidence, minSiteConfidence, USE_SEARCH, unsafeDisableDomainFilters, allowEstateSites,
+      bookTitle,
+      minAuthorConfidence,
+      minSiteConfidence,
+      USE_SEARCH,
+      unsafeDisableDomainFilters,
+      allowEstateSites,
+      excludePublisherSites, // NEW in cache key
     });
 
     const cached = getCached(cacheKey);
@@ -1176,7 +1174,6 @@ export default async function handler(req: any, res: any) {
       return res.status(200).json(payload);
     }
 
-    // Ensure sanitized author name is used everywhere downstream
     const authorName = sanitizeAuthorName(authorBest.name);
 
     /* ---------- Phase 1a: Original publication year (author-aware) ---------- */
@@ -1190,7 +1187,6 @@ export default async function handler(req: any, res: any) {
     /* ---------- Phase 1b: Viability gate ---------- */
     const life = await getAuthorLifeDatesAndOfficial(authorName);
 
-    // Guard against absurd mismatches: pub year decades before the author's plausible life
     let finalPubYear = pubYear;
     if (life?.birthYear && typeof finalPubYear === "number") {
       if (finalPubYear < (life.birthYear as number) - 20) {
