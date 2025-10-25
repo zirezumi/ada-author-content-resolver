@@ -2,29 +2,18 @@
 /// <reference types="node" />
 
 /**
- * Endpoint: POST
- * Body:
+ * POST Body:
  * {
  *   "book_title": "The Art of War",
- *   "include_search": true,                  // optional, defaults true (requires CSE env)
- *   "min_author_confidence": 0.55,           // optional, 0..1
- *   "min_site_confidence": 0.55,             // optional, 0..1
- *   "debug": true,                           // optional
- *   "unsafe_disable_domain_filters": false   // optional
+ *   "include_search": true,                 // default true (requires GOOGLE_CSE_* env)
+ *   "min_author_confidence": 0.55,          // optional 0..1
+ *   "min_site_confidence": 0.55,            // optional 0..1
+ *   "allow_estate_sites": false,            // optional, default false
+ *   "debug": true,                          // optional
+ *   "unsafe_disable_domain_filters": false  // optional
  * }
  *
- * Response (200):
- * {
- *   "book_title": "The Art of War",
- *   "inferred_author": "Sun Tzu",
- *   "author_url": "https://www.suntzuofficial.example",
- *   "site_title": "Sun Tzu — Official Site",
- *   "canonical_url": "https://www.suntzuofficial.example/",
- *   "confidence": 0.87,                      // site confidence
- *   "author_confidence": 0.91,               // author confidence
- *   "source": "web",
- *   "_diag": { ... }                         // if debug=true
- * }
+ * Returns the author's official website ONLY if the author is viable for a personal site.
  */
 
 import pLimit from "p-limit";
@@ -70,8 +59,7 @@ function requireAuth(req: any, res: any): boolean {
    ============================= */
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 const FETCH_TIMEOUT_MS = 5500;
-const USER_AGENT = "BookAuthorWebsite/1.0 (+https://example.com)";
-
+const USER_AGENT = "BookAuthorWebsite/1.1 (+https://example.com)";
 const CONCURRENCY = 4;
 
 const DEFAULT_MIN_AUTHOR_CONFIDENCE = 0.55;
@@ -85,12 +73,17 @@ const USE_SEARCH_BASE = !!(CSE_KEY && CSE_ID);
 /* =============================
    Domain strategy
    ============================= */
-/** Sites we trust for *author discovery* (extracting the correct human author). */
+/** Trusted for author discovery (author name correctness). */
 const AUTHOR_DISCOVERY_ALLOW = [
   "wikipedia.org",
   "britannica.com",
   "books.google.com",
   "goodreads.com",
+  "worldcat.org",
+  "librarything.com",
+  "loc.gov",
+  "openlibrary.org",
+  // major publishers
   "penguinrandomhouse.com",
   "harpercollins.com",
   "simonandschuster.com",
@@ -100,13 +93,9 @@ const AUTHOR_DISCOVERY_ALLOW = [
   "panmacmillan.com",
   "bloomsbury.com",
   "faber.co.uk",
-  "worldcat.org",
-  "librarything.com",
-  "loc.gov",
-  "openlibrary.org",
 ];
 
-/** We block obvious non-home sites when picking the *official website*. */
+/** Block when choosing author's official site. */
 const WEBSITE_BLOCKLIST = [
   // social / aggregators
   "x.com",
@@ -134,7 +123,7 @@ const WEBSITE_BLOCKLIST = [
   "podbean.com",
   "simplecast.com",
   "megaphone.fm",
-  // newsrooms and general magazines (typically not "the author's site")
+  // news/magazines
   "nytimes.com",
   "theguardian.com",
   "wsj.com",
@@ -148,11 +137,14 @@ const WEBSITE_BLOCKLIST = [
 type CacheValue = {
   book_title: string;
   inferred_author?: string;
+  life_dates?: { birthYear?: number | null; deathYear?: number | null } | null;
+  author_viable: boolean;
+  viability_reason?: string;
   author_url?: string;
   site_title?: string | null;
   canonical_url?: string | null;
-  confidence: number;           // site confidence (0..1)
-  author_confidence: number;    // author discovery confidence (0..1)
+  confidence: number;           // site confidence
+  author_confidence: number;    // author discovery confidence
   source: "web";
   _diag?: any;
 };
@@ -170,7 +162,7 @@ type WebHit = {
 
 type AuthorCandidate = {
   name: string;
-  score: number;      // confidence 0..1
+  score: number;
   reasons: string[];
 };
 
@@ -178,6 +170,7 @@ type Context = {
   bookTitle: string;
   bookTokens: string[];
   unsafeDisableDomainFilters: boolean;
+  allowEstateSites: boolean;
 };
 
 /* =============================
@@ -279,7 +272,6 @@ function isBlockedHost(host: string, disableFilters: boolean): boolean {
   const h = host.toLowerCase();
   return WEBSITE_BLOCKLIST.some((bad) => h.includes(bad));
 }
-
 function isAllowedDiscoveryHost(host: string): boolean {
   const h = host.toLowerCase();
   return AUTHOR_DISCOVERY_ALLOW.some((good) => h.includes(good));
@@ -372,7 +364,6 @@ function scoreAuthorCandidate(name: string, host: string, title: string, snippet
 async function discoverAuthorFromBook(bookTitle: string, ctx: Context, debug: boolean) {
   const quoted = `"${bookTitle}"`;
 
-  // Multiple queries to stabilize author detection.
   const queries = [
     `${quoted} author`,
     `${quoted} book author`,
@@ -405,10 +396,8 @@ async function discoverAuthorFromBook(bookTitle: string, ctx: Context, debug: bo
     const title = String(it.title || "");
     const snippet = String(it.snippet || it.htmlSnippet || "");
 
-    // Only tally names from trusted discovery hosts (reduces noise)
     if (!isAllowedDiscoveryHost(host)) continue;
 
-    // Pull names from title/snippet via patterns
     const names = new Set<string>([
       ...extractAuthorNamesFromText(title),
       ...extractAuthorNamesFromText(snippet),
@@ -426,7 +415,6 @@ async function discoverAuthorFromBook(bookTitle: string, ctx: Context, debug: bo
     if (debug) diag.hits.push({ title, url, host });
   }
 
-  // Rank candidates by score; also merge duplicates differing only by accents/case
   const ranked = Array.from(authorScores.values()).sort((a, b) => b.score - a.score);
   if (debug) diag.candidates = ranked.slice(0, 10);
 
@@ -436,7 +424,105 @@ async function discoverAuthorFromBook(bookTitle: string, ctx: Context, debug: bo
 }
 
 /* =============================
-   Phase 2: Find the author's official website
+   Phase 1b: Author viability check (life dates + official link)
+   ============================= */
+async function findWikipediaUrlForAuthor(authorName: string): Promise<string | null> {
+  if (!USE_SEARCH_BASE) return null;
+  const items = await googleCSE(`"${authorName}" site:wikipedia.org`);
+  const first = items.find((it: any) => typeof it?.link === "string" && /wikipedia\.org\/wiki\//i.test(it.link));
+  return first ? String(first.link) : null;
+}
+
+function parseLifeDatesFromWikipedia(html: string): { birthYear?: number | null; deathYear?: number | null; hasOfficialLink: boolean } {
+  const takeYear = (s?: string | null) => {
+    const m = s?.match(/(\d{4})/);
+    return m ? Number(m[1]) : null;
+  };
+
+  // Try typical infobox microformats
+  const birth = html.match(/class=["']bday["'][^>]*>(\d{4})-(\d{2})-(\d{2})/i)?.[1];
+  const birthYearA = takeYear(birth);
+
+  // Sometimes “Born” row has a year
+  const bornRow = html.match(/>Born<[^]*?<td[^>]*>([^<]+)</i)?.[1] ?? null;
+  const birthYearB = takeYear(bornRow);
+
+  // Death patterns
+  const deathdate = html.match(/class=["']dday deathdate["'][^>]*>(\d{4})-(\d{2})-(\d{2})/i)?.[1];
+  const deathYearA = takeYear(deathdate);
+
+  const diedRow = html.match(/>Died<[^]*?<td[^>]*>([^<]+)</i)?.[1] ?? null;
+  const deathYearB = takeYear(diedRow);
+
+  // Official website link in the infobox / external links
+  const hasOfficialLink =
+    /Official\s+website/i.test(html) &&
+    /<a[^>]+href=["'][^"']+["'][^>]*>/i.test(html);
+
+  const birthYear = birthYearA ?? birthYearB ?? null;
+  const deathYear = deathYearA ?? deathYearB ?? null;
+
+  return { birthYear, deathYear, hasOfficialLink };
+}
+
+async function getAuthorLifeDatesAndOfficial(authorName: string): Promise<{ birthYear?: number | null; deathYear?: number | null; hasOfficialLink: boolean; wikiUrl?: string | null }> {
+  try {
+    const wikiUrl = await findWikipediaUrlForAuthor(authorName);
+    if (!wikiUrl) return { birthYear: null, deathYear: null, hasOfficialLink: false, wikiUrl: null };
+    const res = await fetchWithTimeout(wikiUrl);
+    if (!res?.ok) return { birthYear: null, deathYear: null, hasOfficialLink: false, wikiUrl };
+    const html = await res.text();
+    const parsed = parseLifeDatesFromWikipedia(html);
+    return { ...parsed, wikiUrl };
+  } catch {
+    return { birthYear: null, deathYear: null, hasOfficialLink: false, wikiUrl: null };
+  }
+}
+
+function evaluateAuthorViability(
+  birthYear: number | null | undefined,
+  deathYear: number | null | undefined,
+  hasOfficialLinkOnWiki: boolean,
+  allowEstateSites: boolean
+): { viable: boolean; reason: string } {
+  const nowYear = new Date().getFullYear();
+
+  // If Wikipedia explicitly lists an Official website, accept (covers living and some deceased authors).
+  if (hasOfficialLinkOnWiki) {
+    return { viable: true, reason: "official_link_listed_on_wikipedia" };
+  }
+
+  // If deceased:
+  if (typeof deathYear === "number") {
+    // Pre-web era: extremely unlikely a genuine "author's personal site" exists
+    if (deathYear < 1995) {
+      return { viable: false, reason: "deceased_pre_web_era" };
+    }
+    // Early web era: be conservative unless estate sites allowed
+    if (deathYear < 2005 && !allowEstateSites) {
+      return { viable: false, reason: "deceased_early_web_era_estate_not_allowed" };
+    }
+    // Otherwise allow only if estate sites are allowed
+    if (!allowEstateSites) {
+      return { viable: false, reason: "deceased_estate_sites_not_allowed" };
+    }
+    return { viable: true, reason: "deceased_estate_allowed" };
+  }
+
+  // If birth year is recent enough (heuristic for living authors)
+  if (typeof birthYear === "number") {
+    const age = nowYear - birthYear;
+    if (age >= 0 && age < 120) {
+      return { viable: true, reason: "likely_living_author" };
+    }
+  }
+
+  // No dates: neutral fallback—require explicit site signals later
+  return { viable: true, reason: "unknown_life_dates_proceed_with_caution" };
+}
+
+/* =============================
+   Phase 2: Find the author's official website (only if viable)
    ============================= */
 function baseHit(it: any): WebHit {
   const url = String(it.link || "");
@@ -457,19 +543,17 @@ function scoreBaseWebsiteSignals(hit: WebHit, authorName: string): WebHit {
   const t = tokens(hit.title + " " + (hit.snippet || ""));
   const authorTokens = tokens(authorName);
 
-  // Author mentioned in title/snippet
   if (containsAll(t, authorTokens) || jaccard(t, authorTokens) >= 0.35) {
     score += 0.35;
     reasons.push("author_in_title_or_snippet");
   }
 
-  // Block obvious non-home hosts
   if (isBlockedHost(hit.host, false)) {
     score -= 1.0;
     reasons.push("blocked_domain");
   }
 
-  // Vanity domain preference (e.g., firstname-lastname.com)
+  // Vanity domain preference
   const compact = authorName.toLowerCase().replace(/\s+/g, "");
   const hostBare = hit.host.replace(/^www\./, "");
   if (hostBare.startsWith(compact) || hostBare.includes(compact)) {
@@ -496,11 +580,12 @@ async function fetchHtmlSignals(url: string, authorName: string, bookTokens: str
   hasSchemaPerson: boolean;
   hasOfficialWords: boolean;
   bookMentioned: boolean;
+  estateWording: boolean;
 }> {
   try {
     const res = await fetchWithTimeout(url);
     if (!res?.ok) {
-      return { titleTokens: [], hasCopyrightName: false, hasSchemaPerson: false, hasOfficialWords: false, bookMentioned: false };
+      return { titleTokens: [], hasCopyrightName: false, hasSchemaPerson: false, hasOfficialWords: false, bookMentioned: false, estateWording: false };
     }
     const html = await res.text();
     const head = html.slice(0, 120_000);
@@ -522,9 +607,11 @@ async function fetchHtmlSignals(url: string, authorName: string, bookTokens: str
       bookTokens.length > 0 &&
       (containsAll(tokens(head), bookTokens) || jaccard(tokens(head), bookTokens) >= 0.25);
 
-    return { titleTokens: tt, hasCopyrightName, hasSchemaPerson, hasOfficialWords, bookMentioned };
+    const estateWording = /\b(Estate\s+of\s+|Official\s+Estate\s+of\s+)/i.test(head);
+
+    return { titleTokens: tt, hasCopyrightName, hasSchemaPerson, hasOfficialWords, bookMentioned, estateWording };
   } catch {
-    return { titleTokens: [], hasCopyrightName: false, hasSchemaPerson: false, hasOfficialWords: false, bookMentioned: false };
+    return { titleTokens: [], hasCopyrightName: false, hasSchemaPerson: false, hasOfficialWords: false, bookMentioned: false, estateWording: false };
   }
 }
 
@@ -562,6 +649,10 @@ async function enrichWebsiteHit(hit: WebHit, authorName: string, bookTokens: str
       hit.confidence = Math.min(1, hit.confidence + 0.10);
       hit.reasons.push("book_mentioned_on_site");
     }
+    // Estate phrasing slightly negative if estates are disallowed; we’ll apply later.
+    if (s.estateWording) {
+      hit.reasons.push("estate_wording_detected");
+    }
   }
 
   return hit;
@@ -592,7 +683,6 @@ async function searchAuthorWebsite(authorName: string, ctx: Context, debug: bool
     )
   ).flat();
 
-  // Deduplicate by URL
   const seen = new Set<string>();
   const prelim: WebHit[] = [];
   for (const it of allItems) {
@@ -603,23 +693,25 @@ async function searchAuthorWebsite(authorName: string, ctx: Context, debug: bool
     prelim.push(scoreBaseWebsiteSignals(hit, authorName));
   }
 
-  // Filter out blocked hosts (unless unsafe)
   const filtered = prelim.filter((h) =>
     ctx.unsafeDisableDomainFilters ? true : !isBlockedHost(h.host, false)
   );
 
-  // Enrich with HTML signals
   const enriched = await Promise.all(filtered.map((h) => limit(() => enrichWebsiteHit(h, authorName, ctx.bookTokens))));
-  enriched.sort((a, b) => b.confidence - a.confidence);
 
-  if (debug) diag.candidates = enriched.slice(0, 10).map((h) => ({
-    url: h.url,
-    host: h.host,
-    confidence: Number(h.confidence.toFixed(2)),
-    reasons: h.reasons,
+  // If estate sites are NOT allowed, demote/remove candidates that look like estate pages.
+  const postFiltered = enriched.filter((h) => {
+    if (ctx.allowEstateSites) return true;
+    return !h.reasons.includes("estate_wording_detected");
+  });
+
+  postFiltered.sort((a, b) => b.confidence - a.confidence);
+
+  if (debug) diag.candidates = postFiltered.slice(0, 10).map((h) => ({
+    url: h.url, host: h.host, confidence: Number(h.confidence.toFixed(2)), reasons: h.reasons
   }));
 
-  const best = enriched[0] || null;
+  const best = postFiltered[0] || null;
   if (debug && best) diag.picked = { url: best.url, confidence: Number(best.confidence.toFixed(2)), reasons: best.reasons };
 
   return { best, _diag: debug ? diag : undefined };
@@ -647,7 +739,7 @@ export default async function handler(req: any, res: any) {
     const bodyRaw = req.body ?? {};
     const body = typeof bodyRaw === "string" ? JSON.parse(bodyRaw || "{}") : bodyRaw;
 
-    // Require ONLY a book title; author input is not accepted.
+    // Require ONLY a book title
     const bookTitleInput = String(body.book_title || "");
     const bookTitle = normalizeBook(bookTitleInput);
     if (!bookTitle) return res.status(400).json({ error: "book_title required" });
@@ -663,6 +755,7 @@ export default async function handler(req: any, res: any) {
         ? Math.max(0, Math.min(1, body.min_site_confidence))
         : DEFAULT_MIN_SITE_CONFIDENCE;
 
+    const allowEstateSites: boolean = body.allow_estate_sites === true;
     const unsafeDisableDomainFilters: boolean = body.unsafe_disable_domain_filters === true;
 
     // search enablement
@@ -673,14 +766,10 @@ export default async function handler(req: any, res: any) {
     res.setHeader("x-cse-key-present", String(!!CSE_KEY));
 
     const bookTokens = tokens(bookTitle);
-    const ctx: Context = { bookTitle, bookTokens, unsafeDisableDomainFilters };
+    const ctx: Context = { bookTitle, bookTokens, unsafeDisableDomainFilters, allowEstateSites };
 
     const cacheKey = makeCacheKey({
-      bookTitle,
-      minAuthorConfidence,
-      minSiteConfidence,
-      USE_SEARCH,
-      unsafeDisableDomainFilters,
+      bookTitle, minAuthorConfidence, minSiteConfidence, USE_SEARCH, unsafeDisableDomainFilters, allowEstateSites,
     });
 
     const cached = getCached(cacheKey);
@@ -693,6 +782,9 @@ export default async function handler(req: any, res: any) {
       const fail: CacheValue = {
         book_title: bookTitle,
         inferred_author: undefined,
+        life_dates: null,
+        author_viable: false,
+        viability_reason: "search_disabled_or_not_configured",
         author_url: undefined,
         site_title: undefined,
         canonical_url: undefined,
@@ -713,6 +805,9 @@ export default async function handler(req: any, res: any) {
       const payload: CacheValue = {
         book_title: bookTitle,
         inferred_author: authorBest?.name,
+        life_dates: null,
+        author_viable: false,
+        viability_reason: "no_confident_author_match",
         author_url: undefined,
         site_title: undefined,
         canonical_url: undefined,
@@ -726,27 +821,59 @@ export default async function handler(req: any, res: any) {
       return res.status(200).json(payload);
     }
 
-    /* ---------- Phase 2: Find official website ---------- */
-    const { best: siteBest, _diag: siteDiag } = await searchAuthorWebsite(authorBest.name, ctx, debug);
+    /* ---------- Phase 1b: Viability gate ---------- */
+    const life = await getAuthorLifeDatesAndOfficial(authorBest.name);
+    const { viable, reason } = evaluateAuthorViability(
+      life.birthYear ?? null,
+      life.deathYear ?? null,
+      life.hasOfficialLink,
+      ctx.allowEstateSites
+    );
 
-    if (!siteBest || siteBest.confidence < minSiteConfidence) {
+    if (!viable) {
       const payload: CacheValue = {
         book_title: bookTitle,
         inferred_author: authorBest.name,
+        life_dates: { birthYear: life.birthYear ?? null, deathYear: life.deathYear ?? null },
+        author_viable: false,
+        viability_reason: reason,
         author_url: undefined,
         site_title: undefined,
         canonical_url: undefined,
-        confidence: siteBest ? Number(siteBest.confidence.toFixed(2)) : 0,
+        confidence: 0,
         author_confidence: Number(authorBest.score.toFixed(2)),
         source: "web",
-        _diag: debug ? { author: authorDiag, site: siteDiag } : undefined,
+        _diag: debug ? { author: authorDiag, viability: { wikiUrl: life.wikiUrl, hasOfficialLink: life.hasOfficialLink, reason } } : undefined,
       };
       setCached(cacheKey, payload);
       res.setHeader("x-cache", "MISS");
       return res.status(200).json(payload);
     }
 
-    // Normalize to origin, fetch canonical & title for nicety
+    /* ---------- Phase 2: Author website search ---------- */
+    const { best: siteBest, _diag: siteDiag } = await searchAuthorWebsite(authorBest.name, ctx, debug);
+
+    if (!siteBest || siteBest.confidence < minSiteConfidence) {
+      const payload: CacheValue = {
+        book_title: bookTitle,
+        inferred_author: authorBest.name,
+        life_dates: { birthYear: life.birthYear ?? null, deathYear: life.deathYear ?? null },
+        author_viable: true,
+        viability_reason: reason,
+        author_url: undefined,
+        site_title: undefined,
+        canonical_url: undefined,
+        confidence: siteBest ? Number(siteBest.confidence.toFixed(2)) : 0,
+        author_confidence: Number(authorBest.score.toFixed(2)),
+        source: "web",
+        _diag: debug ? { author: authorDiag, viability: { wikiUrl: life.wikiUrl, hasOfficialLink: life.hasOfficialLink, reason }, site: siteDiag } : undefined,
+      };
+      setCached(cacheKey, payload);
+      res.setHeader("x-cache", "MISS");
+      return res.status(200).json(payload);
+    }
+
+    // Normalize to origin, fetch canonical & title
     const origin = originOf(siteBest.url)!;
 
     let siteTitle: string | null = null;
@@ -771,13 +898,16 @@ export default async function handler(req: any, res: any) {
     const payload: CacheValue = {
       book_title: bookTitle,
       inferred_author: authorBest.name,
+      life_dates: { birthYear: life.birthYear ?? null, deathYear: life.deathYear ?? null },
+      author_viable: true,
+      viability_reason: reason,
       author_url: origin,
       site_title: siteTitle,
       canonical_url: canonical || origin,
       confidence: Number(siteBest.confidence.toFixed(2)),
       author_confidence: Number(authorBest.score.toFixed(2)),
       source: "web",
-      _diag: debug ? { author: authorDiag, site: siteDiag } : undefined,
+      _diag: debug ? { author: authorDiag, viability: { wikiUrl: life.wikiUrl, hasOfficialLink: life.hasOfficialLink, reason }, site: siteDiag } : undefined,
     };
 
     setCached(cacheKey, payload);
