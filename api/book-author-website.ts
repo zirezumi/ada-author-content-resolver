@@ -14,6 +14,7 @@
  * }
  *
  * Returns the author's official website ONLY if the author is viable for a personal site.
+ * Viability now integrates original publication year if life dates are missing.
  */
 
 import pLimit from "p-limit";
@@ -59,7 +60,7 @@ function requireAuth(req: any, res: any): boolean {
    ============================= */
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 const FETCH_TIMEOUT_MS = 5500;
-const USER_AGENT = "BookAuthorWebsite/1.1 (+https://example.com)";
+const USER_AGENT = "BookAuthorWebsite/1.2 (+https://example.com)";
 const CONCURRENCY = 4;
 
 const DEFAULT_MIN_AUTHOR_CONFIDENCE = 0.55;
@@ -93,6 +94,15 @@ const AUTHOR_DISCOVERY_ALLOW = [
   "panmacmillan.com",
   "bloomsbury.com",
   "faber.co.uk",
+];
+
+/** Sites we query to extract original publication year. */
+const PUBYEAR_SOURCES = [
+  "books.google.com",
+  "openlibrary.org",
+  "worldcat.org",
+  "goodreads.com",
+  "wikipedia.org",
 ];
 
 /** Block when choosing author's official site. */
@@ -137,6 +147,7 @@ const WEBSITE_BLOCKLIST = [
 type CacheValue = {
   book_title: string;
   inferred_author?: string;
+  pub_year?: number | null;
   life_dates?: { birthYear?: number | null; deathYear?: number | null } | null;
   author_viable: boolean;
   viability_reason?: string;
@@ -162,6 +173,14 @@ type WebHit = {
 
 type AuthorCandidate = {
   name: string;
+  score: number;
+  reasons: string[];
+};
+
+type PubYearHit = {
+  url: string;
+  host: string;
+  year: number;
   score: number;
   reasons: string[];
 };
@@ -424,7 +443,109 @@ async function discoverAuthorFromBook(bookTitle: string, ctx: Context, debug: bo
 }
 
 /* =============================
-   Phase 1b: Author viability check (life dates + official link)
+   Phase 1a: Discover original publication year
+   ============================= */
+function yearCandidatesFromText(text: string): number[] {
+  const out = new Set<number>();
+  const re = /\b(1[6-9]\d{2}|20\d{2}|2100)\b/g; // 1600-2100
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const y = Number(m[1]);
+    if (y >= 1600 && y <= new Date().getFullYear()) out.add(y);
+  }
+  return Array.from(out);
+}
+
+function scorePubYearCandidate(host: string, year: number, ctx: Context): PubYearHit["score"] {
+  let score = 0;
+  const now = new Date().getFullYear();
+
+  // Trusted source boosts
+  if (PUBYEAR_SOURCES.some((d) => host.includes(d))) score += 0.4;
+
+  // Recency sanity: a plausible original year is <= now and not a "future" year
+  if (year <= now) score += 0.1;
+
+  // Prefer "older" earliest mentions from snippets (original ≠ latest edition)
+  if (year < now - 1) score += 0.05;
+
+  return Math.max(0, Math.min(1, score));
+}
+
+async function discoverOriginalPubYear(bookTitle: string, ctx: Context, debug: boolean) {
+  const quoted = `"${bookTitle}"`;
+  const queries = [
+    `${quoted} original publication date`,
+    `${quoted} first published`,
+    `${quoted} publication date`,
+    `${quoted} site:books.google.com`,
+    `${quoted} site:openlibrary.org`,
+    `${quoted} site:worldcat.org`,
+    `${quoted} site:goodreads.com`,
+    `${quoted} site:wikipedia.org`,
+  ];
+
+  const diag: any = { queries, hits: [] as any[], candidates: [] as any[], picked: undefined };
+
+  const limit = pLimit(CONCURRENCY);
+  const items = (
+    await Promise.all(
+      queries.map((q) => limit(async () => (USE_SEARCH_BASE ? await googleCSE(q) : [])))
+    )
+  ).flat();
+
+  const candidates: PubYearHit[] = [];
+  for (const it of items) {
+    const url = String(it.link || "");
+    if (!isHttpUrl(url)) continue;
+    const host = hostOf(url);
+    const title = String(it.title || "");
+    const snippet = String(it.snippet || it.htmlSnippet || "");
+
+    const years = new Set<number>([
+      ...yearCandidatesFromText(title),
+      ...yearCandidatesFromText(snippet),
+    ]);
+
+    for (const y of years) {
+      const sc = scorePubYearCandidate(host, y, ctx);
+      if (sc > 0) {
+        candidates.push({
+          url,
+          host,
+          year: y,
+          score: sc,
+          reasons: [
+            ...(PUBYEAR_SOURCES.some((d) => host.includes(d)) ? ["trusted_pub_source"] : []),
+          ],
+        });
+      }
+    }
+
+    if (debug) diag.hits.push({ title, url, host });
+  }
+
+  // Heuristic: pick the **earliest** year among top-scored candidates to approximate original publication
+  candidates.sort((a, b) => b.score - a.score || a.year - b.year);
+  let best = candidates[0] || null;
+
+  if (best) {
+    const topScore = best.score;
+    const nearTop = candidates.filter((c) => Math.abs(c.score - topScore) <= 0.05);
+    const earliestNearTop = nearTop.sort((a, b) => a.year - b.year)[0] || best;
+    best = earliestNearTop;
+  }
+
+  if (debug) {
+    diag.candidates = candidates.slice(0, 12);
+    diag.picked = best;
+  }
+
+  return { best, _diag: debug ? diag : undefined };
+}
+
+/* =============================
+   Phase 1b: Author viability check (life dates + official link + pub year)
    ============================= */
 async function findWikipediaUrlForAuthor(authorName: string): Promise<string | null> {
   if (!USE_SEARCH_BASE) return null;
@@ -439,22 +560,16 @@ function parseLifeDatesFromWikipedia(html: string): { birthYear?: number | null;
     return m ? Number(m[1]) : null;
   };
 
-  // Try typical infobox microformats
   const birth = html.match(/class=["']bday["'][^>]*>(\d{4})-(\d{2})-(\d{2})/i)?.[1];
   const birthYearA = takeYear(birth);
-
-  // Sometimes “Born” row has a year
   const bornRow = html.match(/>Born<[^]*?<td[^>]*>([^<]+)</i)?.[1] ?? null;
   const birthYearB = takeYear(bornRow);
 
-  // Death patterns
   const deathdate = html.match(/class=["']dday deathdate["'][^>]*>(\d{4})-(\d{2})-(\d{2})/i)?.[1];
   const deathYearA = takeYear(deathdate);
-
   const diedRow = html.match(/>Died<[^]*?<td[^>]*>([^<]+)</i)?.[1] ?? null;
   const deathYearB = takeYear(diedRow);
 
-  // Official website link in the infobox / external links
   const hasOfficialLink =
     /Official\s+website/i.test(html) &&
     /<a[^>]+href=["'][^"']+["'][^>]*>/i.test(html);
@@ -479,10 +594,17 @@ async function getAuthorLifeDatesAndOfficial(authorName: string): Promise<{ birt
   }
 }
 
+/**
+ * Evaluate viability using:
+ * 1) Wikipedia life dates & official link (if available)
+ * 2) Original publication year (if life dates missing)
+ * 3) Estate policy
+ */
 function evaluateAuthorViability(
   birthYear: number | null | undefined,
   deathYear: number | null | undefined,
   hasOfficialLinkOnWiki: boolean,
+  pubYear: number | null | undefined,
   allowEstateSites: boolean
 ): { viable: boolean; reason: string } {
   const nowYear = new Date().getFullYear();
@@ -492,24 +614,16 @@ function evaluateAuthorViability(
     return { viable: true, reason: "official_link_listed_on_wikipedia" };
   }
 
-  // If deceased:
+  // Life dates provided:
   if (typeof deathYear === "number") {
-    // Pre-web era: extremely unlikely a genuine "author's personal site" exists
-    if (deathYear < 1995) {
-      return { viable: false, reason: "deceased_pre_web_era" };
-    }
-    // Early web era: be conservative unless estate sites allowed
+    if (deathYear < 1995) return { viable: false, reason: "deceased_pre_web_era" };
     if (deathYear < 2005 && !allowEstateSites) {
       return { viable: false, reason: "deceased_early_web_era_estate_not_allowed" };
     }
-    // Otherwise allow only if estate sites are allowed
-    if (!allowEstateSites) {
-      return { viable: false, reason: "deceased_estate_sites_not_allowed" };
-    }
-    return { viable: true, reason: "deceased_estate_allowed" };
+    return allowEstateSites
+      ? { viable: true, reason: "deceased_estate_allowed" }
+      : { viable: false, reason: "deceased_estate_sites_not_allowed" };
   }
-
-  // If birth year is recent enough (heuristic for living authors)
   if (typeof birthYear === "number") {
     const age = nowYear - birthYear;
     if (age >= 0 && age < 120) {
@@ -517,8 +631,25 @@ function evaluateAuthorViability(
     }
   }
 
-  // No dates: neutral fallback—require explicit site signals later
-  return { viable: true, reason: "unknown_life_dates_proceed_with_caution" };
+  // No life dates: use original publication year heuristics
+  if (typeof pubYear === "number") {
+    if (pubYear < 1900) {
+      return { viable: false, reason: "pubyear_lt_1900_not_viable" };
+    } else if (pubYear < 1950) {
+      return allowEstateSites
+        ? { viable: true, reason: "pubyear_1900_1950_estate_allowed" }
+        : { viable: false, reason: "pubyear_1900_1950_estate_not_allowed" };
+    } else if (pubYear < 1995) {
+      // 1950–1994: possible living author, but stricter — require strong site signals later
+      return { viable: true, reason: "pubyear_1950_1994_cautious" };
+    } else {
+      // 1995+: very likely a living/modern author
+      return { viable: true, reason: "pubyear_ge_1995_likely_living" };
+    }
+  }
+
+  // Nothing definitive: be conservative (do not proceed)
+  return { viable: false, reason: "unknown_life_and_pubyear_not_confident" };
 }
 
 /* =============================
@@ -649,7 +780,6 @@ async function enrichWebsiteHit(hit: WebHit, authorName: string, bookTokens: str
       hit.confidence = Math.min(1, hit.confidence + 0.10);
       hit.reasons.push("book_mentioned_on_site");
     }
-    // Estate phrasing slightly negative if estates are disallowed; we’ll apply later.
     if (s.estateWording) {
       hit.reasons.push("estate_wording_detected");
     }
@@ -699,7 +829,6 @@ async function searchAuthorWebsite(authorName: string, ctx: Context, debug: bool
 
   const enriched = await Promise.all(filtered.map((h) => limit(() => enrichWebsiteHit(h, authorName, ctx.bookTokens))));
 
-  // If estate sites are NOT allowed, demote/remove candidates that look like estate pages.
   const postFiltered = enriched.filter((h) => {
     if (ctx.allowEstateSites) return true;
     return !h.reasons.includes("estate_wording_detected");
@@ -758,7 +887,6 @@ export default async function handler(req: any, res: any) {
     const allowEstateSites: boolean = body.allow_estate_sites === true;
     const unsafeDisableDomainFilters: boolean = body.unsafe_disable_domain_filters === true;
 
-    // search enablement
     const includeSearchRequested: boolean = body.include_search !== false; // default true
     const USE_SEARCH = includeSearchRequested && USE_SEARCH_BASE;
     res.setHeader("x-use-search", String(USE_SEARCH));
@@ -782,6 +910,7 @@ export default async function handler(req: any, res: any) {
       const fail: CacheValue = {
         book_title: bookTitle,
         inferred_author: undefined,
+        pub_year: null,
         life_dates: null,
         author_viable: false,
         viability_reason: "search_disabled_or_not_configured",
@@ -805,6 +934,7 @@ export default async function handler(req: any, res: any) {
       const payload: CacheValue = {
         book_title: bookTitle,
         inferred_author: authorBest?.name,
+        pub_year: null,
         life_dates: null,
         author_viable: false,
         viability_reason: "no_confident_author_match",
@@ -821,12 +951,17 @@ export default async function handler(req: any, res: any) {
       return res.status(200).json(payload);
     }
 
+    /* ---------- Phase 1a: Original publication year ---------- */
+    const { best: pubBest, _diag: pubDiag } = await discoverOriginalPubYear(bookTitle, ctx, debug);
+    const pubYear = pubBest?.year ?? null;
+
     /* ---------- Phase 1b: Viability gate ---------- */
     const life = await getAuthorLifeDatesAndOfficial(authorBest.name);
     const { viable, reason } = evaluateAuthorViability(
       life.birthYear ?? null,
       life.deathYear ?? null,
       life.hasOfficialLink,
+      pubYear,
       ctx.allowEstateSites
     );
 
@@ -834,6 +969,7 @@ export default async function handler(req: any, res: any) {
       const payload: CacheValue = {
         book_title: bookTitle,
         inferred_author: authorBest.name,
+        pub_year: pubYear,
         life_dates: { birthYear: life.birthYear ?? null, deathYear: life.deathYear ?? null },
         author_viable: false,
         viability_reason: reason,
@@ -843,7 +979,7 @@ export default async function handler(req: any, res: any) {
         confidence: 0,
         author_confidence: Number(authorBest.score.toFixed(2)),
         source: "web",
-        _diag: debug ? { author: authorDiag, viability: { wikiUrl: life.wikiUrl, hasOfficialLink: life.hasOfficialLink, reason } } : undefined,
+        _diag: debug ? { author: authorDiag, pubyear: pubDiag, viability: { wikiUrl: life.wikiUrl, hasOfficialLink: life.hasOfficialLink, reason } } : undefined,
       };
       setCached(cacheKey, payload);
       res.setHeader("x-cache", "MISS");
@@ -857,6 +993,7 @@ export default async function handler(req: any, res: any) {
       const payload: CacheValue = {
         book_title: bookTitle,
         inferred_author: authorBest.name,
+        pub_year: pubYear,
         life_dates: { birthYear: life.birthYear ?? null, deathYear: life.deathYear ?? null },
         author_viable: true,
         viability_reason: reason,
@@ -866,7 +1003,7 @@ export default async function handler(req: any, res: any) {
         confidence: siteBest ? Number(siteBest.confidence.toFixed(2)) : 0,
         author_confidence: Number(authorBest.score.toFixed(2)),
         source: "web",
-        _diag: debug ? { author: authorDiag, viability: { wikiUrl: life.wikiUrl, hasOfficialLink: life.hasOfficialLink, reason }, site: siteDiag } : undefined,
+        _diag: debug ? { author: authorDiag, pubyear: pubDiag, viability: { wikiUrl: life.wikiUrl, hasOfficialLink: life.hasOfficialLink, reason }, site: siteDiag } : undefined,
       };
       setCached(cacheKey, payload);
       res.setHeader("x-cache", "MISS");
@@ -898,6 +1035,7 @@ export default async function handler(req: any, res: any) {
     const payload: CacheValue = {
       book_title: bookTitle,
       inferred_author: authorBest.name,
+      pub_year: pubYear,
       life_dates: { birthYear: life.birthYear ?? null, deathYear: life.deathYear ?? null },
       author_viable: true,
       viability_reason: reason,
@@ -907,7 +1045,7 @@ export default async function handler(req: any, res: any) {
       confidence: Number(siteBest.confidence.toFixed(2)),
       author_confidence: Number(authorBest.score.toFixed(2)),
       source: "web",
-      _diag: debug ? { author: authorDiag, viability: { wikiUrl: life.wikiUrl, hasOfficialLink: life.hasOfficialLink, reason }, site: siteDiag } : undefined,
+      _diag: debug ? { author: authorDiag, pubyear: pubDiag, viability: { wikiUrl: life.wikiUrl, hasOfficialLink: life.hasOfficialLink, reason }, site: siteDiag } : undefined,
     };
 
     setCached(cacheKey, payload);
