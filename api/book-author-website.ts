@@ -4,7 +4,7 @@
 /**
  * POST Body:
  * {
- *   "book_title": "The Art of War",
+ *   "book_title": "Educated",
  *   "include_search": true,                 // default true (requires GOOGLE_CSE_* env)
  *   "min_author_confidence": 0.55,          // optional 0..1
  *   "min_site_confidence": 0.55,            // optional 0..1
@@ -14,7 +14,6 @@
  * }
  *
  * Returns the author's official website ONLY if the author is viable for a personal site.
- * Viability now integrates original publication year if life dates are missing.
  */
 
 import pLimit from "p-limit";
@@ -60,15 +59,15 @@ function requireAuth(req: any, res: any): boolean {
    ============================= */
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 const FETCH_TIMEOUT_MS = 5500;
-const USER_AGENT = "BookAuthorWebsite/1.2 (+https://example.com)";
+const USER_AGENT = "BookAuthorWebsite/1.3 (+https://example.com)";
 const CONCURRENCY = 4;
 
 const DEFAULT_MIN_AUTHOR_CONFIDENCE = 0.55;
 const DEFAULT_MIN_SITE_CONFIDENCE = 0.55;
 
-/* ====== Google CSE config ====== */
-const CSE_KEY = process.env.GOOGLE_CSE_KEY || "";
-const CSE_ID = process.env.GOOGLE_CSE_ID || process.env.GOOGLE_CSE_CX || "";
+/* ====== Google CSE config (trim to avoid whitespace/newlines) ====== */
+const CSE_KEY = (process.env.GOOGLE_CSE_KEY || "").trim();
+const CSE_ID = (process.env.GOOGLE_CSE_ID || process.env.GOOGLE_CSE_CX || "").trim();
 const USE_SEARCH_BASE = !!(CSE_KEY && CSE_ID);
 
 /* =============================
@@ -229,6 +228,31 @@ function tokens(s: string): string[] {
     .filter(Boolean);
 }
 
+function sanitizeAuthorName(raw: string): string {
+  // Remove parentheticals & punctuation noise
+  let s = raw.replace(/\([^)]*\)/g, " ").replace(/[,;:]+/g, " ").replace(/\s+/g, " ").trim();
+  const BAD_LEADING = new Set([
+    "american","british","canadian","australian","irish","nigerian","indian","chinese","japanese","korean",
+    "french","german","italian","spanish","mexican","colombian","argentine","russian","ukrainian","scottish","welsh",
+    "award-winning","bestselling","best-selling","acclaimed","renowned","noted","celebrated"
+  ]);
+  const BAD_ROLES = new Set([
+    "author","novelist","writer","poet","historian","journalist","professor","essayist","editor","biographer","memoirist"
+  ]);
+  const HONORIFICS = new Set(["dr.","dr","sir","dame","prof.","prof","mr.","mr","mrs.","mrs","ms.","ms"]);
+  const toks = s.split(/\s+/);
+  const out: string[] = [];
+  for (const t of toks) {
+    const tl = t.toLowerCase();
+    if (HONORIFICS.has(tl)) continue;
+    if (BAD_LEADING.has(tl)) continue;
+    if (BAD_ROLES.has(tl)) continue;
+    if (/^[A-Z][\p{L}'-]+$/u.test(t) || /^[A-Z]\.?$/.test(t)) out.push(t);
+  }
+  const cleaned = out.slice(0, 4).join(" ").trim();
+  return cleaned || raw.trim();
+}
+
 function containsAll(hay: string[], needles: string[]) {
   const H = new Set(hay);
   return needles.every((n) => H.has(n));
@@ -307,11 +331,12 @@ async function googleCSE(query: string, num = 10): Promise<any[]> {
   url.searchParams.set("num", String(Math.max(1, Math.min(10, num))));
 
   const resp = await fetchWithTimeout(url.toString());
+  const text = await resp.text();
+
   if (!resp?.ok) {
-    const text = await resp?.text?.();
-    throw new Error(`cse_http_${resp?.status}: ${text || ""}`.slice(0, 240));
+    throw new Error(`cse_http_${resp?.status}: ${text?.slice(0, 500)}`);
   }
-  const data: any = await resp.json();
+  const data: any = JSON.parse(text);
   return Array.isArray(data?.items) ? data.items : [];
 }
 
@@ -365,6 +390,12 @@ function scoreAuthorCandidate(name: string, host: string, title: string, snippet
   if (nameJac >= 0.25) {
     score += 0.15;
     reasons.push(`name_similarity:${nameJac.toFixed(2)}`);
+  }
+
+  // NEW: penalize polluted labels (e.g., "American author Tara Westover")
+  if (/\b(american|british|canadian|author|writer|novelist|journalist|poet|historian|professor)\b/i.test(name)) {
+    score -= 0.15;
+    reasons.push("name_contains_descriptor");
   }
 
   // Publisher domains get a small extra bump
@@ -434,16 +465,24 @@ async function discoverAuthorFromBook(bookTitle: string, ctx: Context, debug: bo
     if (debug) diag.hits.push({ title, url, host });
   }
 
-  const ranked = Array.from(authorScores.values()).sort((a, b) => b.score - a.score);
-  if (debug) diag.candidates = ranked.slice(0, 10);
+  const ranked = Array.from(authorScores.values())
+    .map(a => {
+      // sanitize each candidate for fair comparison
+      const clean = sanitizeAuthorName(a.name);
+      return clean && clean !== a.name ? { ...a, name: clean, score: Math.min(1, a.score + 0.05), reasons: [...a.reasons, "sanitized"] } : a;
+    })
+    .sort((a, b) => b.score - a.score);
 
   const best = ranked[0] || null;
-  if (debug) diag.picked = best;
+  if (debug) {
+    diag.candidates = ranked.slice(0, 10);
+    diag.picked = best;
+  }
   return { best, _diag: debug ? diag : undefined };
 }
 
 /* =============================
-   Phase 1a: Discover original publication year
+   Phase 1a: Discover original publication year (author-aware)
    ============================= */
 function yearCandidatesFromText(text: string): number[] {
   const out = new Set<number>();
@@ -456,92 +495,104 @@ function yearCandidatesFromText(text: string): number[] {
   return Array.from(out);
 }
 
-function scorePubYearCandidate(host: string, year: number, ctx: Context): PubYearHit["score"] {
-  let score = 0;
+function scorePubYearHit(host: string, year: number, text: string, requireAuthorMention: boolean, authorName: string): number {
+  let s = 0;
   const now = new Date().getFullYear();
-
-  // Trusted source boosts
-  if (PUBYEAR_SOURCES.some((d) => host.includes(d))) score += 0.4;
-
-  // Recency sanity: a plausible original year is <= now and not a "future" year
-  if (year <= now) score += 0.1;
-
-  // Prefer "older" earliest mentions from snippets (original ≠ latest edition)
-  if (year < now - 1) score += 0.05;
-
-  return Math.max(0, Math.min(1, score));
+  if (PUBYEAR_SOURCES.some(d => host.includes(d))) s += 0.5;
+  if (year <= now) s += 0.1;
+  if (year < now - 1) s += 0.05;
+  if (requireAuthorMention) {
+    const ok = new RegExp(`\\b${authorName.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\b`, "i").test(text);
+    if (!ok) return 0; // reject hit if author isn't mentioned when required
+    s += 0.2;
+  }
+  return Math.max(0, Math.min(1, s));
 }
 
-async function discoverOriginalPubYear(bookTitle: string, ctx: Context, debug: boolean) {
-  const quoted = `"${bookTitle}"`;
-  const queries = [
-    `${quoted} original publication date`,
-    `${quoted} first published`,
-    `${quoted} publication date`,
-    `${quoted} site:books.google.com`,
-    `${quoted} site:openlibrary.org`,
-    `${quoted} site:worldcat.org`,
-    `${quoted} site:goodreads.com`,
-    `${quoted} site:wikipedia.org`,
+async function discoverOriginalPubYear(bookTitle: string, authorName: string, ctx: Context, debug: boolean) {
+  const quotedBook = `"${bookTitle}"`;
+  const quotedAuthor = `"${authorName}"`;
+  const qA = [
+    `${quotedBook} ${quotedAuthor} first published`,
+    `${quotedBook} ${quotedAuthor} original publication date`,
+    `${quotedBook} ${quotedAuthor} publication date`,
+    `${quotedBook} ${quotedAuthor} site:wikipedia.org`,
+    `${quotedBook} ${quotedAuthor} site:books.google.com`,
+    `${quotedBook} ${quotedAuthor} site:openlibrary.org`,
+    `${quotedBook} ${quotedAuthor} site:worldcat.org`,
+    `${quotedBook} ${quotedAuthor} site:goodreads.com`,
   ];
-
-  const diag: any = { queries, hits: [] as any[], candidates: [] as any[], picked: undefined };
-
+  const qB = [
+    `${quotedBook} first published`,
+    `${quotedBook} original publication date`,
+    `${quotedBook} site:wikipedia.org`,
+    `${quotedBook} site:books.google.com`,
+    `${quotedBook} site:openlibrary.org`,
+    `${quotedBook} site:worldcat.org`,
+    `${quotedBook} site:goodreads.com`,
+  ];
+  const diag: any = { queriesA: qA, queriesB: qB, hits: [], candidates: [], picked: undefined };
   const limit = pLimit(CONCURRENCY);
-  const items = (
-    await Promise.all(
-      queries.map((q) => limit(async () => (USE_SEARCH_BASE ? await googleCSE(q) : [])))
-    )
-  ).flat();
-
-  const candidates: PubYearHit[] = [];
-  for (const it of items) {
-    const url = String(it.link || "");
-    if (!isHttpUrl(url)) continue;
+  const itemsA = (await Promise.all(qA.map(q => limit(() => USE_SEARCH_BASE ? googleCSE(q) : [])))).flat();
+  const itemsB = (await Promise.all(qB.map(q => limit(() => USE_SEARCH_BASE ? googleCSE(q) : [])))).flat();
+  const cands: { year: number; score: number; url: string; host: string; phase: "A"|"B" }[] = [];
+  for (const it of itemsA) {
+    const url = String(it.link || ""); if (!isHttpUrl(url)) continue;
     const host = hostOf(url);
-    const title = String(it.title || "");
-    const snippet = String(it.snippet || it.htmlSnippet || "");
-
-    const years = new Set<number>([
-      ...yearCandidatesFromText(title),
-      ...yearCandidatesFromText(snippet),
-    ]);
-
+    const title = String(it.title || ""); const snippet = String(it.snippet || it.htmlSnippet || "");
+    const years = new Set<number>([...yearCandidatesFromText(title), ...yearCandidatesFromText(snippet)]);
     for (const y of years) {
-      const sc = scorePubYearCandidate(host, y, ctx);
-      if (sc > 0) {
-        candidates.push({
-          url,
-          host,
-          year: y,
-          score: sc,
-          reasons: [
-            ...(PUBYEAR_SOURCES.some((d) => host.includes(d)) ? ["trusted_pub_source"] : []),
-          ],
-        });
-      }
+      const sc = scorePubYearHit(host, y, `${title} ${snippet}`, true, authorName);
+      if (sc > 0) cands.push({ year: y, score: sc, url, host, phase: "A" });
     }
-
-    if (debug) diag.hits.push({ title, url, host });
+    if (debug) diag.hits.push({ phase: "A", title, url, host });
   }
-
-  // Heuristic: pick the **earliest** year among top-scored candidates to approximate original publication
-  candidates.sort((a, b) => b.score - a.score || a.year - b.year);
-  let best = candidates[0] || null;
-
-  if (best) {
-    const topScore = best.score;
-    const nearTop = candidates.filter((c) => Math.abs(c.score - topScore) <= 0.05);
-    const earliestNearTop = nearTop.sort((a, b) => a.year - b.year)[0] || best;
-    best = earliestNearTop;
+  if (!cands.length) {
+    for (const it of itemsB) {
+      const url = String(it.link || ""); if (!isHttpUrl(url)) continue;
+      const host = hostOf(url);
+      const title = String(it.title || ""); const snippet = String(it.snippet || it.htmlSnippet || "");
+      const years = new Set<number>([...yearCandidatesFromText(title), ...yearCandidatesFromText(snippet)]);
+      for (const y of years) {
+        const sc = scorePubYearHit(host, y, `${title} ${snippet}`, false, authorName) * 0.8;
+        if (sc > 0) cands.push({ year: y, score: sc, url, host, phase: "B" });
+      }
+      if (debug) diag.hits.push({ phase: "B", title, url, host });
+    }
   }
-
-  if (debug) {
-    diag.candidates = candidates.slice(0, 12);
-    diag.picked = best;
+  const byYear = new Map<number, { year: number; score: number; support: number }>();
+  for (const c of cands) {
+    const g = byYear.get(c.year) || { year: c.year, score: 0, support: 0 };
+    g.score = Math.max(g.score, c.score);
+    g.support += 1;
+    byYear.set(c.year, g);
   }
-
+  let ranked = Array.from(byYear.values())
+    .map(g => ({ ...g, score: g.score + Math.min(0.2, g.support * 0.03) }))
+    .sort((a,b) => b.score - a.score || a.year - b.year);
+  const best = ranked[0] ? { year: ranked[0].year } : null;
+  if (debug) { diag.candidates = ranked.slice(0, 10); diag.picked = best; }
   return { best, _diag: debug ? diag : undefined };
+}
+
+// OpenLibrary fallback (no API key required)
+async function tryOpenLibraryPubYear(title: string, author: string): Promise<number | null> {
+  try {
+    const url = new URL("https://openlibrary.org/search.json");
+    url.searchParams.set("title", title);
+    url.searchParams.set("author", author);
+    url.searchParams.set("limit", "5");
+    const r = await fetchWithTimeout(url.toString());
+    if (!r?.ok) return null;
+    const j: any = await r.json();
+    const yrs = (j?.docs || [])
+      .map((d: any) => d?.first_publish_year)
+      .filter((y: any) => typeof y === "number");
+    if (!yrs.length) return null;
+    return Math.min(...yrs);
+  } catch {
+    return null;
+  }
 }
 
 /* =============================
@@ -594,12 +645,6 @@ async function getAuthorLifeDatesAndOfficial(authorName: string): Promise<{ birt
   }
 }
 
-/**
- * Evaluate viability using:
- * 1) Wikipedia life dates & official link (if available)
- * 2) Original publication year (if life dates missing)
- * 3) Estate policy
- */
 function evaluateAuthorViability(
   birthYear: number | null | undefined,
   deathYear: number | null | undefined,
@@ -609,7 +654,7 @@ function evaluateAuthorViability(
 ): { viable: boolean; reason: string } {
   const nowYear = new Date().getFullYear();
 
-  // If Wikipedia explicitly lists an Official website, accept (covers living and some deceased authors).
+  // If Wikipedia explicitly lists an Official website, accept.
   if (hasOfficialLinkOnWiki) {
     return { viable: true, reason: "official_link_listed_on_wikipedia" };
   }
@@ -648,7 +693,7 @@ function evaluateAuthorViability(
     }
   }
 
-  // Nothing definitive: be conservative (do not proceed)
+  // Nothing definitive: be conservative
   return { viable: false, reason: "unknown_life_and_pubyear_not_confident" };
 }
 
@@ -933,7 +978,7 @@ export default async function handler(req: any, res: any) {
     if (!authorBest || authorBest.score < minAuthorConfidence) {
       const payload: CacheValue = {
         book_title: bookTitle,
-        inferred_author: authorBest?.name,
+        inferred_author: authorBest?.name && sanitizeAuthorName(authorBest.name),
         pub_year: null,
         life_dates: null,
         author_viable: false,
@@ -951,25 +996,41 @@ export default async function handler(req: any, res: any) {
       return res.status(200).json(payload);
     }
 
-    /* ---------- Phase 1a: Original publication year ---------- */
-    const { best: pubBest, _diag: pubDiag } = await discoverOriginalPubYear(bookTitle, ctx, debug);
-    const pubYear = pubBest?.year ?? null;
+    // Ensure sanitized author name is used everywhere downstream
+    const authorName = sanitizeAuthorName(authorBest.name);
+
+    /* ---------- Phase 1a: Original publication year (author-aware) ---------- */
+    const { best: pubBest, _diag: pubDiag } = await discoverOriginalPubYear(bookTitle, authorName, ctx, debug);
+    let pubYear = pubBest?.year ?? null;
+    if (!pubYear) {
+      const ol = await tryOpenLibraryPubYear(bookTitle, authorName);
+      if (ol) pubYear = ol;
+    }
 
     /* ---------- Phase 1b: Viability gate ---------- */
-    const life = await getAuthorLifeDatesAndOfficial(authorBest.name);
+    const life = await getAuthorLifeDatesAndOfficial(authorName);
+
+    // Guard against absurd mismatches: pub year decades before the author's plausible life
+    let finalPubYear = pubYear;
+    if (life?.birthYear && typeof finalPubYear === "number") {
+      if (finalPubYear < (life.birthYear as number) - 20) {
+        finalPubYear = null; // discard obviously wrong year
+      }
+    }
+
     const { viable, reason } = evaluateAuthorViability(
       life.birthYear ?? null,
       life.deathYear ?? null,
       life.hasOfficialLink,
-      pubYear,
+      finalPubYear,
       ctx.allowEstateSites
     );
 
     if (!viable) {
       const payload: CacheValue = {
         book_title: bookTitle,
-        inferred_author: authorBest.name,
-        pub_year: pubYear,
+        inferred_author: authorName,
+        pub_year: finalPubYear,
         life_dates: { birthYear: life.birthYear ?? null, deathYear: life.deathYear ?? null },
         author_viable: false,
         viability_reason: reason,
@@ -987,13 +1048,13 @@ export default async function handler(req: any, res: any) {
     }
 
     /* ---------- Phase 2: Author website search ---------- */
-    const { best: siteBest, _diag: siteDiag } = await searchAuthorWebsite(authorBest.name, ctx, debug);
+    const { best: siteBest, _diag: siteDiag } = await searchAuthorWebsite(authorName, ctx, debug);
 
     if (!siteBest || siteBest.confidence < minSiteConfidence) {
       const payload: CacheValue = {
         book_title: bookTitle,
-        inferred_author: authorBest.name,
-        pub_year: pubYear,
+        inferred_author: authorName,
+        pub_year: finalPubYear,
         life_dates: { birthYear: life.birthYear ?? null, deathYear: life.deathYear ?? null },
         author_viable: true,
         viability_reason: reason,
@@ -1034,8 +1095,8 @@ export default async function handler(req: any, res: any) {
 
     const payload: CacheValue = {
       book_title: bookTitle,
-      inferred_author: authorBest.name,
-      pub_year: pubYear,
+      inferred_author: authorName,
+      pub_year: finalPubYear,
       life_dates: { birthYear: life.birthYear ?? null, deathYear: life.deathYear ?? null },
       author_viable: true,
       viability_reason: reason,
