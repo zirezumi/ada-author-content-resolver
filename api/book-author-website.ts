@@ -119,6 +119,12 @@ const MIDDLE_PARTICLES = new Set([
   "de","del","de la","di","da","dos","das","do","van","von","bin","ibn","al","el","le","la","du","st","saint","mc","mac","ap"
 ]);
 
+const RETAIL_TAIL = new Set([
+  "price","prices","isbn","paperback","hardcover","edition","editions",
+  "format","formats","pages","page","language","languages","special","sale",
+  "buy","kindle","audiobook","audio","ebook","e-book","mp3"
+]);
+
 const GENERATIONAL_SUFFIX = new Set(["jr","jr.","sr","sr.","ii","iii","iv","v"]);
 const BAD_TAIL = new Set([
   "frankly","review","reviews","opinion","analysis","explainer","interview","podcast",
@@ -198,28 +204,41 @@ function maybeOrgish(name: string): boolean {
 
 /** Clean + validate a candidate. Returns null if it fails the threshold. */
 function normalizeNameCandidate(raw: string, title: string): string | null {
+  // Base cleanup
   let s = raw.trim()
-    .replace(/[)\]]+$/g, "")
-    .replace(/[.,;:–—-]+$/g, "")
+    .replace(/[)\]]+$/g, "")     // drop trailing ) ] etc.
+    .replace(/[.,;:–—-]+$/g, "") // drop trailing punctuation/dashes
     .replace(/\s+/g, " ");
 
-  // Token-level: drop trailing punctuation on tokens (e.g., "Gross,")
-  s = s.split(/\s+/).map(tok => tok.replace(/[.,;:]+$/g, "")).join(" ");
-
-  // Early reject for common-word pairs (subtitle artifacts)
-  const partsEarly = s.split(/\s+/);
-  if (partsEarly.length === 2 && looksLikeCommonPair(s)) return null;
-
-  // Reject if equals a token in the title
+  // Quick reject if the whole candidate equals a single title token (very weak heuristic)
   if (tokens(title).includes(s.toLowerCase())) return null;
 
-  // Drop one trailing garbage token if present
-  const parts = s.split(" ");
-  const last = parts[parts.length - 1];
-  if (BAD_TAIL.has(last.toLowerCase()) || looksLikeAdverb(last)) {
-    if (parts.length >= 3) { parts.pop(); s = parts.join(" "); }
+  // Token-level: strip trailing punctuation per token (so "Price:" -> "Price")
+  s = s.split(/\s+/).map(tok => tok.replace(/[.,;:]+$/g, "")).join(" ");
+
+  // Work with parts
+  let parts = s.split(" ").filter(Boolean);
+  if (!parts.length) return null;
+
+  // Remove retail/format tails that often follow Author: ... in snippets
+  // (e.g., "Author: Yuval Noah Harari Price: $34.00" -> drop "Price")
+  while (parts.length >= 2 && RETAIL_TAIL.has(parts[parts.length - 1].toLowerCase())) {
+    parts.pop();
   }
 
+  // If trailing token is a bad tail or adverb, drop it once (keep min 2 tokens)
+  if (parts.length >= 3) {
+    const last = parts[parts.length - 1];
+    if (BAD_TAIL.has(last.toLowerCase()) || looksLikeAdverb(last)) {
+      parts.pop();
+    }
+  }
+
+  // Rebuild string
+  s = parts.join(" ").trim();
+  if (!s) return null;
+
+  // Final scoring gate
   return nameLikeness(s) >= 0.65 ? s : null;
 }
 
