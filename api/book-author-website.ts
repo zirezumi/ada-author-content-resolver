@@ -188,7 +188,7 @@ function extractNamesFromText(text: string, opts?: { booky?: boolean }): string[
     /\b([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})\s+(?:wrote|writes)\s+the\s+book\b/gu,
     // "by Last, First"
     /\bby\s+([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)(?=\s*(?:[),.?:;!–—-]\s|$))/gu,
-    // PLAIN "Last, First" (only when page looks like a book page)
+    // PLAIN "Last, First" (only in booky context)
     ...(booky ? [/\b([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)\b/gu] : []),
   ];
 
@@ -292,29 +292,42 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
 }
 
 /* =============================
-   Phase 2: Resolve Website (author-first)
+   Phase 2: Resolve Website (normalized 0–1 scoring + threshold)
    ============================= */
 const BLOCKED_DOMAINS = [
   "wikipedia.org","goodreads.com","google.com","books.google.com","reddit.com",
-  "amazon.","barnesandnoble.com","bookshop.org","penguinrandomhouse.com","biography.com",
+  "amazon.","barnesandnoble.com","bookshop.org","penguinrandomhouse.com",
   "harpercollins.com","simonandschuster.com","macmillan.com","hachettebookgroup.com",
-  "spotify.com","apple.com","bookbrowse.com"
+  "spotify.com","apple.com"
 ];
 
 function isBlockedHost(host: string): boolean {
   return BLOCKED_DOMAINS.some((d) => host.includes(d));
 }
 
+// Normalize to 0–1
 function scoreCandidateUrl(u: URL, author: string): number {
   let score = 0;
+
+  // homepage bonus
   const pathDepth = u.pathname.split("/").filter(Boolean).length;
-  if (pathDepth === 0) score += 2;       // homepage
-  if (u.protocol === "https:") score += 0.25;
+  if (pathDepth === 0) score += 0.5;
+
+  // https bonus
+  if (u.protocol === "https:") score += 0.1;
+
+  // host contains author token(s)
   const toks = tokens(author).filter(t => t.length > 2);
   const host = u.host.toLowerCase();
-  for (const t of toks) if (host.includes(t)) score += 0.4;
-  return score;
+  for (const t of toks) {
+    if (host.includes(t)) score += 0.4;
+  }
+
+  return Math.min(1, score);
 }
+
+// Minimum normalized score to accept a site (default 0.6)
+const WEBSITE_MIN_SCORE = Number(process.env.WEBSITE_MIN_SCORE ?? 0.6);
 
 async function resolveWebsite(author: string, bookTitle: string): Promise<{ url: string|null, debug: any }> {
   const queries = [
@@ -332,16 +345,35 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
       } catch { return false; }
     });
 
-    if (filtered.length) {
-      const ranked = filtered
-        .map(it => ({ it, urlObj: new URL(it.link) }))
-        .sort((a, b) => scoreCandidateUrl(b.urlObj, author) - scoreCandidateUrl(a.urlObj, author));
+    if (!filtered.length) continue;
 
-      const top = ranked[0];
-      return { url: top.urlObj.origin, debug: { query: q, picked: top.it, items: filtered.map(i => i.link) } };
+    const ranked = filtered
+      .map(it => {
+        const urlObj = new URL(it.link);
+        const score = scoreCandidateUrl(urlObj, author);
+        return { it, urlObj, score };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    const top = ranked[0];
+
+    // Threshold check (0–1 scale)
+    if (top.score >= WEBSITE_MIN_SCORE) {
+      return {
+        url: top.urlObj.origin,
+        debug: {
+          query: q,
+          threshold: WEBSITE_MIN_SCORE,
+          topScore: top.score,
+          picked: top.it,
+          candidates: ranked.slice(0, 5).map(r => ({ url: r.urlObj.href, score: r.score }))
+        }
+      };
     }
+    // else try next query
   }
-  return { url: null, debug: { tried: queries } };
+
+  return { url: null, debug: { tried: queries, threshold: WEBSITE_MIN_SCORE } };
 }
 
 /* =============================
@@ -364,7 +396,7 @@ export default async function handler(req: any, res: any) {
         inferred_author: null,
         confidence: 0,
         error: "no_author_found",
-        _diag: { flags: { USE_SEARCH, CSE_KEY: !!CSE_KEY, CSE_ID: !!CSE_ID }, author: authorRes.debug }
+        _diag: { flags: { USE_SEARCH, CSE_KEY: !!CSE_KEY, CSE_ID: !!CSE_ID, WEBSITE_MIN_SCORE }, author: authorRes.debug }
       });
     }
 
@@ -377,7 +409,7 @@ export default async function handler(req: any, res: any) {
       author_url: siteRes.url,
       confidence: siteRes.url ? 0.9 : 0,
       _diag: {
-        flags: { USE_SEARCH, CSE_KEY: !!CSE_KEY, CSE_ID: !!CSE_ID },
+        flags: { USE_SEARCH, CSE_KEY: !!CSE_KEY, CSE_ID: !!CSE_ID, WEBSITE_MIN_SCORE },
         author: authorRes.debug,
         site: siteRes.debug
       }
