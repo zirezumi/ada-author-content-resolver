@@ -29,7 +29,7 @@
   <div class="wrap">
     <div class="card">
       <h1>Author Website Resolver</h1>
-      <p class="sub">Enter a book title. This page calls <code>/api/book-author-website</code> and displays the resolved author and website.</p>
+      <p class="sub">Enter a book title. This page calls <code>/api/resolve</code> and displays the resolved author and website.</p>
 
       <form id="form">
         <input id="title" type="text" placeholder="e.g., Sapiens: A Brief History of Humankind" required />
@@ -95,7 +95,7 @@
         min_search_confidence: 0.35
       };
 
-      const res = await fetch("/api/book-author-website", {
+      const res = await fetch("/api/resolve", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
