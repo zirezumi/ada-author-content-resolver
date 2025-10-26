@@ -42,7 +42,6 @@
         <div class="kv small">
           <div class="muted">Author</div><div id="out-author">—</div>
           <div class="muted">Website</div><div id="out-site">—</div>
-          <div class="muted">Latest Title</div><div id="out-title">—</div>
         </div>
         <div id="out-debug" class="small muted" style="margin-top:12px;"></div>
       </div>
@@ -64,9 +63,9 @@
       resultsEl.classList.add("show");
 
       const author =
-        payload.inferred_author ??
-        payload.author_name ??
-        payload.author ??
+        payload.inferred_author ||
+        payload.author_name ||
+        payload.author ||
         "(unknown)";
 
       const website =
@@ -75,21 +74,21 @@
         payload.latest_url ||
         "—";
 
-      const latestTitle = payload.latest_title || payload.book_title || "—";
-
       $("out-author").textContent = author;
 
       const siteEl = $("out-site");
       siteEl.innerHTML = "";
       if (typeof website === "string" && /^https?:\/\//i.test(website)) {
         const a = document.createElement("a");
-        a.href = website; a.textContent = website; a.target = "_blank"; a.rel = "noopener";
+        a.href = website;
+        a.textContent = website;
+        a.target = "_blank";
+        a.rel = "noopener";
         siteEl.appendChild(a);
       } else {
         siteEl.textContent = website ?? "—";
       }
 
-      $("out-title").textContent = latestTitle;
       $("out-debug").textContent = payload._debug ? "debug info present" : "";
     }
 
@@ -115,9 +114,11 @@
         const text = contentType.includes("application/json") ? JSON.stringify(await res.json()) : await res.text();
         throw new Error(`HTTP ${res.status} – ${text.slice(0, 400)}`);
       }
-      return contentType.includes("application/json") ? res.json() : res.text().then(t => {
-        try { return JSON.parse(t); } catch { return { raw: t }; }
-      });
+      return contentType.includes("application/json")
+        ? res.json()
+        : res.text().then(t => {
+            try { return JSON.parse(t); } catch { return { raw: t }; }
+          });
     }
 
     form.addEventListener("submit", async (e) => {
