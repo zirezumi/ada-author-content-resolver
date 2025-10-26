@@ -1,101 +1,21 @@
 // api/book-author-website.ts
-//
-// Framework-agnostic (no `next` import). Works as a Vercel Node serverless
-// function. Includes the previously discussed fixes:
-//
-// • Safer title expansion (ignores “- Wikipedia”, etc.)
-// • Robust author-query builder (handles ALL CAPS, partial titles)
-// • Stronger name normalization (filters “Poet Lovelace”, “… Price” artefacts)
-// • Lightweight scoring with host trust & PDF penalization
-// • Website picker that avoids retailer/social hosts
+/* eslint-disable @typescript-eslint/no-explicit-any */
 
-// ---- Config -----------------------------------------------------------------
+import type { NextApiRequest, NextApiResponse } from "next";
 
-const CSE_KEY = process.env.CSE_KEY!;
-const CSE_ID = process.env.CSE_ID!;
-const AUTH_TOKEN = process.env.AUTH_TOKEN;
-
-// website score threshold (0–1)
-const WEBSITE_MIN_SCORE =
-  process.env.WEBSITE_MIN_SCORE ? Number(process.env.WEBSITE_MIN_SCORE) : 0.6;
-
-// timeouts
-const FETCH_TIMEOUT_MS = 12_000;
-
-// hosts we generally trust for clean author strings
-const HOST_WEIGHTS: Record<string, number> = {
-  "amazon.com": 0.9,
-  "www.amazon.com": 0.9,
-  "amazon.co.uk": 0.85,
-  "www.amazon.co.uk": 0.85,
-  "goodreads.com": 0.85,
-  "www.goodreads.com": 0.85,
-  "penguinrandomhouse.com": 0.8,
-  "www.penguinrandomhouse.com": 0.8,
-  "harpercollins.com": 0.8,
-  "www.harpercollins.com": 0.8,
-  "simonandschuster.com": 0.8,
-  "www.simonandschuster.com": 0.8,
-  "macmillan.com": 0.8,
-  "us.macmillan.com": 0.8,
-  "barnesandnoble.com": 0.75,
-  "www.barnesandnoble.com": 0.75,
-  "en.wikipedia.org": 0.3, // good for subtitle/title, not for author text
-};
-
-const WEBSITE_BAD_HOSTS = new Set([
-  "amazon.com",
-  "www.amazon.com",
-  "amazon.co.uk",
-  "www.amazon.co.uk",
-  "goodreads.com",
-  "www.goodreads.com",
-  "en.wikipedia.org",
-  "www.wikipedia.org",
-  "facebook.com",
-  "www.facebook.com",
-  "twitter.com",
-  "x.com",
-  "instagram.com",
-  "www.instagram.com",
-  "linkedin.com",
-  "www.linkedin.com",
-  "youtube.com",
-  "www.youtube.com",
-]);
-
-// ---- Utilities ---------------------------------------------------------------
-
-const SITE_SUFFIX =
-  /\s*[-–:]\s*(Wikipedia|Goodreads|Amazon(?:\.com)?|Barnes\s*&\s*Noble|Penguin\s*Random\s*House|Macmillan|HarperCollins|Simon\s*&\s*Schuster|PRH)\s*$/i;
-
-function cleanTitleLike(s: string): string {
-  return (s || "")
-    .replace(SITE_SUFFIX, "")
-    .replace(/\s*\|.*$/, "")
-    .replace(/[“”"']+/g, "")
-    .replace(/\s{2,}/g, " ")
-    .trim();
-}
-
-async function fetchJSON<T>(url: string): Promise<T> {
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, { signal: ac.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return (await res.json()) as T;
-  } finally {
-    clearTimeout(t);
-  }
-}
+/**
+ * ENV
+ *  - CSE_KEY: Google Custom Search JSON API key
+ *  - CSE_ID:  Google Custom Search Engine ID
+ *  - WEBSITE_MIN_SCORE: number (0..1)
+ *  - AUTH_TOKEN: shared secret for X-Auth header (optional; if present, enforced)
+ */
 
 type CSEItem = {
-  kind: string;
-  title: string;
+  link?: string;
+  displayLink?: string;
+  title?: string;
   htmlTitle?: string;
-  link: string;
-  displayLink: string;
   snippet?: string;
   htmlSnippet?: string;
   pagemap?: any;
@@ -103,373 +23,407 @@ type CSEItem = {
   fileFormat?: string;
 };
 
-type CSEResult = { items?: CSEItem[] };
-
-function cseUrl(q: string, num = 10): string {
-  const url = new URL("https://www.googleapis.com/customsearch/v1");
-  url.searchParams.set("key", CSE_KEY);
-  url.searchParams.set("cx", CSE_ID);
-  url.searchParams.set("q", q);
-  url.searchParams.set("num", String(num));
-  return url.toString();
-}
-
-function expandBookTitleForSearch(
-  userTitle: string,
-  evidenceTitles: string[]
-): { full: string; usedShort: boolean } {
-  const base = cleanTitleLike(userTitle);
-  let best = "";
-
-  for (const raw of evidenceTitles) {
-    const t = cleanTitleLike(raw || "");
-    if (!t) continue;
-    if (t.toLowerCase().startsWith(base.toLowerCase())) {
-      if (t.length > best.length) best = t;
-    }
-  }
-
-  const polluted =
-    !best ||
-    /(?:wikipedia|goodreads|amazon|barnes|noble|penguin|random|house)/i.test(
-      best
-    ) ||
-    best.split(/\s+/).length > 12;
-
-  const full = polluted ? base : best;
-  return { full, usedShort: polluted };
-}
-
-function buildAuthorQuery(expandedTitle: string): string {
-  const t = cleanTitleLike(expandedTitle);
-  const looksAllCaps = /[A-Z]/.test(t) && !/[a-z]/.test(t);
-  const norm = looksAllCaps ? t.toLowerCase() : t;
-
-  const toks = norm.split(/\s+/);
-  const head = toks.slice(0, Math.min(6, toks.length)).join(" ");
-  const tail = toks.slice(6).join(" ");
-
-  const parts = [`"${head}"`, tail, "book", "written by"]
-    .filter(Boolean)
-    .join(" ");
-
-  return `${parts} -film -movie -screenplay -soundtrack -director`;
-}
-
-function normalizeNameCandidate(raw: string): string | null {
-  if (!raw) return null;
-  let s = raw;
-
-  s = s.replace(/&amp;|&quot;|&apos;|&lt;|&gt;/g, " ");
-  s = s.replace(/\[[^\]]+\]|\([^)]+\)|\{[^}]+\}/g, " ");
-
-  s = s.replace(
-    /\s*,\s*(?:Ph\.?D\.?|MD|M\.?D\.?|Ed\.?D\.?|MBA|J\.?D\.?|Prof\.?|Professor|Editor|Ed\.|Illustrator|Illustrated by|Translator|Foreword by|Preface by|Introduction by)\b.*$/i,
-    ""
-  );
-
-  s = s
-    .replace(/\b(price|prices|pricing|sale|discount|deal)\b/gi, " ")
-    .replace(
-      /[\$£€¥]\s*\d+(?:[\.,]\d{2})?|\b\d+(?:\.\d{2})?\s*(?:USD|EUR|GBP|JPY)\b/gi,
-      " "
-    );
-
-  s = s.replace(/^\s*(?:author|by|written by|writer|creator)\s*[:\-]\s*/i, "");
-  s = s.replace(/[–—-]/g, " ").replace(/\s{2,}/g, " ").trim();
-  s = s.replace(/^[^\p{L}]+|[^\p{L}]+$/gu, "");
-
-  if (!s) return null;
-
-  const toks = s.split(/\s+/);
-  if (toks.some((t) => /\w+\.\w{2,}/.test(t))) return null;
-  if (toks.length > 5) return null;
-
-  if (/^(poet|sir|dame|lord|lady|dr|doctor|prof|professor)$/i.test(toks[0])) {
-    s = toks.slice(1).join(" ");
-  }
-
-  s = s.replace(/\s+\b(and|with)\b.*$/i, "").trim();
-
-  const alphaTokens = s.split(/\s+/).filter((t) => /[A-Za-z\u00C0-\u017F]/.test(t));
-  if (alphaTokens.length < 2) return null;
-
-  s = s
-    .split(/\s+/)
-    .map((t) =>
-      t.length <= 3 && t === t.toLowerCase()
-        ? t
-        : t.charAt(0).toUpperCase() + t.slice(1)
-    )
-    .join(" ");
-
-  return s || null;
-}
-
-function extractAuthorCandidates(item: CSEItem): string[] {
-  const out = new Set<string>();
-  const pieces: string[] = [];
-
-  if (item.title) pieces.push(item.title);
-  if (item.snippet) pieces.push(item.snippet);
-  if (item.htmlSnippet) pieces.push(item.htmlSnippet);
-  if (item.pagemap?.metatags) {
-    const mt = item.pagemap.metatags[0] || {};
-    const metaCandidates = [
-      mt["og:title"],
-      mt["twitter:title"],
-      mt["og:description"],
-      mt["twitter:description"],
-    ].filter(Boolean);
-    pieces.push(...metaCandidates);
-  }
-
-  const PATTERNS: RegExp[] = [
-    /\bby\s+([A-Z][\p{L}\-']+(?:\s+[A-Z][\p{L}\-']+){0,3})\b/giu,
-    /\bauthor:\s*([A-Z][\p{L}\-']+(?:\s+[A-Z][\p{L}\-']+){0,3})\b/giu,
-    /\bwritten by\s+([A-Z][\p{L}\-']+(?:\s+[A-Z][\p{L}\-']+){0,3})\b/giu,
-    /\b(Diane|Yuval|Barack|Malcolm|Melinda)\s+[A-Z][\p{L}\-']+\b/giu,
-  ];
-
-  for (const p of pieces) {
-    for (const re of PATTERNS) {
-      let m: RegExpExecArray | null;
-      const hay = p.replace(/<[^>]+>/g, " ");
-      while ((m = re.exec(hay))) {
-        const cand = normalizeNameCandidate(m[1]);
-        if (cand) out.add(cand);
-      }
-    }
-  }
-
-  if (/amazon\./i.test(item.displayLink) && item.title) {
-    const m = item.title.match(/:\s*([^:]+?)\s*\[(?:Hardcover|Paperback|.*)\]/i);
-    if (m) {
-      const parts = m[1].split(/,\s*/);
-      if (parts.length) {
-        const cand = normalizeNameCandidate(parts[0]);
-        if (cand) out.add(cand);
-      }
-    }
-  }
-
-  return [...out];
-}
-
-function scoreCandidate(
-  item: CSEItem,
-  name: string,
-  counts: Record<string, number>
-): number {
-  const host = (item.displayLink || "").toLowerCase();
-  const base = HOST_WEIGHTS[host] ?? 0.5;
-  const signal = counts[name] ?? 1;
-
-  let penalty = 0;
-  if (item.mime === "application/pdf" || /pdf/i.test(item.fileFormat || ""))
-    penalty += 0.2;
-  if (/\bPrice\b/i.test(name)) penalty += 0.5;
-
-  return Math.max(
-    0,
-    Math.min(1, base + Math.min(0.4, Math.log2(1 + signal) / 4) - penalty)
-  );
-}
-
-function inferAuthorFromCSE(items: CSEItem[]) {
-  const candidates = new Map<string, number>();
-  const perItem: Array<{ item: CSEItem; names: string[] }> = [];
-
-  for (const it of items) {
-    const names = extractAuthorCandidates(it);
-    perItem.push({ item: it, names });
-    for (const n of names) {
-      candidates.set(n, (candidates.get(n) || 0) + 1);
-    }
-  }
-
-  let bestName: string | null = null;
-  let bestScore = 0;
-
-  const counts = Object.fromEntries(candidates);
-
-  for (const { item, names } of perItem) {
-    for (const n of names) {
-      const s = scoreCandidate(item, n, counts);
-      if (s > bestScore) {
-        bestScore = s;
-        bestName = n;
-      }
-    }
-  }
-
-  return { name: bestName, confidence: bestScore, tallies: candidates };
-}
-
-function pickAuthorWebsite(items: CSEItem[], author: string) {
-  let best: { url: string; score: number } | null = null;
-
-  for (const it of items) {
-    const host = (it.displayLink || "").toLowerCase();
-    if (WEBSITE_BAD_HOSTS.has(host)) continue;
-
-    const title = `${it.title || ""} ${it.snippet || ""}`.toLowerCase();
-    const a = author.toLowerCase();
-
-    let score = 0;
-    if (host.includes(a.replace(/\s+/g, ""))) score += 0.6;
-    if (title.includes("official")) score += 0.25;
-    if (title.includes("author")) score += 0.15;
-    if (/\.(com|org|net)$/i.test(host)) score += 0.05;
-
-    if (!best || score > best.score) {
-      best = { url: it.link, score };
-    }
-  }
-
-  if (!best || best.score < WEBSITE_MIN_SCORE)
-    return { url: null as string | null, score: best?.score ?? 0 };
-  return best;
-}
-
-// ---- API Handler -------------------------------------------------------------
-
-type ResolveBody = { book_title?: string };
-
 type ResolveResponse = {
   book_title: string;
-  inferred_author: string | null;
+  inferred_author?: string | null;
   author_confidence?: number;
-  author_url: string | null;
+  author_url?: string | null;
   confidence: number;
   error?: string;
   _diag?: any;
 };
 
-export default async function handler(req: any, res: any) {
+const REQUIRED_AUTH = process.env.AUTH_TOKEN?.trim();
+
+/* ----------------------------- Utilities ----------------------------- */
+
+const SITE_SUFFIX =
+  /\s*[-–:]\s*(Wikipedia|Goodreads|Amazon(\.com)?|Barnes\s*&\s*Noble|Penguin\s*Random\s*House|Macmillan|HarperCollins|Simon\s*&\s*Schuster|PRH)\s*$/i;
+
+function cleanTitleLike(s: string): string {
+  return (s || "")
+    .replace(SITE_SUFFIX, "") // drop common " - Wikipedia"/retailer suffixes
+    .replace(/\s*\|.*$/, "") // drop " | Site"
+    .replace(/[“”"’‘]+/g, "") // quotes
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function looksAllCaps(s: string): boolean {
+  return /[A-Z]/.test(s) && !/[a-z]/.test(s);
+}
+
+/** Title expansion: prefer evidence that starts with the user’s title; otherwise keep short. */
+function expandBookTitleForSearch(
+  userTitle: string,
+  evidenceTitles: string[]
+): { full: string; usedShort: boolean; debug: any } {
+  const base = cleanTitleLike(userTitle);
+  let best = "";
+
+  const considered: Array<{ cand: string; full: string; reason: string }> = [];
+
+  for (const raw of evidenceTitles || []) {
+    const t = cleanTitleLike(raw);
+    if (!t) continue;
+
+    considered.push({ cand: raw, full: t, reason: "from_evidence" });
+
+    if (t.toLowerCase().startsWith(base.toLowerCase())) {
+      if (t.length > best.length) best = t;
+    }
+  }
+
+  // Pollution checks
+  const polluted =
+    !best ||
+    /(wikipedia|goodreads|amazon|barnes|noble|penguin|random|house|harpercollins|macmillan|simon\s*&\s*schuster)/i.test(
+      best
+    ) ||
+    best.split(/\s+/).length > 12;
+
+  return {
+    full: polluted ? base : best,
+    usedShort: polluted,
+    debug: {
+      q: `"${cleanTitleLike(userTitle)}" book`,
+      bestFull: polluted ? null : best,
+      evidence: considered,
+    },
+  };
+}
+
+/** Build a safe author query from expanded title. */
+function buildAuthorQuery(expandedTitle: string): string {
+  const t0 = cleanTitleLike(expandedTitle);
+  const t = looksAllCaps(t0) ? t0.toLowerCase() : t0;
+
+  const toks = t.split(/\s+/);
+  const head = toks.slice(0, Math.min(6, toks.length)).join(" ");
+  const tail = toks.slice(6).join(" ");
+
+  const parts = [`"${head}"`, tail, "book", "written by"].filter(Boolean);
+  const core = parts.join(" ");
+  return `${core} -film -movie -screenplay -soundtrack -director`;
+}
+
+/** Normalize name candidates: strip roles, prices, and trailing garbage; title-case properly. */
+function normalizeNameCandidate(raw: string): string | null {
+  if (!raw) return null;
+
+  // 1) Pull the part that looks like a person name out of noisy strings (e.g., "by XYZ, PhD – $14.99")
+  let s = raw
+    .replace(/^[^A-Za-z]+/, "")
+    .replace(/\bby\s+/i, "")
+    .replace(/\s*\([^)]*\)\s*$/, "") // drop trailing parentheticals
+    .replace(/\s*[,;•|–-]\s*(?:author|writer|editor|illustrator|narrator|price|hardcover|paperback|ebook|edition)\b.*$/i, "")
+    .replace(/\s+\$?\d+(?:\.\d{2})?\b.*$/i, "") // drop price and after
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  // 2) If the string is a comma-separated role title (e.g., "Poet Lovelace", "Change Transitions"),
+  //    reject words that are common role/descriptor nouns when they appear in the leading slot.
+  const roleish = new Set([
+    "poet",
+    "saint",
+    "doctor",
+    "professor",
+    "coach",
+    "pastor",
+    "bishop",
+    "minister",
+    "president",
+    "prime",
+    "queen",
+    "king",
+    "change",
+    "transitions",
+    "author",
+    "writer",
+  ]);
+  const tokens = s.split(/\s+/);
+  if (tokens.length === 2) {
+    const [w1, w2] = tokens.map((t) => t.toLowerCase());
+    if (roleish.has(w1) && /^[a-z]+$/.test(w2)) {
+      // likely "Poet Lovelace" → drop
+      return null;
+    }
+  }
+
+  // 3) Remove stray "price" if it stuck to the end (e.g., "Yuval Noah Harari Price")
+  s = s.replace(/\bprice\b$/i, "").trim();
+
+  // 4) Guard against all-uppercase names from shouted titles
+  if (looksAllCaps(s)) {
+    s = s.toLowerCase();
+  }
+
+  // 5) Title-case words that look like names; preserve "van", "de", etc.
+  const keepLower = new Set(["van", "de", "da", "del", "dos", "di", "von", "der", "la", "le", "of"]);
+  s = s
+    .split(/\s+/)
+    .map((w, i) => {
+      const lw = w.toLowerCase();
+      if (i > 0 && keepLower.has(lw)) return lw;
+      return w.charAt(0).toUpperCase() + w.slice(1);
+    })
+    .join(" ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  // Basic sanity: require at least one space (firstname lastname) unless it's a known single-name author
+  if (!/\s/.test(s)) {
+    const singletons = new Set(["Plato", "Homer", "Voltaire", "Molière", "Aeschylus", "Euripides", "Sophocles"]);
+    if (!singletons.has(s)) return null;
+  }
+
+  // Ban generic phrases
+  if (/^(poet|author|writer|change|transitions)$/i.test(s)) return null;
+
+  return s || null;
+}
+
+function scoreAuthorNameQuality(name: string): number {
+  // lightweight heuristic: 0..1
+  if (!name) return 0;
+  let score = 0.5;
+  if (/\s/.test(name)) score += 0.2;
+  if (/^[A-Z][a-z]+(?:\s+[A-Z][a-z'-]+)+$/.test(name)) score += 0.2;
+  if (!/(author|writer|editor|illustrator|price)/i.test(name)) score += 0.1;
+  return Math.max(0, Math.min(1, score));
+}
+
+function isLikelyPdf(item: CSEItem): boolean {
+  return item.mime === "application/pdf" || /pdf/i.test(item.fileFormat || "");
+}
+
+function unique<T>(arr: T[]): T[] {
+  return Array.from(new Set(arr));
+}
+
+/* ----------------------------- CSE Helpers ----------------------------- */
+
+async function cseSearch(q: string) {
+  const key = process.env.CSE_KEY;
+  const cx = process.env.CSE_ID;
+  if (!key || !cx) throw new Error("Missing CSE_KEY or CSE_ID");
+
+  const url = new URL("https://www.googleapis.com/customsearch/v1");
+  url.searchParams.set("key", key);
+  url.searchParams.set("cx", cx);
+  url.searchParams.set("q", q);
+  url.searchParams.set("num", "10");
+
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(`CSE error: ${res.status}`);
+  return res.json();
+}
+
+/* --------------------------- Extraction logic -------------------------- */
+
+function harvestEvidenceTitles(items: CSEItem[]): string[] {
+  const out: string[] = [];
+  for (const it of items) {
+    if (it?.title) out.push(it.title);
+    if (it?.htmlTitle) out.push(it.htmlTitle);
+  }
+  return out;
+}
+
+function harvestAuthorCandidates(items: CSEItem[]): string[] {
+  const cands: string[] = [];
+
+  for (const it of items) {
+    if (isLikelyPdf(it)) continue; // PDFs often quote Wikipedia, rarely clean author lines
+
+    const src: string[] = [];
+    if (it.title) src.push(it.title);
+    if (it.snippet) src.push(it.snippet);
+    if (it.htmlSnippet) src.push(it.htmlSnippet);
+
+    // Common “by <Author>” pattern
+    for (const s of src) {
+      const m = s.match(/\bby\s+([A-Z][A-Za-z'’.\-]+\s+[A-Z][A-Za-z'’.\-]+(?:\s+[A-Z][A-Za-z'’.\-]+)*)/i);
+      if (m) cands.push(m[1]);
+    }
+
+    // Goodreads/Amazon title pattern: “<Book> by <Author>”
+    for (const s of src) {
+      const m = s.match(/\bby\s+([A-Z][^\]|:]+?)(?:\s*[\]|:–-]|$)/i);
+      if (m) cands.push(m[1]);
+    }
+
+    // Fallback: pagemap metadata (sometimes includes author)
+    const meta = it.pagemap?.metatags?.[0];
+    const ogTitle: string | undefined = meta?.["og:title"] || meta?.["twitter:title"];
+    if (ogTitle) {
+      const m = ogTitle.match(/\bby\s+([A-Z][A-Za-z'’.\-]+\s+[A-Z][A-Za-z'’.\-]+.*)$/i);
+      if (m) cands.push(m[1]);
+    }
+  }
+
+  return cands;
+}
+
+function pickBestAuthor(rawCandidates: string[]) {
+  const normalized: string[] = [];
+  for (const c of rawCandidates) {
+    const n = normalizeNameCandidate(c);
+    if (n) normalized.push(n);
+  }
+  const counts = new Map<string, number>();
+  for (const n of normalized) counts.set(n, (counts.get(n) || 0) + 1);
+
+  let best = "";
+  let bestScore = 0;
+
+  for (const [name, cnt] of counts.entries()) {
+    const quality = scoreAuthorNameQuality(name);
+    const score = cnt * 0.6 + quality * 0.4;
+    if (score > bestScore) {
+      bestScore = score;
+      best = name;
+    }
+  }
+
+  return { name: best || null, confidence: Number(best ? Math.min(0.95, bestScore / 3).toFixed(2) : 0) };
+}
+
+function harvestWebsiteCandidates(items: CSEItem[], author: string): Array<{ url: string; score: number }> {
+  const out: Array<{ url: string; score: number }> = [];
+  const authorLow = author.toLowerCase();
+
+  for (const it of items) {
+    const url = it.link || "";
+    const host = (it.displayLink || "").toLowerCase();
+    const title = (it.title || "").toLowerCase();
+
+    if (!url) continue;
+
+    let score = 0;
+
+    // Prefer obvious official sites
+    if (/official site|official website|home page/i.test(it.title || "")) score += 0.5;
+
+    // Domain hints
+    if (host.includes(authorLow.replace(/\s+/g, ""))) score += 0.3;
+    if (/\.org|\.com|\.net$/i.test(host)) score += 0.05;
+
+    // Author name in title
+    if (title.includes(authorLow)) score += 0.15;
+
+    // Deprioritize socials, retailers, and aggregators
+    if (/(twitter|x\.com|facebook|instagram|goodreads|amazon|barnes|noble|wikipedia)/i.test(host)) score -= 0.4;
+
+    if (score > 0) out.push({ url, score });
+  }
+
+  // unique by url
+  const seen = new Set<string>();
+  const uniq = out.filter((o) => (seen.has(o.url) ? false : (seen.add(o.url), true)));
+
+  return uniq.sort((a, b) => b.score - a.score);
+}
+
+/* ------------------------------ API route ------------------------------ */
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse<ResolveResponse>) {
   try {
-    if (AUTH_TOKEN) {
-      const x = req.headers?.["x-auth"];
-      if (!x || x !== AUTH_TOKEN) {
-        res.status(401).json({ error: "unauthorized" });
-        return;
+    if (REQUIRED_AUTH) {
+      const token = (req.headers["x-auth"] || req.headers["X-Auth"]) as string | undefined;
+      if (!token || token !== REQUIRED_AUTH) {
+        return res.status(401).json({
+          book_title: (req.body?.book_title as string) || "",
+          confidence: 0,
+          error: "unauthorized",
+        });
       }
     }
 
     if (req.method !== "POST") {
-      res.status(405).json({ error: "method_not_allowed" });
-      return;
+      return res.status(405).json({ book_title: "", confidence: 0, error: "method_not_allowed" });
     }
 
-    const body: ResolveBody =
-      typeof req.body === "object" && req.body
-        ? req.body
-        : JSON.parse(req.body || "{}");
-
-    const titleInput = (body?.book_title || "").trim();
-    if (!titleInput) {
-      res.status(400).json({ error: "missing_book_title" });
-      return;
+    const rawTitle: string = (req.body?.book_title || "").toString().trim();
+    if (!rawTitle) {
+      return res.status(400).json({ book_title: "", confidence: 0, error: "missing_book_title" });
     }
 
-    // 1) Probe for title expansion
-    const probeQ = `"${cleanTitleLike(titleInput)}" book`;
-    const probeJson = await fetchJSON<CSEResult>(cseUrl(probeQ, 10));
-    const evidenceTitles = probeJson.items?.map((i) => i.title).filter(Boolean) ?? [];
-    const expanded = expandBookTitleForSearch(titleInput, evidenceTitles);
+    // Phase 1: initial search to gather evidence titles
+    const initialQ = `"${cleanTitleLike(rawTitle)}" book`;
+    const initial = await cseSearch(initialQ);
+    const firstItems: CSEItem[] = initial?.items || [];
+    const evidenceTitles = harvestEvidenceTitles(firstItems);
 
-    // 2) Author query
+    // Phase 2: safer title expansion (fix #1 & #2)
+    const expanded = expandBookTitleForSearch(rawTitle, evidenceTitles);
+
+    // Phase 3: build robust author query (fix #3)
     const authorQuery = buildAuthorQuery(expanded.full);
-    const authorJson = await fetchJSON<CSEResult>(cseUrl(authorQuery, 10));
-    const authorItems = authorJson.items ?? [];
-    const authorPick = inferAuthorFromCSE(authorItems);
-    const inferredAuthor = authorPick.name;
+    const authorSearch = await cseSearch(authorQuery);
+    const authorItems: CSEItem[] = authorSearch?.items || [];
 
-    if (!inferredAuthor) {
-      const payload: ResolveResponse = {
-        book_title: titleInput,
-        inferred_author: null,
-        author_url: null,
-        confidence: 0,
-        error: "no_author_found",
-        _diag: {
-          flags: {
-            USE_SEARCH: true,
-            CSE_KEY: Boolean(CSE_KEY),
-            CSE_ID: Boolean(CSE_ID),
-            WEBSITE_MIN_SCORE,
-          },
-          author: {
-            expanded: {
-              full: expanded.full,
-              usedShort: expanded.usedShort,
-              debug: {
-                q: probeQ,
-                bestFull: expanded.full === titleInput ? null : expanded.full,
-                evidence: evidenceTitles.slice(0, 10),
-              },
-            },
-            query: authorQuery,
-            items: authorItems.slice(0, 10),
-            candidates: Object.fromEntries(authorPick.tallies),
-          },
-        },
-      };
-      res.status(200).json(payload);
-      return;
-    }
+    // Collect author candidates from both waves (dedup to keep things tidy)
+    const candidates = unique([
+      ...harvestAuthorCandidates(firstItems),
+      ...harvestAuthorCandidates(authorItems),
+    ]);
+    const picked = pickBestAuthor(candidates);
 
-    // 3) Author website
-    const siteQueries = [
-      `"${inferredAuthor}" author website`,
-      `"${inferredAuthor}" official site`,
-      `"${inferredAuthor}" homepage`,
-    ];
-
-    let bestSite: { url: string | null; score: number } = { url: null, score: 0 };
-    for (const q of siteQueries) {
-      const js = await fetchJSON<CSEResult>(cseUrl(q, 10));
-      const items = js.items ?? [];
-      const pick = pickAuthorWebsite(items, inferredAuthor);
-      if (pick.url && pick.score > bestSite.score) bestSite = pick;
-      if (bestSite.score >= WEBSITE_MIN_SCORE) break;
-    }
-
-    const payload: ResolveResponse = {
-      book_title: titleInput,
-      inferred_author: inferredAuthor,
-      author_confidence: Number(authorPick.confidence.toFixed(2)),
-      author_url: bestSite.url,
-      confidence: Number((bestSite.score || 0).toFixed(2)),
-      _diag: {
-        flags: {
-          USE_SEARCH: true,
-          CSE_KEY: Boolean(CSE_KEY),
-          CSE_ID: Boolean(CSE_ID),
-          WEBSITE_MIN_SCORE,
-        },
-        author: {
-          expanded: {
-            full: expanded.full,
-            usedShort: expanded.usedShort,
-            debug: {
-              q: probeQ,
-              bestFull: expanded.full === titleInput ? null : expanded.full,
-              evidence: evidenceTitles.slice(0, 10),
-            },
-          },
-          query: authorQuery,
-          items: authorItems.slice(0, 10),
-          candidates: Object.fromEntries(authorPick.tallies),
-        },
-        site: {
-          threshold: WEBSITE_MIN_SCORE,
-        },
+    const diag: any = {
+      flags: {
+        USE_SEARCH: true,
+        CSE_KEY: !!process.env.CSE_KEY,
+        CSE_ID: !!process.env.CSE_ID,
+        WEBSITE_MIN_SCORE: Number(process.env.WEBSITE_MIN_SCORE ?? 0.6),
+      },
+      author: {
+        expanded,
+        query: authorQuery,
+        items: authorItems,
+        candidates: candidates.slice(0, 24),
+        picked: picked.name,
       },
     };
 
-    res.status(200).json(payload);
+    if (!picked.name) {
+      return res.status(200).json({
+        book_title: rawTitle,
+        inferred_author: null,
+        confidence: 0,
+        error: "no_author_found",
+        _diag: diag,
+      });
+    }
+
+    // Phase 4: website resolution (very lightweight heuristic)
+    const siteQuery = `"${picked.name}" official site`;
+    const siteSearch = await cseSearch(siteQuery);
+    const siteItems: CSEItem[] = siteSearch?.items || [];
+    const siteCands = harvestWebsiteCandidates(siteItems, picked.name);
+    const minScore = Math.max(0, Math.min(1, Number(process.env.WEBSITE_MIN_SCORE ?? 0.6)));
+    const topSite = siteCands.find((c) => c.score >= minScore);
+
+    diag.site = {
+      tried: [siteQuery],
+      threshold: minScore,
+      top: siteCands[0] || null,
+    };
+
+    return res.status(200).json({
+      book_title: rawTitle,
+      inferred_author: picked.name,
+      author_confidence: picked.confidence,
+      author_url: topSite?.url ?? null,
+      confidence: topSite ? Number(Math.min(1, picked.confidence * topSite.score).toFixed(2)) : 0,
+      _diag: diag,
+    });
   } catch (err: any) {
-    res.status(500).json({ error: String(err?.message || err) });
+    return res.status(200).json({
+      book_title: (req.body?.book_title as string) || "",
+      inferred_author: null,
+      confidence: 0,
+      error: err?.message || "unknown_error",
+    });
   }
 }
