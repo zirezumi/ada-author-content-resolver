@@ -316,7 +316,7 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
    Phase 2: Resolve Website (unchanged)
    ============================= */
 const BLOCKED_DOMAINS = [
-  "wikipedia.org","goodreads.com","google.com","books.google.com",
+  "wikipedia.org","goodreads.com","google.com","books.google.com","reddit.com",
   "amazon.","barnesandnoble.com","bookshop.org","penguinrandomhouse.com",
   "harpercollins.com","simonandschuster.com","macmillan.com","hachettebookgroup.com"
 ];
