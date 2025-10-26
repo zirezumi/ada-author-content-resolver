@@ -206,17 +206,23 @@ function extractNamesFromText(
   const booky = !!opts?.booky;
   const out: Array<{ name: string; signal: Signal }> = [];
 
-  // Patterns (capture group #1 is "Name"; for Last,First we reorder)
+  // Build with a concrete element type so `signal` stays a `Signal` literal, not `string`
   const patterns: Array<{ re: RegExp; signal: Signal; swap?: boolean }> = [
     { re: /\bAuthor:\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "author_label" },
     { re: /\bwritten by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "author_label" },
     { re: /\b([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})\s+(?:wrote|writes)\s+the\s+book\b/gu, signal: "wrote_book" },
     { re: /\bby\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "byline" },
-    // "by Last, First"
     { re: /\bby\s+([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "byline", swap: true },
-    // plain "Last, First" only in book-ish contexts
-    ...(booky ? [{ re: /\b([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)\b/gu, signal: "plain_last_first", swap: true }] : []),
   ];
+
+  // Only add the plain "Last, First" rule in book-y contexts
+  if (booky) {
+    patterns.push({
+      re: /\b([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)\b/gu,
+      signal: "plain_last_first",
+      swap: true
+    });
+  }
 
   for (const { re, signal, swap } of patterns) {
     let m: RegExpExecArray | null;
@@ -225,6 +231,7 @@ function extractNamesFromText(
       out.push({ name: name.trim(), signal });
     }
   }
+
   return out;
 }
 
