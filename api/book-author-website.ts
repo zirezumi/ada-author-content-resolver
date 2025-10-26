@@ -1,8 +1,6 @@
 // api/book-author-website.ts
 /// <reference types="node" />
 
-import pLimit from "p-limit";
-
 /* =============================
    Vercel runtime
    ============================= */
@@ -90,19 +88,10 @@ function tokens(s: string): string[] {
     .filter(Boolean);
 }
 
-function jaccard(a: string[], b: string[]) {
-  const A = new Set(a);
-  const B = new Set(b);
-  const inter = [...A].filter((x) => B.has(x)).length;
-  const uni = new Set([...A, ...B]).size;
-  return uni ? inter / uni : 0;
-}
-
 /* =============================
    Heuristic "name-likeness" scoring
    ============================= */
 
-// particles allowed in the middle and lowercased in many languages
 const MIDDLE_PARTICLES = new Set([
   "de","del","de la","di","da","dos","das","do","van","von","bin","ibn","al","el","le","la","du","st","saint","mc","mac","ap"
 ]);
@@ -115,136 +104,98 @@ const BAD_TAIL = new Set([
 ]);
 
 function isCasedWordToken(tok: string): boolean {
-  // Accept “O’Connor”, “Jean-Paul”, “Anne-Marie”, “D'Arcy”
   return /^[A-Z][\p{L}’'-]*[A-Za-z]$/u.test(tok);
 }
-
-function isParticle(tok: string): boolean {
-  tok = tok.toLowerCase();
-  return MIDDLE_PARTICLES.has(tok);
-}
-
-function isSuffix(tok: string): boolean {
-  return GENERATIONAL_SUFFIX.has(tok.toLowerCase());
-}
-
-function looksLikeAdverb(tok: string): boolean {
-  return /^[A-Za-z]{3,}ly$/u.test(tok); // “Frankly”, “Surely” …
-}
+function isParticle(tok: string): boolean { return MIDDLE_PARTICLES.has(tok.toLowerCase()); }
+function isSuffix(tok: string): boolean { return GENERATIONAL_SUFFIX.has(tok.toLowerCase()); }
+function looksLikeAdverb(tok: string): boolean { return /^[A-Za-z]{3,}ly$/u.test(tok); }
 
 function nameLikeness(raw: string): number {
   const s = raw.trim().replace(/\s+/g, " ");
   if (!s) return 0;
 
   const partsOrig = s.split(" ");
-  // normalize multiword particles like "de la"
   const parts: string[] = [];
   for (let i = 0; i < partsOrig.length; i++) {
     const cur = partsOrig[i];
     const next = partsOrig[i + 1]?.toLowerCase();
-    if (i + 1 < partsOrig.length && (cur.toLowerCase() === "de" && next === "la")) {
-      parts.push("de la"); i++; continue;
-    }
+    if (i + 1 < partsOrig.length && (cur.toLowerCase() === "de" && next === "la")) { parts.push("de la"); i++; continue; }
     parts.push(cur);
   }
 
-  // Base constraints
-  if (parts.length < 2) return 0;         // must be First+Last
-  if (parts.length > 5) return 0.25;      // too many tokens
+  if (parts.length < 2) return 0;
+  if (parts.length > 5) return 0.25;
 
-  // Scoring
   let score = 1.0;
 
-  // Head (first token) must be a cased name token
   if (!isCasedWordToken(parts[0])) score -= 0.6;
 
-  // Last token rules (allow suffix after the surname)
   const last = parts[parts.length - 1];
   const lastIsSuffix = isSuffix(last);
   const lastName = lastIsSuffix ? parts[parts.length - 2] : last;
-
   if (!isCasedWordToken(lastName)) score -= 0.6;
 
-  // Particles allowed only between first and last name
   for (let i = 1; i < parts.length - (lastIsSuffix ? 2 : 1); i++) {
     const p = parts[i];
-    if (!isCasedWordToken(p)) {
-      if (isParticle(p.toLowerCase())) {
-        score -= 0.05; // tiny penalty; allowed
-      } else {
-        score -= 0.35; // unknown lowercase or malformed token
-      }
-    }
+    if (!isCasedWordToken(p)) score += isParticle(p) ? -0.05 : -0.35;
   }
 
-  // Trailing garbage penalties
   if (BAD_TAIL.has(last.toLowerCase())) score -= 0.7;
   if (!lastIsSuffix && looksLikeAdverb(last)) score -= 0.6;
-  if (/\d/.test(s)) score -= 0.8;          // digits don’t belong in names
-  if (/[;:!?]$/.test(s)) score -= 0.2;     // odd punctuation at end
+  if (/\d/.test(s)) score -= 0.8;
+  if (/[;:!?]$/.test(s)) score -= 0.2;
 
-  // Reward reasonable total length (2–4 tokens incl. particles/suffix)
   if (parts.length === 2) score += 0.10;
   if (parts.length === 3) score += 0.12;
   if (parts.length === 4) score += 0.05;
 
-  // Cap and floor
-  if (score > 1) score = 1;
-  if (score < 0) score = 0;
-
-  return score;
+  return Math.max(0, Math.min(1, score));
 }
 
 /** Clean + validate a candidate. Returns null if it fails the threshold. */
 function normalizeNameCandidate(raw: string, title: string): string | null {
-  // Trim obvious trailing punctuation/brackets on whole string
   let s = raw.trim()
     .replace(/[)\]]+$/g, "")
     .replace(/[.,;:–—-]+$/g, "")
     .replace(/\s+/g, " ");
 
-  // Token-level cleanup: drop trailing punctuation on each token (e.g., "Gross,")
+  // Token-level: drop trailing punctuation on tokens (e.g., "Gross,")
   s = s.split(/\s+/).map(tok => tok.replace(/[.,;:]+$/g, "")).join(" ");
 
-  // Quick reject if the whole thing appears inside the title tokens
+  // Reject if exactly equals a token in title
   if (tokens(title).includes(s.toLowerCase())) return null;
 
-  // If trailing token is a bad tail or adverb, drop it once
+  // Drop one trailing garbage token if present
   const parts = s.split(" ");
   const last = parts[parts.length - 1];
   if (BAD_TAIL.has(last.toLowerCase()) || looksLikeAdverb(last)) {
-    if (parts.length >= 3) {
-      parts.pop();
-      s = parts.join(" ");
-    }
+    if (parts.length >= 3) { parts.pop(); s = parts.join(" "); }
   }
 
-  // Score threshold tuned to reject “Harari Frankly” etc.
   return nameLikeness(s) >= 0.65 ? s : null;
 }
 
 /* =============================
    Name extraction (expanded patterns)
    ============================= */
-function extractNamesFromText(text: string): string[] {
-  // Right boundary: stop before whitespace+punctuation OR end of string.
+function extractNamesFromText(text: string, opts?: { booky?: boolean }): string[] {
+  const booky = !!opts?.booky;
   const patterns = [
     /\bby\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu,
     /\bAuthor:\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu,
     /\bwritten by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu,
-
-    // NEW: "<Name> wrote the book" / "<Name> writes the book"
+    // "<Name> wrote the book"
     /\b([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})\s+(?:wrote|writes)\s+the\s+book\b/gu,
-
-    // NEW: "by Last, First" (Amazon-style, single last+first)
+    // "by Last, First"
     /\bby\s+([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)(?=\s*(?:[),.?:;!–—-]\s|$))/gu,
+    // PLAIN "Last, First" (only when page looks like a book page)
+    ...(booky ? [/\b([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)\b/gu] : []),
   ];
 
   const names: string[] = [];
   for (const pat of patterns) {
     let m: RegExpExecArray | null;
     while ((m = pat.exec(text))) {
-      // Reorder "Last, First" capture
       const candidate = m.length === 3 ? `${m[2]} ${m[1]}` : m[1];
       names.push(candidate.trim());
     }
@@ -253,39 +204,39 @@ function extractNamesFromText(text: string): string[] {
 }
 
 /* =============================
-   Phase 1: Determine Author (heuristic + clustering)
+   Phase 1: Determine Author
    ============================= */
 async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, confidence: number, debug: any }> {
-  // 👉 Use "written by" phrasing, and quote the title to reduce noise.
   const query = `"${bookTitle}" book written by -film -movie -screenplay -soundtrack -director`;
   const items = await googleCSE(query, 10);
 
   const candidates: Record<string, number> = {};
 
   for (const it of items) {
-    // Collect more text fields: title + snippet + common metatag fields (Amazon, etc.)
     const fields: string[] = [];
     if (typeof it.title === "string") fields.push(it.title);
     if (typeof it.snippet === "string") fields.push(it.snippet);
 
+    // Collect metatag hints and whether the page looks "booky"
     const mtList = Array.isArray(it.pagemap?.metatags) ? it.pagemap.metatags : [];
+    let mtIsBook = false;
     for (const mt of mtList) {
       if (mt && typeof mt === "object") {
         const t1 = (mt as any).title;
         const t2 = (mt as any)["og:title"];
         const t3 = (mt as any)["book:author"];
+        const ogType = (mt as any)["og:type"];
         if (typeof t1 === "string") fields.push(t1);
         if (typeof t2 === "string") fields.push(t2);
         if (typeof t3 === "string") fields.push(t3);
+        if (ogType && String(ogType).toLowerCase().includes("book")) mtIsBook = true;
       }
     }
 
     const haystack = fields.join(" • ");
-    for (const n of extractNamesFromText(haystack)) {
+    for (const n of extractNamesFromText(haystack, { booky: mtIsBook })) {
       const norm = normalizeNameCandidate(n, bookTitle);
-      if (norm) {
-        candidates[norm] = (candidates[norm] || 0) + 1;
-      }
+      if (norm) candidates[norm] = (candidates[norm] || 0) + 1;
     }
   }
 
@@ -294,11 +245,11 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
     return { name: null, confidence: 0, debug: { query, items, candidates } };
   }
 
-  // Build clusters keyed by the first two tokens (First + Middle/Last) to merge truncations.
+  // Cluster variants (merge prefixes/supersets)
   const clusters = new Map<string, Array<{ name: string; count: number }>>();
   for (const [name, count] of entries) {
     const toks = name.split(/\s+/);
-    if (toks.length < 2) continue; // need First+Last
+    if (toks.length < 2) continue;
     const key = toks.slice(0, 2).join(" ").toLowerCase();
     const arr = clusters.get(key) || [];
     arr.push({ name, count });
@@ -307,7 +258,6 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
 
   const merged: Array<{ name: string; score: number }> = [];
   for (const arr of clusters.values()) {
-    // Prefer longer names; break ties by higher raw count, then lexicographically
     arr.sort((a, b) => {
       const al = a.name.split(/\s+/).length, bl = b.name.split(/\s+/).length;
       if (al !== bl) return bl - al;
@@ -318,8 +268,6 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
     const longest = arr[0].name;
     const longLower = longest.toLowerCase();
     let score = 0;
-
-    // Merge counts for prefix/superset variants within cluster
     for (const { name, count } of arr) {
       const nLower = name.toLowerCase();
       if (longLower.startsWith(nLower) || nLower.startsWith(longLower)) score += count;
@@ -334,7 +282,6 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
     return { name: best, confidence, debug: { query, items, candidates, merged, picked: best } };
   }
 
-  // Fallback: prefer higher count then longer name
   const sorted = entries.sort((a, b) => {
     if (b[1] !== a[1]) return b[1] - a[1];
     return b[0].split(/\s+/).length - a[0].split(/\s+/).length;
@@ -345,13 +292,12 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
 }
 
 /* =============================
-   Phase 2: Resolve Website  (PRIORITIZE "{author} author website")
+   Phase 2: Resolve Website (author-first)
    ============================= */
 const BLOCKED_DOMAINS = [
   "wikipedia.org","goodreads.com","google.com","books.google.com","reddit.com",
   "amazon.","barnesandnoble.com","bookshop.org","penguinrandomhouse.com",
   "harpercollins.com","simonandschuster.com","macmillan.com","hachettebookgroup.com",
-  // optionally keep podcast/audio platforms out:
   "spotify.com","apple.com"
 ];
 
@@ -360,26 +306,17 @@ function isBlockedHost(host: string): boolean {
 }
 
 function scoreCandidateUrl(u: URL, author: string): number {
-  // Higher is better
   let score = 0;
   const pathDepth = u.pathname.split("/").filter(Boolean).length;
-  if (pathDepth === 0) score += 2;        // homepage
+  if (pathDepth === 0) score += 2;       // homepage
   if (u.protocol === "https:") score += 0.25;
-
-  // Bonus if hostname contains author tokens (e.g., johndoe.com, harari.org)
   const toks = tokens(author).filter(t => t.length > 2);
   const host = u.host.toLowerCase();
-  for (const t of toks) {
-    if (host.includes(t)) score += 0.4;
-  }
+  for (const t of toks) if (host.includes(t)) score += 0.4;
   return score;
 }
 
 async function resolveWebsite(author: string, bookTitle: string): Promise<{ url: string|null, debug: any }> {
-  // Priority:
-  //  1) "{author} author website"
-  //  2) "{author} official site"
-  //  3) "{bookTitle}" "{author}" author website (fallback)
   const queries = [
     `"${author}" author website`,
     `"${author}" official site`,
@@ -401,10 +338,7 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
         .sort((a, b) => scoreCandidateUrl(b.urlObj, author) - scoreCandidateUrl(a.urlObj, author));
 
       const top = ranked[0];
-      return {
-        url: top.urlObj.origin,
-        debug: { query: q, picked: top.it, items: filtered.map(i => i.link) }
-      };
+      return { url: top.urlObj.origin, debug: { query: q, picked: top.it, items: filtered.map(i => i.link) } };
     }
   }
   return { url: null, debug: { tried: queries } };
@@ -430,22 +364,24 @@ export default async function handler(req: any, res: any) {
         inferred_author: null,
         confidence: 0,
         error: "no_author_found",
-        _diag: authorRes.debug
+        _diag: { flags: { USE_SEARCH, CSE_KEY: !!CSE_KEY, CSE_ID: !!CSE_ID }, author: authorRes.debug }
       });
     }
 
     const siteRes = await resolveWebsite(authorRes.name, bookTitle);
 
-    const payload = {
+    return res.status(200).json({
       book_title: bookTitle,
       inferred_author: authorRes.name,
       author_confidence: authorRes.confidence,
       author_url: siteRes.url,
       confidence: siteRes.url ? 0.9 : 0,
-      _diag: { author: authorRes.debug, site: siteRes.debug }
-    };
-
-    return res.status(200).json(payload);
+      _diag: {
+        flags: { USE_SEARCH, CSE_KEY: !!CSE_KEY, CSE_ID: !!CSE_ID },
+        author: authorRes.debug,
+        site: siteRes.debug
+      }
+    });
   } catch (err: any) {
     console.error("handler_error", err);
     return res.status(500).json({ error: String(err?.message || err) });
