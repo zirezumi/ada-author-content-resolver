@@ -113,7 +113,7 @@
         min_search_confidence: 0.35
       };
 
-      const res = await fetch("/api/author-updates", {
+      const res = await fetch("/api/book-author-updates", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
