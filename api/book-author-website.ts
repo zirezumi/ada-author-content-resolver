@@ -1,6 +1,8 @@
 // api/book-author-website.ts
 /// <reference types="node" />
 
+import pLimit from "p-limit";
+
 /* =============================
    Vercel runtime
    ============================= */
@@ -60,7 +62,6 @@ async function fetchWithTimeout(url: string, init?: RequestInit, ms = 5500) {
 }
 
 async function googleCSE(query: string, num = 10): Promise<any[]> {
-  if (!USE_SEARCH) return [];
   const url = new URL("https://www.googleapis.com/customsearch/v1");
   url.searchParams.set("key", CSE_KEY);
   url.searchParams.set("cx", CSE_ID);
@@ -88,62 +89,56 @@ function tokens(s: string): string[] {
     .filter(Boolean);
 }
 
+function jaccard(a: string[], b: string[]) {
+  const A = new Set(a);
+  const B = new Set(b);
+  const inter = [...A].filter((x) => B.has(x)).length;
+  const uni = new Set([...A, ...B]).size;
+  return uni ? inter / uni : 0;
+}
+
 /* =============================
-   Heuristic "name-likeness" scoring
+   Name heuristics
    ============================= */
-
-const MIDDLE_PARTICLES = new Set([
-  "de","del","de la","di","da","dos","das","do","van","von","bin","ibn","al","el","le","la","du","st","saint","mc","mac","ap"
-]);
-
+const MIDDLE_PARTICLES = new Set(["de","del","de la","di","da","dos","das","do","van","von","bin","ibn","al","el","le","la","du","st","saint","mc","mac","ap"]);
 const GENERATIONAL_SUFFIX = new Set(["jr","jr.","sr","sr.","ii","iii","iv","v"]);
-const BAD_TAIL = new Set([
-  "frankly","review","reviews","opinion","analysis","explainer","interview","podcast",
-  "video","transcript","essay","profile","biography","news","guide","column","commentary",
-  "editorial","update","thread","blog"
-]);
+const BAD_TAIL = new Set(["frankly","review","reviews","opinion","analysis","explainer","interview","podcast","video","transcript","essay","profile","biography","news","guide","column","commentary","editorial","update","thread","blog"]);
 
 function isCasedWordToken(tok: string): boolean {
   return /^[A-Z][\p{L}’'-]*[A-Za-z]$/u.test(tok);
 }
-function isParticle(tok: string): boolean { return MIDDLE_PARTICLES.has(tok.toLowerCase()); }
-function isSuffix(tok: string): boolean { return GENERATIONAL_SUFFIX.has(tok.toLowerCase()); }
-function looksLikeAdverb(tok: string): boolean { return /^[A-Za-z]{3,}ly$/u.test(tok); }
+function isSuffix(tok: string): boolean {
+  return GENERATIONAL_SUFFIX.has(tok.toLowerCase());
+}
+function looksLikeAdverb(tok: string): boolean {
+  return /^[A-Za-z]{3,}ly$/u.test(tok);
+}
 
 function nameLikeness(raw: string): number {
   const s = raw.trim().replace(/\s+/g, " ");
   if (!s) return 0;
-
   const partsOrig = s.split(" ");
   const parts: string[] = [];
   for (let i = 0; i < partsOrig.length; i++) {
     const cur = partsOrig[i];
     const next = partsOrig[i + 1]?.toLowerCase();
-    if (i + 1 < partsOrig.length && (cur.toLowerCase() === "de" && next === "la")) { parts.push("de la"); i++; continue; }
+    if (i + 1 < partsOrig.length && cur.toLowerCase() === "de" && next === "la") {
+      parts.push("de la"); i++; continue;
+    }
     parts.push(cur);
   }
-
   if (parts.length < 2) return 0;
   if (parts.length > 5) return 0.25;
 
   let score = 1.0;
-
   if (!isCasedWordToken(parts[0])) score -= 0.6;
-
   const last = parts[parts.length - 1];
   const lastIsSuffix = isSuffix(last);
   const lastName = lastIsSuffix ? parts[parts.length - 2] : last;
   if (!isCasedWordToken(lastName)) score -= 0.6;
-
-  for (let i = 1; i < parts.length - (lastIsSuffix ? 2 : 1); i++) {
-    const p = parts[i];
-    if (!isCasedWordToken(p)) score += isParticle(p) ? -0.05 : -0.35;
-  }
-
   if (BAD_TAIL.has(last.toLowerCase())) score -= 0.7;
   if (!lastIsSuffix && looksLikeAdverb(last)) score -= 0.6;
   if (/\d/.test(s)) score -= 0.8;
-  if (/[;:!?]$/.test(s)) score -= 0.2;
 
   if (parts.length === 2) score += 0.10;
   if (parts.length === 3) score += 0.12;
@@ -152,78 +147,53 @@ function nameLikeness(raw: string): number {
   return Math.max(0, Math.min(1, score));
 }
 
-/** Clean + validate a candidate. Returns null if it fails the threshold. */
 function normalizeNameCandidate(raw: string, title: string): string | null {
-  let s = raw.trim()
-    .replace(/[)\]]+$/g, "")
-    .replace(/[.,;:–—-]+$/g, "")
-    .replace(/\s+/g, " ");
-
-  // Token-level: drop trailing punctuation on tokens (e.g., "Gross,")
-  s = s.split(/\s+/).map(tok => tok.replace(/[.,;:]+$/g, "")).join(" ");
-
-  // Reject if exactly equals a token in title
+  let s = raw.trim().replace(/[)\]]+$/g, "").replace(/[.,;:–—-]+$/g, "").replace(/\s+/g, " ");
   if (tokens(title).includes(s.toLowerCase())) return null;
-
-  // Drop one trailing garbage token if present
   const parts = s.split(" ");
   const last = parts[parts.length - 1];
   if (BAD_TAIL.has(last.toLowerCase()) || looksLikeAdverb(last)) {
-    if (parts.length >= 3) { parts.pop(); s = parts.join(" "); }
+    if (parts.length >= 3) {
+      parts.pop(); s = parts.join(" ");
+    }
   }
-
+  if (parts.length === 2 && looksLikeCommonPair(s)) return null;
   return nameLikeness(s) >= 0.65 ? s : null;
 }
 
 /* =============================
-   Author extraction (signal-aware)
+   Common pair guard
    ============================= */
-
-// Recognized publisher hosts (extend as needed)
-const PUBLISHERS = [
-  "us.macmillan.com","macmillan.com","penguinrandomhouse.com","prh.com",
-  "harpercollins.com","simonandschuster.com","simonandschuster.net",
-  "macmillanlearning.com","hachettebookgroup.com","fsgbooks.com"
-];
-
-// Light heuristic for org/brand bylines like "Change Transitions"
-const ABSTRACT_TOKENS = new Set([
-  "Change","Transitions","News","Press","Policy","Support","Guide","Team",
-  "Center","Office","School","Library","Community","Media","Communications"
+const COMMON_TITLE_WORDS = new Set([
+  "Change","Transitions","Transition","Moving","Forward","Next","Day","The",
+  "Future","Guide","How","Policy","Center","Office","Press","News","Support"
 ]);
-function maybeOrgish(name: string): boolean {
+function looksLikeCommonPair(name: string): boolean {
   const toks = name.split(/\s+/);
   if (toks.length !== 2) return false;
-  return toks.every(t => ABSTRACT_TOKENS.has(t));
+  return toks.every(t => COMMON_TITLE_WORDS.has(t));
 }
 
+/* =============================
+   Extract names
+   ============================= */
 type Signal = "author_label" | "wrote_book" | "byline" | "plain_last_first";
-
-function extractNamesFromText(
-  text: string,
-  opts?: { booky?: boolean }
-): Array<{ name: string; signal: Signal }> {
+function extractNamesFromText(text: string, opts?: { booky?: boolean }): Array<{ name: string; signal: Signal }> {
   const booky = !!opts?.booky;
   const out: Array<{ name: string; signal: Signal }> = [];
-
-  // Build with a concrete element type so `signal` stays a `Signal` literal, not `string`
   const patterns: Array<{ re: RegExp; signal: Signal; swap?: boolean }> = [
-    { re: /\bAuthor:\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "author_label" },
-    { re: /\bwritten by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "author_label" },
+    { re: /\bAuthor:\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})/gu, signal: "author_label" },
+    { re: /\bwritten by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})/gu, signal: "author_label" },
     { re: /\b([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})\s+(?:wrote|writes)\s+the\s+book\b/gu, signal: "wrote_book" },
-    { re: /\bby\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "byline" },
-    { re: /\bby\s+([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "byline", swap: true },
+    { re: /\bby\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})/gu, signal: "byline" },
   ];
-
-  // Only add the plain "Last, First" rule in book-y contexts
   if (booky) {
     patterns.push({
-      re: /\b([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)\b/gu,
+      re: /\b([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)\b(?!\s*(?:and|or|&|,))/gu,
       signal: "plain_last_first",
       swap: true
     });
   }
-
   for (const { re, signal, swap } of patterns) {
     let m: RegExpExecArray | null;
     while ((m = re.exec(text))) {
@@ -231,15 +201,13 @@ function extractNamesFromText(
       out.push({ name: name.trim(), signal });
     }
   }
-
   return out;
 }
 
 /* =============================
-   Phase 1: Determine Author
+   Resolve author
    ============================= */
 async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, confidence: number, debug: any }> {
-  // Quote the title to reduce noise
   const query = `"${bookTitle}" book written by -film -movie -screenplay -soundtrack -director`;
   const items = await googleCSE(query, 10);
 
@@ -248,26 +216,15 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
 
   for (const it of items) {
     const fields: string[] = [];
-    if (typeof it.title === "string") fields.push(it.title);
-    if (typeof it.snippet === "string") fields.push(it.snippet);
-
-    // Metatags + booky hint
+    if (it.title) fields.push(it.title);
+    if (it.snippet) fields.push(it.snippet);
     const mtList = Array.isArray(it.pagemap?.metatags) ? it.pagemap.metatags : [];
     let mtIsBook = false;
     for (const mt of mtList) {
-      if (mt && typeof mt === "object") {
-        const t1 = (mt as any).title;
-        const t2 = (mt as any)["og:title"];
-        const t3 = (mt as any)["book:author"];
-        const ogType = (mt as any)["og:type"];
-        if (typeof t1 === "string") fields.push(t1);
-        if (typeof t2 === "string") fields.push(t2);
-        if (typeof t3 === "string") fields.push(t3);
-        if (ogType && String(ogType).toLowerCase().includes("book")) mtIsBook = true;
+      if (typeof mt === "object") {
+        if ((mt as any)["og:type"]?.toLowerCase().includes("book")) mtIsBook = true;
       }
     }
-
-    // Host features (publisher boost)
     let host = "";
     try { host = new URL(it.link).host.toLowerCase(); } catch {}
 
@@ -277,167 +234,66 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
     for (const { name, signal } of matches) {
       const norm = normalizeNameCandidate(name, bookTitle);
       if (!norm) continue;
-
-      // Base weight by signal strength
-      let w =
-        signal === "author_label" ? 2.0 :
-        signal === "wrote_book"   ? 1.5 :
-        signal === "plain_last_first" && mtIsBook ? 1.3 :
-        1.0; // byline (generic)
-
-      // Penalize org-ish two-token bylines like "Change Transitions"
-      if (signal === "byline" && maybeOrgish(norm)) w *= 0.25;
-
-      // Publisher boost
-      if (host && PUBLISHERS.some(d => host.endsWith(d))) w *= 1.4;
-
+      let w: number;
+      switch (signal) {
+        case "author_label": w = 3.0; break;
+        case "wrote_book": w = 2.0; break;
+        case "byline": w = 1.0; break;
+        case "plain_last_first": w = 0.6; break;
+        default: w = 1.0;
+      }
+      if ((signal === "byline" || signal === "plain_last_first") &&
+          (looksLikeCommonPair(norm))) continue;
       candidates[norm] = (candidates[norm] || 0) + w;
-
-      // Track high-signal evidence
-      if (signal === "author_label" || signal === "wrote_book" || (signal === "plain_last_first" && mtIsBook)) {
+      if (signal === "author_label" || signal === "wrote_book") {
         highSignalSeen[norm] = (highSignalSeen[norm] || 0) + 1;
       }
     }
   }
 
   const entries = Object.entries(candidates);
-  if (entries.length === 0) {
-    return { name: null, confidence: 0, debug: { query, items, candidates } };
-  }
+  if (!entries.length) return { name: null, confidence: 0, debug: { query, items, candidates } };
 
-  // Cluster variants (merge prefixes/supersets)
-  const clusters = new Map<string, Array<{ name: string; count: number }>>();
-  for (const [name, count] of entries) {
-    const toks = name.split(/\s+/);
-    if (toks.length < 2) continue;
-    const key = toks.slice(0, 2).join(" ").toLowerCase();
-    const arr = clusters.get(key) || [];
-    arr.push({ name, count });
-    clusters.set(key, arr);
-  }
-
-  const merged: Array<{ name: string; score: number }> = [];
-  for (const arr of clusters.values()) {
-    arr.sort((a, b) => {
-      const al = a.name.split(/\s+/).length, bl = b.name.split(/\s+/).length;
-      if (al !== bl) return bl - al;
-      if (a.count !== b.count) return b.count - a.count;
-      return a.name.localeCompare(b.name);
-    });
-
-    const longest = arr[0].name;
-    const longLower = longest.toLowerCase();
-    let score = 0;
-    for (const { name, count } of arr) {
-      const nLower = name.toLowerCase();
-      if (longLower.startsWith(nLower) || nLower.startsWith(longLower)) score += count;
+  // Pick winner preferring high-signal
+  const merged = entries.map(([name, score]) => ({ name, score }));
+  merged.sort((a,b) => b.score - a.score);
+  let pick = merged[0];
+  const withHigh = merged.filter(m => (highSignalSeen[m.name]||0) > 0);
+  if (withHigh.length) {
+    const bestHigh = withHigh[0];
+    if ((highSignalSeen[pick.name]||0)===0 && pick.score < 1.5*bestHigh.score) {
+      pick = bestHigh;
     }
-    merged.push({ name: longest, score });
   }
-
-  if (merged.length) {
-    merged.sort((a, b) => b.score - a.score);
-
-    // Prefer highest-scoring name that has any high-signal evidence
-    const withHigh = merged.filter(m => (highSignalSeen[m.name] || 0) > 0);
-    const pick = withHigh.length ? withHigh[0] : merged[0];
-
-    const confidence = pick.score >= 2 ? 0.95 : 0.8;
-    return { name: pick.name, confidence, debug: { query, items, candidates, merged, highSignalSeen, picked: pick.name } };
-  }
-
-  // Fallback (should rarely happen)
-  const sorted = entries.sort((a, b) => {
-    if (b[1] !== a[1]) return b[1] - a[1];
-    return b[0].split(/\s+/).length - a[0].split(/\s+/).length;
-  });
-  const [best, count] = sorted[0];
-  const confidence = count >= 2 ? 0.95 : 0.8;
-  return { name: best, confidence, debug: { query, items, candidates, picked: best } };
+  const confidence = pick.score >= 2 ? 0.95 : 0.8;
+  return { name: pick.name, confidence, debug: { query, items, candidates, merged, highSignalSeen, picked: pick.name } };
 }
 
 /* =============================
-   Phase 2: Resolve Website (normalized 0–1 scoring + threshold)
+   Website resolution (unchanged except prioritization)
    ============================= */
-const BLOCKED_DOMAINS = [
-  "wikipedia.org","goodreads.com","google.com","books.google.com","reddit.com",
-  "amazon.","barnesandnoble.com","bookshop.org","penguinrandomhouse.com",
-  "harpercollins.com","simonandschuster.com","macmillan.com","hachettebookgroup.com",
-  "spotify.com","apple.com"
-];
-
+const BLOCKED_DOMAINS = ["wikipedia.org","goodreads.com","google.com","amazon.","barnesandnoble.com","bookshop.org"];
 function isBlockedHost(host: string): boolean {
   return BLOCKED_DOMAINS.some((d) => host.includes(d));
 }
-
-// Normalize to 0–1
-function scoreCandidateUrl(u: URL, author: string): number {
-  let score = 0;
-
-  // homepage bonus
-  const pathDepth = u.pathname.split("/").filter(Boolean).length;
-  if (pathDepth === 0) score += 0.5;
-
-  // https bonus
-  if (u.protocol === "https:") score += 0.1;
-
-  // host contains author token(s)
-  const toks = tokens(author).filter(t => t.length > 2);
-  const host = u.host.toLowerCase();
-  for (const t of toks) {
-    if (host.includes(t)) score += 0.4;
-  }
-
-  return Math.min(1, score);
-}
-
-// Minimum normalized score to accept a site (default 0.6)
-const WEBSITE_MIN_SCORE = Number(process.env.WEBSITE_MIN_SCORE ?? 0.6);
-
 async function resolveWebsite(author: string, bookTitle: string): Promise<{ url: string|null, debug: any }> {
   const queries = [
     `"${author}" author website`,
     `"${author}" official site`,
-    `"${bookTitle}" "${author}" author website`,
+    `"${bookTitle}" "${author}" author website`
   ];
-
   for (const q of queries) {
     const items = await googleCSE(q, 10);
     const filtered = items.filter(it => {
-      try {
-        const host = new URL(it.link).host.toLowerCase();
-        return !isBlockedHost(host);
-      } catch { return false; }
+      try { return !isBlockedHost(new URL(it.link).host.toLowerCase()); }
+      catch { return false; }
     });
-
-    if (!filtered.length) continue;
-
-    const ranked = filtered
-      .map(it => {
-        const urlObj = new URL(it.link);
-        const score = scoreCandidateUrl(urlObj, author);
-        return { it, urlObj, score };
-      })
-      .sort((a, b) => b.score - a.score);
-
-    const top = ranked[0];
-
-    if (top.score >= WEBSITE_MIN_SCORE) {
-      return {
-        url: top.urlObj.origin,
-        debug: {
-          query: q,
-          threshold: WEBSITE_MIN_SCORE,
-          topScore: top.score,
-          picked: top.it,
-          candidates: ranked.slice(0, 5).map(r => ({ url: r.urlObj.href, score: r.score }))
-        }
-      };
+    if (filtered.length) {
+      const top = filtered[0];
+      return { url: new URL(top.link).origin, debug: { query: q, picked: top, items: filtered.map(i=>i.link) } };
     }
-    // else try next query
   }
-
-  return { url: null, debug: { tried: queries, threshold: WEBSITE_MIN_SCORE } };
+  return { url: null, debug: { tried: queries } };
 }
 
 /* =============================
@@ -448,35 +304,21 @@ export default async function handler(req: any, res: any) {
     if (req.method === "OPTIONS") return res.status(204).end();
     if (req.method !== "POST") return res.status(405).json({ error: "POST required" });
     if (!requireAuth(req, res)) return;
-
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body;
     const bookTitle: string = String(body.book_title || "").trim();
     if (!bookTitle) return res.status(400).json({ error: "book_title required" });
-
     const authorRes = await resolveAuthor(bookTitle);
     if (!authorRes.name) {
-      return res.status(200).json({
-        book_title: bookTitle,
-        inferred_author: null,
-        confidence: 0,
-        error: "no_author_found",
-        _diag: { flags: { USE_SEARCH, CSE_KEY: !!CSE_KEY, CSE_ID: !!CSE_ID, WEBSITE_MIN_SCORE }, author: authorRes.debug }
-      });
+      return res.status(200).json({ book_title: bookTitle, inferred_author: null, confidence: 0, error: "no_author_found", _diag: authorRes.debug });
     }
-
     const siteRes = await resolveWebsite(authorRes.name, bookTitle);
-
     return res.status(200).json({
       book_title: bookTitle,
       inferred_author: authorRes.name,
       author_confidence: authorRes.confidence,
       author_url: siteRes.url,
       confidence: siteRes.url ? 0.9 : 0,
-      _diag: {
-        flags: { USE_SEARCH, CSE_KEY: !!CSE_KEY, CSE_ID: !!CSE_ID, WEBSITE_MIN_SCORE },
-        author: authorRes.debug,
-        site: siteRes.debug
-      }
+      _diag: { author: authorRes.debug, site: siteRes.debug }
     });
   } catch (err: any) {
     console.error("handler_error", err);
