@@ -124,7 +124,7 @@ function extractNamesFromText(text: string): string[] {
 }
 
 /* =============================
-   Phase 1: Determine Author
+   Phase 1: Determine Author (refactored)
    ============================= */
 async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, confidence: number, debug: any }> {
   const query = `"${bookTitle}" book author -film -movie -screenplay -soundtrack -director`;
@@ -140,17 +140,66 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
     }
   }
 
-  const sorted = Object.entries(candidates).sort((a,b) => b[1]-a[1]);
-  if (sorted.length === 0) {
+  // Cluster near-duplicates and prefer the longest variant within each cluster.
+  const entries = Object.entries(candidates);
+
+  // Build clusters keyed by the first two tokens (first + middle) to group truncated vs full names.
+  const clusters = new Map<string, Array<{ name: string; count: number }>>();
+  for (const [name, count] of entries) {
+    const toks = name.split(/\s+/);
+    // Require at least First + Last; skip singletons
+    if (toks.length < 2) continue;
+    const key = toks.slice(0, 2).join(" ").toLowerCase();
+    const arr = clusters.get(key) || [];
+    arr.push({ name, count });
+    clusters.set(key, arr);
+  }
+
+  const merged: Array<{ name: string; score: number }> = [];
+  for (const arr of clusters.values()) {
+    // Prefer longer names; break ties by higher raw count, then lexicographically
+    arr.sort((a, b) => {
+      const al = a.name.split(/\s+/).length, bl = b.name.split(/\s+/).length;
+      if (al !== bl) return bl - al;                 // longer first
+      if (a.count !== b.count) return b.count - a.count;
+      return a.name.localeCompare(b.name);
+    });
+
+    // Sum counts from all entries that are prefixes/supersets of the longest
+    const longest = arr[0].name;
+    let score = 0;
+    const longLower = longest.toLowerCase();
+    for (const { name, count } of arr) {
+      const nLower = name.toLowerCase();
+      if (longLower.startsWith(nLower) || nLower.startsWith(longLower)) score += count;
+    }
+    merged.push({ name: longest, score });
+  }
+
+  // If clustering yielded a result, choose the highest score cluster representative.
+  if (merged.length) {
+    merged.sort((a, b) => b.score - a.score);
+    const best = merged[0].name;
+    const confidence = merged[0].score >= 2 ? 0.95 : 0.8;
+    return { name: best, confidence, debug: { query, items, candidates, merged, picked: best } };
+  }
+
+  // Fallback: original behavior, but with improved tie-break to prefer longer names.
+  if (entries.length === 0) {
     return { name: null, confidence: 0, debug: { query, items, candidates } };
   }
+  const sorted = entries.sort((a, b) => {
+    if (b[1] !== a[1]) return b[1] - a[1]; // by count desc
+    // OPTIONAL IMPROVEMENT #2: prefer longer names on ties
+    return b[0].split(/\s+/).length - a[0].split(/\s+/).length;
+  });
   const [best, count] = sorted[0];
   const confidence = count >= 2 ? 0.95 : 0.8;
   return { name: best, confidence, debug: { query, items, candidates, picked: best } };
 }
 
 /* =============================
-   Phase 2: Resolve Website (unchanged from your deterministic refactor)
+   Phase 2: Resolve Website (unchanged)
    ============================= */
 const BLOCKED_DOMAINS = [
   "wikipedia.org","goodreads.com","google.com","books.google.com",
