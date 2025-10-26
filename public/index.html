@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Author Website Resolver</title>
+  <style>
+    :root { --bg:#0b0e12; --card:#141922; --muted:#a0a6b0; --fg:#e7ecf3; --accent:#6ea8ff; }
+    html,body { height:100%; background:var(--bg); color:var(--fg); font:16px/1.4 ui-sans-serif,system-ui,Segoe UI,Roboto,Helvetica,Arial; }
+    .wrap { max-width:760px; margin:6rem auto; padding:0 1rem; }
+    .card { background:var(--card); border-radius:16px; box-shadow:0 8px 30px rgba(0,0,0,.35); padding:24px; }
+    h1 { margin:0 0 12px; font-size:1.6rem; letter-spacing:.2px; }
+    p.sub { margin:0 0 24px; color:var(--muted); }
+    form { display:flex; gap:10px; align-items:center; }
+    input[type="text"] { flex:1; padding:12px 14px; border-radius:12px; border:1px solid #273143; background:#0f141c; color:var(--fg); outline:none; }
+    input[type="text"]::placeholder { color:#6c7480; }
+    button { padding:12px 16px; border:0; border-radius:12px; background:var(--accent); color:#071221; font-weight:600; cursor:pointer; }
+    button[disabled]{ opacity:.6; cursor:not-allowed; }
+    .row { display:flex; gap:12px; margin-top:12px; flex-wrap:wrap; }
+    .row > label { display:flex; gap:8px; align-items:center; color:#c7ccd6; font-size:.9rem; user-select:none; }
+    .results { margin-top:20px; padding:16px; border:1px solid #243046; border-radius:12px; background:#0f141c; display:none; }
+    .results.show { display:block; }
+    .kv { display:grid; grid-template-columns:max(120px) 1fr; gap:8px 16px; }
+    .muted { color:var(--muted); }
+    .err { color:#ff8a8a; }
+    .small { font-size:.85rem; }
+    code { background:#0b0f16; padding:2px 6px; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Author Website Resolver</h1>
+      <p class="sub">Enter a book title. This page calls <code>/api/author-updates</code> and displays the resolved author and website.</p>
+
+      <form id="form">
+        <input id="title" type="text" placeholder="e.g., Sapiens: A Brief History of Humankind" required />
+        <button id="go" type="submit">Resolve</button>
+      </form>
+
+      <div class="row small">
+        <label><input id="strict_author_match" type="checkbox" checked/> strict author match</label>
+        <label><input id="require_book_match" type="checkbox" checked/> require book match</label>
+        <label><input id="include_search" type="checkbox" checked/> include web search</label>
+        <label><input id="fallback_author_only" type="checkbox" checked/> allow author-only</label>
+      </div>
+
+      <div id="status" class="small muted" style="margin-top:12px;"></div>
+
+      <div id="results" class="results">
+        <div class="kv small">
+          <div class="muted">Author</div><div id="out-author">—</div>
+          <div class="muted">Website</div><div id="out-site">—</div>
+          <div class="muted">Latest Title</div><div id="out-title">—</div>
+          <div class="muted">Source</div><div id="out-source">—</div>
+        </div>
+        <div id="out-debug" class="small muted" style="margin-top:12px;"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const form = $("form");
+    const statusEl = $("status");
+    const resultsEl = $("results");
+
+    function showStatus(msg, isErr=false){
+      statusEl.textContent = msg;
+      statusEl.className = "small " + (isErr ? "err" : "muted");
+    }
+
+    function showResults(payload) {
+      resultsEl.classList.add("show");
+
+      // Try multiple likely field names to be robust to API shape changes.
+      const author = payload.author_name || payload.author || payload.name || "—";
+      const website = payload.author_url || payload.website || payload.url || payload.latest_url || "—";
+      const latestTitle = payload.latest_title || payload.book_title || payload.title || "—";
+      const source = payload.source || payload.origin || "—";
+
+      $("out-author").textContent = author;
+      // Website may be a URL or object; render link if it looks like a URL.
+      const siteEl = $("out-site");
+      siteEl.innerHTML = "";
+      if (typeof website === "string" && /^https?:\/\//i.test(website)) {
+        const a = document.createElement("a");
+        a.href = website; a.textContent = website; a.target = "_blank"; a.rel = "noopener";
+        siteEl.appendChild(a);
+      } else {
+        siteEl.textContent = website ?? "—";
+      }
+
+      $("out-title").textContent = latestTitle;
+      $("out-source").textContent = source;
+
+      // Optional: echo minimal debug if present
+      const dbg = payload._debug;
+      $("out-debug").textContent = Array.isArray(dbg) || typeof dbg === "object"
+        ? "debug available (" + (Array.isArray(dbg) ? dbg.length + " entries" : Object.keys(dbg).length + " keys") + ")"
+        : "";
+    }
+
+    async function callAPI(bookTitle, options) {
+      // Shape matches your serverless function expectations from earlier threads.
+      const body = {
+        book_title: bookTitle,
+        include_search: options.include_search,
+        strict_author_match: options.strict_author_match,
+        require_book_match: options.require_book_match,
+        fallback_author_only: options.fallback_author_only,
+        min_confidence: 0.35,
+        min_search_confidence: 0.35
+      };
+
+      const res = await fetch("/api/author-updates", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+
+      // Handle non-2xx with readable text if possible
+      const contentType = res.headers.get("content-type") || "";
+      if (!res.ok) {
+        const text = contentType.includes("application/json") ? JSON.stringify(await res.json()) : await res.text();
+        throw new Error(`HTTP ${res.status} – ${text.slice(0, 400)}`);
+      }
+      return contentType.includes("application/json") ? res.json() : res.text().then(t => {
+        try { return JSON.parse(t); } catch { return { raw: t }; }
+      });
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const btn = $("go");
+      const title = $("title").value.trim();
+      if (!title) { $("title").focus(); return; }
+
+      btn.disabled = true; showStatus("Resolving…"); resultsEl.classList.remove("show");
+
+      try {
+        const payload = await callAPI(title, {
+          strict_author_match: $("strict_author_match").checked,
+          require_book_match: $("require_book_match").checked,
+          include_search: $("include_search").checked,
+          fallback_author_only: $("fallback_author_only").checked
+        });
+        showStatus("Done.");
+        showResults(payload || {});
+      } catch (err) {
+        console.error(err);
+        showStatus(err.message || String(err), true);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
