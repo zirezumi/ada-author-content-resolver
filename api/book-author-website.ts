@@ -243,7 +243,7 @@ function extractNamesFromText(text: string): string[] {
    Phase 1: Determine Author (heuristic + clustering)
    ============================= */
 async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, confidence: number, debug: any }> {
-  const query = `"${bookTitle}" book author -film -movie -screenplay -soundtrack -director`;
+  const query = `"${bookTitle}" book written by -film -movie -screenplay -soundtrack -director`;
   const items = await googleCSE(query, 10);
 
   const candidates: Record<string, number> = {};
@@ -312,8 +312,9 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
   return { name: best, confidence, debug: { query, items, candidates, picked: best } };
 }
 
+
 /* =============================
-   Phase 2: Resolve Website (unchanged)
+   Phase 2: Resolve Website  (PRIORITIZE "{author} author website")
    ============================= */
 const BLOCKED_DOMAINS = [
   "wikipedia.org","goodreads.com","google.com","books.google.com","reddit.com",
@@ -325,22 +326,53 @@ function isBlockedHost(host: string): boolean {
   return BLOCKED_DOMAINS.some((d) => host.includes(d));
 }
 
+function scoreCandidateUrl(u: URL, author: string): number {
+  // Higher is better
+  let score = 0;
+  const pathDepth = u.pathname.split("/").filter(Boolean).length;
+  if (pathDepth === 0) score += 2;        // homepage
+  if (u.protocol === "https:") score += 0.25;
+
+  // Bonus if hostname contains author tokens (e.g., johndoe.com, harari.org)
+  const toks = tokens(author).filter(t => t.length > 2);
+  const host = u.host.toLowerCase();
+  for (const t of toks) {
+    if (host.includes(t)) score += 0.4;
+  }
+  return score;
+}
+
 async function resolveWebsite(author: string, bookTitle: string): Promise<{ url: string|null, debug: any }> {
+  // New priority order:
+  //  1) "{author} author website"
+  //  2) "{author} official site"
+  //  3) "{bookTitle}" "{author}" author website  (fallback)
   const queries = [
-    `"${bookTitle}" "${author}" author website`,
+    `"${author}" author website`,
     `"${author}" official site`,
-    `"${author}" author website`
+    `"${bookTitle}" "${author}" author website`,
   ];
 
   for (const q of queries) {
     const items = await googleCSE(q, 10);
     const filtered = items.filter(it => {
-      const host = new URL(it.link).host.toLowerCase();
-      return !isBlockedHost(host);
+      try {
+        const host = new URL(it.link).host.toLowerCase();
+        return !isBlockedHost(host);
+      } catch { return false; }
     });
+
     if (filtered.length) {
-      const top = filtered[0];
-      return { url: new URL(top.link).origin, debug: { query: q, picked: top, items: filtered.map(i=>i.link) } };
+      // Pick best candidate by a simple score
+      const ranked = filtered
+        .map(it => ({ it, urlObj: new URL(it.link) }))
+        .sort((a, b) => scoreCandidateUrl(b.urlObj, author) - scoreCandidateUrl(a.urlObj, author));
+
+      const top = ranked[0];
+      return {
+        url: top.urlObj.origin,
+        debug: { query: q, picked: top.it, items: filtered.map(i => i.link) }
+      };
     }
   }
   return { url: null, debug: { tried: queries } };
