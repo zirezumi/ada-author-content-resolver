@@ -43,7 +43,6 @@
           <div class="muted">Author</div><div id="out-author">—</div>
           <div class="muted">Website</div><div id="out-site">—</div>
           <div class="muted">Latest Title</div><div id="out-title">—</div>
-          <div class="muted">Source</div><div id="out-source">—</div>
         </div>
         <div id="out-debug" class="small muted" style="margin-top:12px;"></div>
       </div>
@@ -63,12 +62,23 @@
 
     function showResults(payload) {
       resultsEl.classList.add("show");
-      const author = payload.author_name || payload.author || "—";
-      const website = payload.author_url || payload.website || payload.latest_url || "—";
+
+      const author =
+        payload.inferred_author ??
+        payload.author_name ??
+        payload.author ??
+        "(unknown)";
+
+      const website =
+        payload.author_url ||
+        payload.website ||
+        payload.latest_url ||
+        "—";
+
       const latestTitle = payload.latest_title || payload.book_title || "—";
-      const source = payload.source || "—";
 
       $("out-author").textContent = author;
+
       const siteEl = $("out-site");
       siteEl.innerHTML = "";
       if (typeof website === "string" && /^https?:\/\//i.test(website)) {
@@ -80,7 +90,6 @@
       }
 
       $("out-title").textContent = latestTitle;
-      $("out-source").textContent = source;
       $("out-debug").textContent = payload._debug ? "debug info present" : "";
     }
 
