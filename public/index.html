@@ -16,8 +16,6 @@
     input[type="text"]::placeholder { color:#6c7480; }
     button { padding:12px 16px; border:0; border-radius:12px; background:var(--accent); color:#071221; font-weight:600; cursor:pointer; }
     button[disabled]{ opacity:.6; cursor:not-allowed; }
-    .row { display:flex; gap:12px; margin-top:12px; flex-wrap:wrap; }
-    .row > label { display:flex; gap:8px; align-items:center; color:#c7ccd6; font-size:.9rem; user-select:none; }
     .results { margin-top:20px; padding:16px; border:1px solid #243046; border-radius:12px; background:#0f141c; display:none; }
     .results.show { display:block; }
     .kv { display:grid; grid-template-columns:max(120px) 1fr; gap:8px 16px; }
@@ -31,19 +29,12 @@
   <div class="wrap">
     <div class="card">
       <h1>Author Website Resolver</h1>
-      <p class="sub">Enter a book title. This page calls <code>/api/author-updates</code> and displays the resolved author and website.</p>
+      <p class="sub">Enter a book title. This page calls <code>/api/book-author-updates</code> and displays the resolved author and website.</p>
 
       <form id="form">
         <input id="title" type="text" placeholder="e.g., Sapiens: A Brief History of Humankind" required />
         <button id="go" type="submit">Resolve</button>
       </form>
-
-      <div class="row small">
-        <label><input id="strict_author_match" type="checkbox" checked/> strict author match</label>
-        <label><input id="require_book_match" type="checkbox" checked/> require book match</label>
-        <label><input id="include_search" type="checkbox" checked/> include web search</label>
-        <label><input id="fallback_author_only" type="checkbox" checked/> allow author-only</label>
-      </div>
 
       <div id="status" class="small muted" style="margin-top:12px;"></div>
 
@@ -72,15 +63,12 @@
 
     function showResults(payload) {
       resultsEl.classList.add("show");
-
-      // Try multiple likely field names to be robust to API shape changes.
-      const author = payload.author_name || payload.author || payload.name || "—";
-      const website = payload.author_url || payload.website || payload.url || payload.latest_url || "—";
-      const latestTitle = payload.latest_title || payload.book_title || payload.title || "—";
-      const source = payload.source || payload.origin || "—";
+      const author = payload.author_name || payload.author || "—";
+      const website = payload.author_url || payload.website || payload.latest_url || "—";
+      const latestTitle = payload.latest_title || payload.book_title || "—";
+      const source = payload.source || "—";
 
       $("out-author").textContent = author;
-      // Website may be a URL or object; render link if it looks like a URL.
       const siteEl = $("out-site");
       siteEl.innerHTML = "";
       if (typeof website === "string" && /^https?:\/\//i.test(website)) {
@@ -93,22 +81,16 @@
 
       $("out-title").textContent = latestTitle;
       $("out-source").textContent = source;
-
-      // Optional: echo minimal debug if present
-      const dbg = payload._debug;
-      $("out-debug").textContent = Array.isArray(dbg) || typeof dbg === "object"
-        ? "debug available (" + (Array.isArray(dbg) ? dbg.length + " entries" : Object.keys(dbg).length + " keys") + ")"
-        : "";
+      $("out-debug").textContent = payload._debug ? "debug info present" : "";
     }
 
-    async function callAPI(bookTitle, options) {
-      // Shape matches your serverless function expectations from earlier threads.
+    async function callAPI(bookTitle) {
       const body = {
         book_title: bookTitle,
-        include_search: options.include_search,
-        strict_author_match: options.strict_author_match,
-        require_book_match: options.require_book_match,
-        fallback_author_only: options.fallback_author_only,
+        include_search: true,
+        strict_author_match: true,
+        require_book_match: true,
+        fallback_author_only: true,
         min_confidence: 0.35,
         min_search_confidence: 0.35
       };
@@ -119,7 +101,6 @@
         body: JSON.stringify(body)
       });
 
-      // Handle non-2xx with readable text if possible
       const contentType = res.headers.get("content-type") || "";
       if (!res.ok) {
         const text = contentType.includes("application/json") ? JSON.stringify(await res.json()) : await res.text();
@@ -139,12 +120,7 @@
       btn.disabled = true; showStatus("Resolving…"); resultsEl.classList.remove("show");
 
       try {
-        const payload = await callAPI(title, {
-          strict_author_match: $("strict_author_match").checked,
-          require_book_match: $("require_book_match").checked,
-          include_search: $("include_search").checked,
-          fallback_author_only: $("fallback_author_only").checked
-        });
+        const payload = await callAPI(title);
         showStatus("Done.");
         showResults(payload || {});
       } catch (err) {
