@@ -176,48 +176,75 @@ function normalizeNameCandidate(raw: string, title: string): string | null {
 }
 
 /* =============================
-   Name extraction (expanded patterns)
+   Author extraction (signal-aware)
    ============================= */
-function extractNamesFromText(text: string, opts?: { booky?: boolean }): string[] {
+
+// Recognized publisher hosts (extend as needed)
+const PUBLISHERS = [
+  "us.macmillan.com","macmillan.com","penguinrandomhouse.com","prh.com",
+  "harpercollins.com","simonandschuster.com","simonandschuster.net",
+  "macmillanlearning.com","hachettebookgroup.com","fsgbooks.com"
+];
+
+// Light heuristic for org/brand bylines like "Change Transitions"
+const ABSTRACT_TOKENS = new Set([
+  "Change","Transitions","News","Press","Policy","Support","Guide","Team",
+  "Center","Office","School","Library","Community","Media","Communications"
+]);
+function maybeOrgish(name: string): boolean {
+  const toks = name.split(/\s+/);
+  if (toks.length !== 2) return false;
+  return toks.every(t => ABSTRACT_TOKENS.has(t));
+}
+
+type Signal = "author_label" | "wrote_book" | "byline" | "plain_last_first";
+
+function extractNamesFromText(
+  text: string,
+  opts?: { booky?: boolean }
+): Array<{ name: string; signal: Signal }> {
   const booky = !!opts?.booky;
-  const patterns = [
-    /\bby\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu,
-    /\bAuthor:\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu,
-    /\bwritten by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu,
-    // "<Name> wrote the book"
-    /\b([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})\s+(?:wrote|writes)\s+the\s+book\b/gu,
+  const out: Array<{ name: string; signal: Signal }> = [];
+
+  // Patterns (capture group #1 is "Name"; for Last,First we reorder)
+  const patterns: Array<{ re: RegExp; signal: Signal; swap?: boolean }> = [
+    { re: /\bAuthor:\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "author_label" },
+    { re: /\bwritten by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "author_label" },
+    { re: /\b([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})\s+(?:wrote|writes)\s+the\s+book\b/gu, signal: "wrote_book" },
+    { re: /\bby\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "byline" },
     // "by Last, First"
-    /\bby\s+([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)(?=\s*(?:[),.?:;!–—-]\s|$))/gu,
-    // PLAIN "Last, First" (only in booky context)
-    ...(booky ? [/\b([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)\b/gu] : []),
+    { re: /\bby\s+([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "byline", swap: true },
+    // plain "Last, First" only in book-ish contexts
+    ...(booky ? [{ re: /\b([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)\b/gu, signal: "plain_last_first", swap: true }] : []),
   ];
 
-  const names: string[] = [];
-  for (const pat of patterns) {
+  for (const { re, signal, swap } of patterns) {
     let m: RegExpExecArray | null;
-    while ((m = pat.exec(text))) {
-      const candidate = m.length === 3 ? `${m[2]} ${m[1]}` : m[1];
-      names.push(candidate.trim());
+    while ((m = re.exec(text))) {
+      const name = swap ? `${m[2]} ${m[1]}` : m[1];
+      out.push({ name: name.trim(), signal });
     }
   }
-  return names;
+  return out;
 }
 
 /* =============================
    Phase 1: Determine Author
    ============================= */
 async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, confidence: number, debug: any }> {
+  // Quote the title to reduce noise
   const query = `"${bookTitle}" book written by -film -movie -screenplay -soundtrack -director`;
   const items = await googleCSE(query, 10);
 
   const candidates: Record<string, number> = {};
+  const highSignalSeen: Record<string, number> = {};
 
   for (const it of items) {
     const fields: string[] = [];
     if (typeof it.title === "string") fields.push(it.title);
     if (typeof it.snippet === "string") fields.push(it.snippet);
 
-    // Collect metatag hints and whether the page looks "booky"
+    // Metatags + booky hint
     const mtList = Array.isArray(it.pagemap?.metatags) ? it.pagemap.metatags : [];
     let mtIsBook = false;
     for (const mt of mtList) {
@@ -233,10 +260,36 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
       }
     }
 
+    // Host features (publisher boost)
+    let host = "";
+    try { host = new URL(it.link).host.toLowerCase(); } catch {}
+
     const haystack = fields.join(" • ");
-    for (const n of extractNamesFromText(haystack, { booky: mtIsBook })) {
-      const norm = normalizeNameCandidate(n, bookTitle);
-      if (norm) candidates[norm] = (candidates[norm] || 0) + 1;
+    const matches = extractNamesFromText(haystack, { booky: mtIsBook });
+
+    for (const { name, signal } of matches) {
+      const norm = normalizeNameCandidate(name, bookTitle);
+      if (!norm) continue;
+
+      // Base weight by signal strength
+      let w =
+        signal === "author_label" ? 2.0 :
+        signal === "wrote_book"   ? 1.5 :
+        signal === "plain_last_first" && mtIsBook ? 1.3 :
+        1.0; // byline (generic)
+
+      // Penalize org-ish two-token bylines like "Change Transitions"
+      if (signal === "byline" && maybeOrgish(norm)) w *= 0.25;
+
+      // Publisher boost
+      if (host && PUBLISHERS.some(d => host.endsWith(d))) w *= 1.4;
+
+      candidates[norm] = (candidates[norm] || 0) + w;
+
+      // Track high-signal evidence
+      if (signal === "author_label" || signal === "wrote_book" || (signal === "plain_last_first" && mtIsBook)) {
+        highSignalSeen[norm] = (highSignalSeen[norm] || 0) + 1;
+      }
     }
   }
 
@@ -277,11 +330,16 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
 
   if (merged.length) {
     merged.sort((a, b) => b.score - a.score);
-    const best = merged[0].name;
-    const confidence = merged[0].score >= 2 ? 0.95 : 0.8;
-    return { name: best, confidence, debug: { query, items, candidates, merged, picked: best } };
+
+    // Prefer highest-scoring name that has any high-signal evidence
+    const withHigh = merged.filter(m => (highSignalSeen[m.name] || 0) > 0);
+    const pick = withHigh.length ? withHigh[0] : merged[0];
+
+    const confidence = pick.score >= 2 ? 0.95 : 0.8;
+    return { name: pick.name, confidence, debug: { query, items, candidates, merged, highSignalSeen, picked: pick.name } };
   }
 
+  // Fallback (should rarely happen)
   const sorted = entries.sort((a, b) => {
     if (b[1] !== a[1]) return b[1] - a[1];
     return b[0].split(/\s+/).length - a[0].split(/\s+/).length;
@@ -357,7 +415,6 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
 
     const top = ranked[0];
 
-    // Threshold check (0–1 scale)
     if (top.score >= WEBSITE_MIN_SCORE) {
       return {
         url: top.urlObj.origin,
