@@ -298,7 +298,7 @@ const BLOCKED_DOMAINS = [
   "wikipedia.org","goodreads.com","google.com","books.google.com","reddit.com",
   "amazon.","barnesandnoble.com","bookshop.org","penguinrandomhouse.com","biography.com",
   "harpercollins.com","simonandschuster.com","macmillan.com","hachettebookgroup.com",
-  "spotify.com","apple.com"
+  "spotify.com","apple.com","bookbrowse.com"
 ];
 
 function isBlockedHost(host: string): boolean {
