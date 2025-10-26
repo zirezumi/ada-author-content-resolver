@@ -1,16 +1,6 @@
 // api/book-author-website.ts
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-import type { NextApiRequest, NextApiResponse } from "next";
-
-/**
- * ENV
- *  - CSE_KEY: Google Custom Search JSON API key
- *  - CSE_ID:  Google Custom Search Engine ID
- *  - WEBSITE_MIN_SCORE: number (0..1)
- *  - AUTH_TOKEN: shared secret for X-Auth header (optional; if present, enforced)
- */
-
 type CSEItem = {
   link?: string;
   displayLink?: string;
@@ -42,9 +32,9 @@ const SITE_SUFFIX =
 
 function cleanTitleLike(s: string): string {
   return (s || "")
-    .replace(SITE_SUFFIX, "") // drop common " - Wikipedia"/retailer suffixes
-    .replace(/\s*\|.*$/, "") // drop " | Site"
-    .replace(/[“”"’‘]+/g, "") // quotes
+    .replace(SITE_SUFFIX, "")
+    .replace(/\s*\|.*$/, "")
+    .replace(/[“”"’‘]+/g, "")
     .replace(/\s{2,}/g, " ")
     .trim();
 }
@@ -53,7 +43,6 @@ function looksAllCaps(s: string): boolean {
   return /[A-Z]/.test(s) && !/[a-z]/.test(s);
 }
 
-/** Title expansion: prefer evidence that starts with the user’s title; otherwise keep short. */
 function expandBookTitleForSearch(
   userTitle: string,
   evidenceTitles: string[]
@@ -74,7 +63,6 @@ function expandBookTitleForSearch(
     }
   }
 
-  // Pollution checks
   const polluted =
     !best ||
     /(wikipedia|goodreads|amazon|barnes|noble|penguin|random|house|harpercollins|macmillan|simon\s*&\s*schuster)/i.test(
@@ -93,7 +81,6 @@ function expandBookTitleForSearch(
   };
 }
 
-/** Build a safe author query from expanded title. */
 function buildAuthorQuery(expandedTitle: string): string {
   const t0 = cleanTitleLike(expandedTitle);
   const t = looksAllCaps(t0) ? t0.toLowerCase() : t0;
@@ -107,22 +94,18 @@ function buildAuthorQuery(expandedTitle: string): string {
   return `${core} -film -movie -screenplay -soundtrack -director`;
 }
 
-/** Normalize name candidates: strip roles, prices, and trailing garbage; title-case properly. */
 function normalizeNameCandidate(raw: string): string | null {
   if (!raw) return null;
 
-  // 1) Pull the part that looks like a person name out of noisy strings (e.g., "by XYZ, PhD – $14.99")
   let s = raw
     .replace(/^[^A-Za-z]+/, "")
     .replace(/\bby\s+/i, "")
-    .replace(/\s*\([^)]*\)\s*$/, "") // drop trailing parentheticals
+    .replace(/\s*\([^)]*\)\s*$/, "")
     .replace(/\s*[,;•|–-]\s*(?:author|writer|editor|illustrator|narrator|price|hardcover|paperback|ebook|edition)\b.*$/i, "")
-    .replace(/\s+\$?\d+(?:\.\d{2})?\b.*$/i, "") // drop price and after
+    .replace(/\s+\$?\d+(?:\.\d{2})?\b.*$/i, "")
     .replace(/\s{2,}/g, " ")
     .trim();
 
-  // 2) If the string is a comma-separated role title (e.g., "Poet Lovelace", "Change Transitions"),
-  //    reject words that are common role/descriptor nouns when they appear in the leading slot.
   const roleish = new Set([
     "poet",
     "saint",
@@ -145,20 +128,16 @@ function normalizeNameCandidate(raw: string): string | null {
   if (tokens.length === 2) {
     const [w1, w2] = tokens.map((t) => t.toLowerCase());
     if (roleish.has(w1) && /^[a-z]+$/.test(w2)) {
-      // likely "Poet Lovelace" → drop
       return null;
     }
   }
 
-  // 3) Remove stray "price" if it stuck to the end (e.g., "Yuval Noah Harari Price")
   s = s.replace(/\bprice\b$/i, "").trim();
 
-  // 4) Guard against all-uppercase names from shouted titles
   if (looksAllCaps(s)) {
     s = s.toLowerCase();
   }
 
-  // 5) Title-case words that look like names; preserve "van", "de", etc.
   const keepLower = new Set(["van", "de", "da", "del", "dos", "di", "von", "der", "la", "le", "of"]);
   s = s
     .split(/\s+/)
@@ -171,20 +150,17 @@ function normalizeNameCandidate(raw: string): string | null {
     .replace(/\s{2,}/g, " ")
     .trim();
 
-  // Basic sanity: require at least one space (firstname lastname) unless it's a known single-name author
   if (!/\s/.test(s)) {
     const singletons = new Set(["Plato", "Homer", "Voltaire", "Molière", "Aeschylus", "Euripides", "Sophocles"]);
     if (!singletons.has(s)) return null;
   }
 
-  // Ban generic phrases
   if (/^(poet|author|writer|change|transitions)$/i.test(s)) return null;
 
   return s || null;
 }
 
 function scoreAuthorNameQuality(name: string): number {
-  // lightweight heuristic: 0..1
   if (!name) return 0;
   let score = 0.5;
   if (/\s/.test(name)) score += 0.2;
@@ -234,26 +210,23 @@ function harvestAuthorCandidates(items: CSEItem[]): string[] {
   const cands: string[] = [];
 
   for (const it of items) {
-    if (isLikelyPdf(it)) continue; // PDFs often quote Wikipedia, rarely clean author lines
+    if (isLikelyPdf(it)) continue;
 
     const src: string[] = [];
     if (it.title) src.push(it.title);
     if (it.snippet) src.push(it.snippet);
     if (it.htmlSnippet) src.push(it.htmlSnippet);
 
-    // Common “by <Author>” pattern
     for (const s of src) {
       const m = s.match(/\bby\s+([A-Z][A-Za-z'’.\-]+\s+[A-Z][A-Za-z'’.\-]+(?:\s+[A-Z][A-Za-z'’.\-]+)*)/i);
       if (m) cands.push(m[1]);
     }
 
-    // Goodreads/Amazon title pattern: “<Book> by <Author>”
     for (const s of src) {
       const m = s.match(/\bby\s+([A-Z][^\]|:]+?)(?:\s*[\]|:–-]|$)/i);
       if (m) cands.push(m[1]);
     }
 
-    // Fallback: pagemap metadata (sometimes includes author)
     const meta = it.pagemap?.metatags?.[0];
     const ogTitle: string | undefined = meta?.["og:title"] || meta?.["twitter:title"];
     if (ogTitle) {
@@ -302,23 +275,15 @@ function harvestWebsiteCandidates(items: CSEItem[], author: string): Array<{ url
 
     let score = 0;
 
-    // Prefer obvious official sites
     if (/official site|official website|home page/i.test(it.title || "")) score += 0.5;
-
-    // Domain hints
     if (host.includes(authorLow.replace(/\s+/g, ""))) score += 0.3;
     if (/\.org|\.com|\.net$/i.test(host)) score += 0.05;
-
-    // Author name in title
     if (title.includes(authorLow)) score += 0.15;
-
-    // Deprioritize socials, retailers, and aggregators
     if (/(twitter|x\.com|facebook|instagram|goodreads|amazon|barnes|noble|wikipedia)/i.test(host)) score -= 0.4;
 
     if (score > 0) out.push({ url, score });
   }
 
-  // unique by url
   const seen = new Set<string>();
   const uniq = out.filter((o) => (seen.has(o.url) ? false : (seen.add(o.url), true)));
 
@@ -327,43 +292,43 @@ function harvestWebsiteCandidates(items: CSEItem[], author: string): Array<{ url
 
 /* ------------------------------ API route ------------------------------ */
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse<ResolveResponse>) {
+export default async function handler(req: any, res: any) {
   try {
     if (REQUIRED_AUTH) {
-      const token = (req.headers["x-auth"] || req.headers["X-Auth"]) as string | undefined;
+      const token = (req.headers?.["x-auth"] || req.headers?.["X-Auth"]) as string | undefined;
       if (!token || token !== REQUIRED_AUTH) {
-        return res.status(401).json({
+        const body: ResolveResponse = {
           book_title: (req.body?.book_title as string) || "",
           confidence: 0,
           error: "unauthorized",
-        });
+        };
+        res.status(401).json(body);
+        return;
       }
     }
 
     if (req.method !== "POST") {
-      return res.status(405).json({ book_title: "", confidence: 0, error: "method_not_allowed" });
+      res.status(405).json({ book_title: "", confidence: 0, error: "method_not_allowed" });
+      return;
     }
 
     const rawTitle: string = (req.body?.book_title || "").toString().trim();
     if (!rawTitle) {
-      return res.status(400).json({ book_title: "", confidence: 0, error: "missing_book_title" });
+      res.status(400).json({ book_title: "", confidence: 0, error: "missing_book_title" });
+      return;
     }
 
-    // Phase 1: initial search to gather evidence titles
     const initialQ = `"${cleanTitleLike(rawTitle)}" book`;
     const initial = await cseSearch(initialQ);
     const firstItems: CSEItem[] = initial?.items || [];
     const evidenceTitles = harvestEvidenceTitles(firstItems);
 
-    // Phase 2: safer title expansion (fix #1 & #2)
     const expanded = expandBookTitleForSearch(rawTitle, evidenceTitles);
 
-    // Phase 3: build robust author query (fix #3)
     const authorQuery = buildAuthorQuery(expanded.full);
     const authorSearch = await cseSearch(authorQuery);
     const authorItems: CSEItem[] = authorSearch?.items || [];
 
-    // Collect author candidates from both waves (dedup to keep things tidy)
     const candidates = unique([
       ...harvestAuthorCandidates(firstItems),
       ...harvestAuthorCandidates(authorItems),
@@ -387,16 +352,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     };
 
     if (!picked.name) {
-      return res.status(200).json({
+      const body: ResolveResponse = {
         book_title: rawTitle,
         inferred_author: null,
         confidence: 0,
         error: "no_author_found",
         _diag: diag,
-      });
+      };
+      res.status(200).json(body);
+      return;
     }
 
-    // Phase 4: website resolution (very lightweight heuristic)
     const siteQuery = `"${picked.name}" official site`;
     const siteSearch = await cseSearch(siteQuery);
     const siteItems: CSEItem[] = siteSearch?.items || [];
@@ -410,20 +376,22 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       top: siteCands[0] || null,
     };
 
-    return res.status(200).json({
+    const body: ResolveResponse = {
       book_title: rawTitle,
       inferred_author: picked.name,
       author_confidence: picked.confidence,
       author_url: topSite?.url ?? null,
       confidence: topSite ? Number(Math.min(1, picked.confidence * topSite.score).toFixed(2)) : 0,
       _diag: diag,
-    });
+    };
+    res.status(200).json(body);
   } catch (err: any) {
-    return res.status(200).json({
+    const body: ResolveResponse = {
       book_title: (req.body?.book_title as string) || "",
       inferred_author: null,
       confidence: 0,
       error: err?.message || "unknown_error",
-    });
+    };
+    res.status(200).json(body);
   }
 }
