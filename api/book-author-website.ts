@@ -62,6 +62,7 @@ async function fetchWithTimeout(url: string, init?: RequestInit, ms = 5500) {
 }
 
 async function googleCSE(query: string, num = 10): Promise<any[]> {
+  if (!USE_SEARCH) return [];
   const url = new URL("https://www.googleapis.com/customsearch/v1");
   url.searchParams.set("key", CSE_KEY);
   url.searchParams.set("cx", CSE_ID);
@@ -196,11 +197,14 @@ function nameLikeness(raw: string): number {
 
 /** Clean + validate a candidate. Returns null if it fails the threshold. */
 function normalizeNameCandidate(raw: string, title: string): string | null {
-  // Trim obvious trailing punctuation/brackets
+  // Trim obvious trailing punctuation/brackets on whole string
   let s = raw.trim()
     .replace(/[)\]]+$/g, "")
     .replace(/[.,;:–—-]+$/g, "")
     .replace(/\s+/g, " ");
+
+  // Token-level cleanup: drop trailing punctuation on each token (e.g., "Gross,")
+  s = s.split(/\s+/).map(tok => tok.replace(/[.,;:]+$/g, "")).join(" ");
 
   // Quick reject if the whole thing appears inside the title tokens
   if (tokens(title).includes(s.toLowerCase())) return null;
@@ -215,12 +219,12 @@ function normalizeNameCandidate(raw: string, title: string): string | null {
     }
   }
 
-  // Score threshold: empirically, 0.65 cuts “Harari Frankly” but keeps legit names
+  // Score threshold tuned to reject “Harari Frankly” etc.
   return nameLikeness(s) >= 0.65 ? s : null;
 }
 
 /* =============================
-   Name extraction with strict right-boundary
+   Name extraction (expanded patterns)
    ============================= */
 function extractNamesFromText(text: string): string[] {
   // Right boundary: stop before whitespace+punctuation OR end of string.
@@ -228,12 +232,21 @@ function extractNamesFromText(text: string): string[] {
     /\bby\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu,
     /\bAuthor:\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu,
     /\bwritten by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu,
+
+    // NEW: "<Name> wrote the book" / "<Name> writes the book"
+    /\b([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})\s+(?:wrote|writes)\s+the\s+book\b/gu,
+
+    // NEW: "by Last, First" (Amazon-style, single last+first)
+    /\bby\s+([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)(?=\s*(?:[),.?:;!–—-]\s|$))/gu,
   ];
+
   const names: string[] = [];
   for (const pat of patterns) {
-    let m;
+    let m: RegExpExecArray | null;
     while ((m = pat.exec(text))) {
-      names.push(m[1].trim());
+      // Reorder "Last, First" capture
+      const candidate = m.length === 3 ? `${m[2]} ${m[1]}` : m[1];
+      names.push(candidate.trim());
     }
   }
   return names;
@@ -243,13 +256,32 @@ function extractNamesFromText(text: string): string[] {
    Phase 1: Determine Author (heuristic + clustering)
    ============================= */
 async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, confidence: number, debug: any }> {
+  // 👉 Use "written by" phrasing, and quote the title to reduce noise.
   const query = `"${bookTitle}" book written by -film -movie -screenplay -soundtrack -director`;
   const items = await googleCSE(query, 10);
 
   const candidates: Record<string, number> = {};
+
   for (const it of items) {
-    const text = `${it.title} ${it.snippet || ""}`;
-    for (const n of extractNamesFromText(text)) {
+    // Collect more text fields: title + snippet + common metatag fields (Amazon, etc.)
+    const fields: string[] = [];
+    if (typeof it.title === "string") fields.push(it.title);
+    if (typeof it.snippet === "string") fields.push(it.snippet);
+
+    const mtList = Array.isArray(it.pagemap?.metatags) ? it.pagemap.metatags : [];
+    for (const mt of mtList) {
+      if (mt && typeof mt === "object") {
+        const t1 = (mt as any).title;
+        const t2 = (mt as any)["og:title"];
+        const t3 = (mt as any)["book:author"];
+        if (typeof t1 === "string") fields.push(t1);
+        if (typeof t2 === "string") fields.push(t2);
+        if (typeof t3 === "string") fields.push(t3);
+      }
+    }
+
+    const haystack = fields.join(" • ");
+    for (const n of extractNamesFromText(haystack)) {
       const norm = normalizeNameCandidate(n, bookTitle);
       if (norm) {
         candidates[norm] = (candidates[norm] || 0) + 1;
@@ -312,14 +344,15 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
   return { name: best, confidence, debug: { query, items, candidates, picked: best } };
 }
 
-
 /* =============================
    Phase 2: Resolve Website  (PRIORITIZE "{author} author website")
    ============================= */
 const BLOCKED_DOMAINS = [
   "wikipedia.org","goodreads.com","google.com","books.google.com","reddit.com",
   "amazon.","barnesandnoble.com","bookshop.org","penguinrandomhouse.com",
-  "harpercollins.com","simonandschuster.com","macmillan.com","hachettebookgroup.com"
+  "harpercollins.com","simonandschuster.com","macmillan.com","hachettebookgroup.com",
+  // optionally keep podcast/audio platforms out:
+  "spotify.com","apple.com"
 ];
 
 function isBlockedHost(host: string): boolean {
@@ -343,10 +376,10 @@ function scoreCandidateUrl(u: URL, author: string): number {
 }
 
 async function resolveWebsite(author: string, bookTitle: string): Promise<{ url: string|null, debug: any }> {
-  // New priority order:
+  // Priority:
   //  1) "{author} author website"
   //  2) "{author} official site"
-  //  3) "{bookTitle}" "{author}" author website  (fallback)
+  //  3) "{bookTitle}" "{author}" author website (fallback)
   const queries = [
     `"${author}" author website`,
     `"${author}" official site`,
@@ -363,7 +396,6 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     });
 
     if (filtered.length) {
-      // Pick best candidate by a simple score
       const ranked = filtered
         .map(it => ({ it, urlObj: new URL(it.link) }))
         .sort((a, b) => scoreCandidateUrl(b.urlObj, author) - scoreCandidateUrl(a.urlObj, author));
