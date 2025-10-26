@@ -41,7 +41,6 @@ function requireAuth(req: any, res: any): boolean {
    Google CSE
    ============================= */
 const CSE_KEY = process.env.GOOGLE_CSE_KEY || "";
-// Support both GOOGLE_CSE_ID and GOOGLE_CSE_CX for convenience.
 const CSE_ID = process.env.GOOGLE_CSE_ID || process.env.GOOGLE_CSE_CX || "";
 const USE_SEARCH = !!(CSE_KEY && CSE_ID);
 
@@ -113,11 +112,31 @@ function normalizeCompareTitle(s: string): string {
   return s.toLowerCase().replace(/[\s“”"'-]+/g, " ").trim();
 }
 
-/** Remove common site suffixes appended to titles */
+/* Helpers for subtitle tail hygiene */
 function stripSiteSuffix(s: string): string {
   return (s || "")
-    .replace(/\s*[-–—•|]\s*(?:Amazon|Goodreads|Barnes\s*&\s*Noble|Bookshop(?:\.org)?|Penguin\s*Random\s*House|Simon\s*&\s*Schuster|HarperCollins|Hachette(?:\s*Book\s*Group)?|Macmillan|Official\s*Site|Home|Books?).*$/i, "")
+    .replace(
+      /\s*[-–—•|]\s*(?:Wikipedia|Amazon|Goodreads|Barnes\s*&\s*Noble|Bookshop(?:\.org)?|Penguin\s*Random\s*House|Simon\s*&\s*Schuster|HarperCollins|Hachette(?:\s*Book\s*Group)?|Macmillan|Official\s*Site|Home|Books?).*$/i,
+      ""
+    )
     .trim();
+}
+function cleanFirstSubtitleSegment(s: string): string {
+  // Keep only the first clause-like segment; drop marketing add-ons
+  const cut = s.split(/[|•–—-]{1,2}|\b\|\b/)[0];
+  return (cut || "").replace(/\s+/g, " ").trim();
+}
+function looksLikeISBNy(s: string): boolean {
+  // heavy digit / ISBN-like
+  const d = (s.match(/\d/g) || []).length;
+  return d >= 6 || /\b(?:ISBN|978|979)\b/i.test(s);
+}
+function looksLikeCategoryTail(s: string): boolean {
+  return /\b(?:Books?|Book|Home|Official Site|Edit(?:ion)?|Paperback|Hardcover|Audiobook)\b/i.test(s);
+}
+function looksLikeAuthorListTail(s: string): boolean {
+  // Avoid “Obama, Barack: Books” / “by X and Y”
+  return /(?:,|\band\b|\bwith\b)/i.test(s) && /\b[A-Z][\p{L}'-]+/u.test(s);
 }
 
 /* =============================
@@ -131,7 +150,7 @@ const GENERATIONAL_SUFFIX = new Set(["jr","jr.","sr","sr.","ii","iii","iv","v"])
 const BAD_TAIL = new Set([
   "frankly","review","reviews","opinion","analysis","explainer","interview","podcast",
   "video","transcript","essay","profile","biography","news","guide","column","commentary",
-  "editorial","update","thread","blog"
+  "editorial","update","thread","blog","price" // <- avoid “Yuval Noah Harari Price”
 ]);
 
 function isCasedWordToken(tok: string): boolean {
@@ -186,7 +205,7 @@ function nameLikeness(raw: string): number {
 /** Obvious non-name words that often appear capitalized in subtitles/titles */
 const COMMON_TITLE_WORDS = new Set([
   "Change","Transitions","Transition","Moving","Forward","Next","Day","The",
-  "Future","Guide","How","Policy","Center","Office","Press","News","Support"
+  "Future","Guide","How","Policy","Center","Office","Press","News","Support","Poet"
 ]);
 
 function looksLikeCommonPair(name: string): boolean {
@@ -198,7 +217,7 @@ function looksLikeCommonPair(name: string): boolean {
 function maybeOrgish(name: string): boolean {
   const ABSTRACT_TOKENS = new Set([
     "Change","Transitions","News","Press","Policy","Support","Guide","Team",
-    "Center","Office","School","Library","Community","Media","Communications"
+    "Center","Office","School","Library","Community","Media","Communications","Poet"
   ]);
   const toks = name.split(/\s+/);
   return toks.length === 2 && toks.every(t => ABSTRACT_TOKENS.has(t));
@@ -218,8 +237,15 @@ function normalizeNameCandidate(raw: string, title: string): string | null {
   const partsEarly = s.split(/\s+/);
   if (partsEarly.length === 2 && looksLikeCommonPair(s)) return null;
 
+  const titleToks = tokens(title);
   // Reject if equals a token in the title
-  if (tokens(title).includes(s.toLowerCase())) return null;
+  if (titleToks.includes(s.toLowerCase())) return null;
+
+  // If it's a 2-word candidate and both words appear in the title, reject (e.g., "Poet Lovelace")
+  if (partsEarly.length === 2) {
+    const overlap = partsEarly.filter(p => titleToks.includes(p.toLowerCase())).length;
+    if (overlap === 2) return null;
+  }
 
   // Drop one trailing garbage token if present
   const parts = s.split(" ");
@@ -247,12 +273,12 @@ function extractNamesFromText(
     { re: /\bAuthor:\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "author_label" },
     { re: /\bwritten by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "author_label" },
     { re: /\b([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})\s+(?:wrote|writes)\s+the\s+book\b/gu, signal: "wrote_book" },
+    // Ensure "by" captures a clean name; exclude “Price” trailing noise via punctuation lookahead above
     { re: /\bby\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "byline" },
     { re: /\bby\s+([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "byline", swap: true },
   ];
 
   // Allow "Last, First" only on book-ish pages and not part of a list:
-  // blocks matches like "Transitions, Change, and Moving Forward"
   if (booky) {
     patterns.push({
       re: /\b([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)\b(?!\s*(?:and|or|&|,))/gu,
@@ -290,44 +316,18 @@ function preferPublisherOrRetail(host: string): boolean {
 }
 
 /* =============================
-   Phase 0: Title expansion (subtitle recovery) with sanitation
+   Phase 0: Title expansion (subtitle recovery)
    ============================= */
-// Helpers to detect junky subtitle tails
-function looksLikeISBNy(s: string) {
-  return /\b(?:97[89][-\s]?)?\d{9,}\b/i.test(s) || /\bisbn\b/i.test(s);
-}
-const BAD_SUBTITLE_TOKENS = new Set([
-  "hardcover","paperback","audiobook","kindle","books","amazon","edition","mass","market"
-]);
-function looksLikeCategoryTail(s: string) {
-  const t = s.toLowerCase();
-  return [...BAD_SUBTITLE_TOKENS].some(w => t.includes(w));
-}
-function looksLikeAuthorListTail(s: string) {
-  return /\b[A-Z][a-z]+,\s*[A-Z][a-z]+\b/.test(s);
-}
-function cleanFirstSubtitleSegment(tail: string) {
-  const seg = stripSiteSuffix(tail.split(":")[0] || "").trim();
-  return seg;
-}
-
 function startsWithShortThenSubtitle(title: string, short: string): string | null {
   const esc = short.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const re = new RegExp(`^${esc}\\s*[:—-]\\s*(.+)$`, "i");
   const m = title.match(re);
   if (!m) return null;
-
-  let subtitleRaw = stripSiteSuffix(m[1]).trim();
-  subtitleRaw = cleanFirstSubtitleSegment(subtitleRaw);
-
-  if (!subtitleRaw ||
-      looksLikeISBNy(subtitleRaw) ||
-      looksLikeCategoryTail(subtitleRaw) ||
-      looksLikeAuthorListTail(subtitleRaw)) {
+  const subtitleRaw = m[1];
+  let subtitle = cleanFirstSubtitleSegment(stripSiteSuffix(subtitleRaw));
+  if (!subtitle || looksLikeISBNy(subtitle) || looksLikeCategoryTail(subtitle) || looksLikeAuthorListTail(subtitle)) {
     return null;
   }
-
-  const subtitle = subtitleRaw.split(/\s+/).slice(0, 12).join(" ");
   return subtitle || null;
 }
 
@@ -340,6 +340,9 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
 
   for (const it of items) {
     const host = hostOf(it.link);
+    // Ignore Wikipedia pages as expansion evidence
+    if (host.includes("wikipedia.org")) continue;
+
     const mtList = Array.isArray(it.pagemap?.metatags) ? it.pagemap.metatags : [];
     const candidates: string[] = [];
 
@@ -349,10 +352,12 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
       if (typeof t === "string") candidates.push(cleanTitle(t));
     }
 
-    for (const cand of candidates) {
+    for (const candRaw of candidates) {
+      const cand = stripSiteSuffix(candRaw);
       const subtitle = startsWithShortThenSubtitle(cand, shortTitle);
       if (subtitle) {
         const full = `${shortTitle}: ${subtitle}`;
+        if (/\bWikipedia\b/i.test(subtitle)) continue; // belt-and-suspenders
         evidence.push({ host, cand, full, reason: "subtitle_from_prefix" });
         if (!bestFull || (preferPublisherOrRetail(host) && !preferPublisherOrRetail(hostOf(bestFull)))) {
           bestFull = full;
@@ -365,10 +370,10 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
           const colonIdx = cand.indexOf(":");
           if (colonIdx > 0) {
             const head = cand.slice(0, colonIdx).trim();
-            let tail = stripSiteSuffix(cand.slice(colonIdx + 1)).trim();
-            tail = cleanFirstSubtitleSegment(tail);
+            let tail = cleanFirstSubtitleSegment(stripSiteSuffix(cand.slice(colonIdx + 1))).trim();
 
             if (!tail ||
+                /\bWikipedia\b/i.test(tail) ||
                 looksLikeISBNy(tail) ||
                 looksLikeCategoryTail(tail) ||
                 looksLikeAuthorListTail(tail)) {
@@ -388,6 +393,9 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
     }
   }
 
+  // Final sanity: drop any wiki-tainted tail
+  if (bestFull && /:\s*Wikipedia\s*$/i.test(bestFull)) bestFull = null;
+
   return {
     full: bestFull || shortTitle,
     usedShort: !bestFull,
@@ -396,7 +404,7 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
 }
 
 /* =============================
-   Phase 1: Determine Author (with title expansion + fallback)
+   Phase 1: Determine Author (with title expansion + robust fallback)
    ============================= */
 async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, confidence: number, debug: any }> {
   // Phase 0: expand title
@@ -406,8 +414,15 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
   let query = `"${titleForSearch}" book written by -film -movie -screenplay -soundtrack -director`;
   let items = await googleCSE(query, 10);
 
-  // Fallback if expansion over-constrained the query
-  if ((!items || items.length === 0) && expanded.usedShort === false) {
+  // Fallback if expansion was suspicious or results are junky (all PDFs/wiki)
+  const looksSuspiciousExpansion = /:\s*Wikipedia\s*$/i.test(titleForSearch);
+  const allPdfOrWiki = (items || []).length > 0 && (items || []).every(it => {
+    const h = hostOf(it.link);
+    const mime = (it as any).mime || "";
+    return h.includes("wikipedia.org") || /pdf/i.test(mime) || /\.pdf(?:$|\?)/i.test(it.link);
+  });
+
+  if ((!items || items.length === 0) || looksSuspiciousExpansion || allPdfOrWiki) {
     query = `"${bookTitle}" book written by -film -movie -screenplay -soundtrack -director`;
     items = await googleCSE(query, 10);
   }
@@ -532,7 +547,11 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
       const bestOverall = merged[0];
 
       if ((highSignalSeen[bestOverall.name] || 0) === 0) {
-        pick = bestOverall.score < 1.5 * bestHigh.score ? bestHigh : bestOverall;
+        if (bestOverall.score < 1.5 * bestHigh.score) {
+          pick = bestHigh;
+        } else {
+          pick = bestOverall;
+        }
       } else {
         pick = bestOverall;
       }
