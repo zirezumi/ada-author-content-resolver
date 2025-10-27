@@ -399,11 +399,11 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
   const items = await googleCSE(q, 8);
 
   let bestFull: string | null = null;
+  let bestHost: string | null = null;  // <--- track host
   const evidence: any[] = [];
 
   for (const it of items) {
     const host = hostOf(it.link);
-    // Ignore Wikipedia pages as expansion evidence
     if (host.includes("wikipedia.org")) continue;
 
     const mtList = Array.isArray(it.pagemap?.metatags) ? it.pagemap.metatags : [];
@@ -422,8 +422,9 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
         const full = `${shortTitle}: ${subtitle}`;
         if (/\bWikipedia\b/i.test(subtitle)) continue;
         evidence.push({ host, cand, full, reason: "subtitle_from_prefix" });
-        if (!bestFull || (preferPublisherOrRetail(host) && !preferPublisherOrRetail(hostOf(bestFull)))) {
+        if (!bestFull || (preferPublisherOrRetail(host) && !(bestHost && preferPublisherOrRetail(bestHost)))) {
           bestFull = full;
+          bestHost = host;        // <---
         }
       } else {
         const shortToks = tokenSet(shortTitle);
@@ -435,22 +436,21 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
             const head = cand.slice(0, colonIdx).trim();
             let tail = cleanFirstSubtitleSegment(stripSiteSuffix(cand.slice(colonIdx + 1))).trim();
 
-            if (
-              !tail ||
-              /\bWikipedia\b/i.test(tail) ||
-              looksLikeISBNy(tail) ||
-              looksLikeCategoryTail(tail) ||
-              looksLikeAuthorListTail(tail) ||
-              isBannedSubtitle(tail)
-            ) {
+            if (!tail ||
+                /\bWikipedia\b/i.test(tail) ||
+                looksLikeISBNy(tail) ||
+                looksLikeCategoryTail(tail) ||
+                looksLikeAuthorListTail(tail) ||
+                isBannedSubtitle(tail)) {
               continue;
             }
 
             if (head.toLowerCase().startsWith(shortTitle.toLowerCase()) && tail) {
               const full = `${shortTitle}: ${tail}`;
               evidence.push({ host, cand, full, reason: "subtitle_from_colon" });
-              if (!bestFull || (preferPublisherOrRetail(host) && !preferPublisherOrRetail(hostOf(bestFull)))) {
+              if (!bestFull || (preferPublisherOrRetail(host) && !(bestHost && preferPublisherOrRetail(bestHost)))) {
                 bestFull = full;
+                bestHost = host;  // <---
               }
             }
           }
@@ -459,7 +459,6 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
     }
   }
 
-  // Final sanity: drop any wiki-tainted tail
   if (bestFull && /:\s*Wikipedia\s*$/i.test(bestFull)) bestFull = null;
 
   return {
