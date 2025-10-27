@@ -10,14 +10,14 @@ export const config = { runtime: "nodejs" } as const;
    Perf helpers (memo + concurrency)
    ============================= */
 function memoize1<T extends (a: string) => any>(fn: T, max = 1000): T {
-  const m = new Map<string, any>();
+  const m: Map<string, any> = new Map();
   return ((a: string) => {
     if (m.has(a)) return m.get(a);
     const v = fn(a);
     m.set(a, v);
     if (m.size > max) {
-      const k = m.keys().next().value;
-      m.delete(k);
+      const first = m.keys().next();
+      if (!first.done) m.delete(first.value);
     }
     return v;
   }) as T;
