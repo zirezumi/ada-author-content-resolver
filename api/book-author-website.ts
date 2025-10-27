@@ -185,9 +185,9 @@ async function googleCSE(query: string, num = 10): Promise<any[]> {
 
   const resp = await fetchWithRetryAbort(url.toString(), undefined, FETCH_TIMEOUT_GENERAL_MS, FETCH_RETRY_ON_ABORT);
   if (!resp?.ok) {
-    const text = await resp?.text?.();
+    const text = await (resp as any)?.text?.();
     lruCSE.set(key, { value: [], expires: now + CACHE_TTL_NEG_MS, neg: true });
-    throw new Error(`cse_http_${resp?.status}: ${text || ""}`.slice(0, 240));
+    throw new Error(`cse_http_${(resp as any)?.status}: ${text || ""}`.slice(0, 240));
   }
   const data: any = await resp.json();
   const items = Array.isArray(data?.items) ? data.items : [];
@@ -1006,4 +1006,327 @@ function contentSignalsForSite(text: string, author: string, bookTitle: string):
   const bookOverlap = overlapRatio(bag, tokenBag(bookTitle)); // 0..1
   const aExact = new RegExp(`\\b${a.replace(/\s+/g, "\\s+")}\\b`, "i").test(text) ? 1 : 0;
 
-  const hasBooksPage = /\b(books|publications|titles|works)\b/i.test(text) ? 1 : 0
+  const hasBooksPage = /\b(books|publications|titles|works)\b/i.test(text) ? 1 : 0;
+  const mentionsAuthorRole = /\b(author|writer|written by|byline)\b/i.test(text) ? 1 : 0;
+
+  const { person, book } = hasJsonLdPersonOrBook(text, author, bookTitle);
+
+  let score =
+    0.40 * Math.min(1, bookOverlap * 1.5) +
+    0.18 * aExact +
+    0.12 * hasBooksPage +
+    0.10 * mentionsAuthorRole +
+    0.12 * (person ? 1 : 0) +
+    0.08 * (book ? 1 : 0);
+
+  return Math.min(1, score);
+}
+
+/* =============================
+   Domain classification + priors + early-accept
+   ============================= */
+function isPlatformHost(host: string): boolean {
+  return PLATFORM_HOSTS.some(p => host.includes(p));
+}
+
+function isPersonalHostForAuthor(host: string, author: string): boolean {
+  // e.g., cherylstrayed.com, paula-hawkins.net
+  const apex = apexOfHost(host);
+  if (isPlatformHost(host)) return false;
+  const aToks = tokens(author).filter(t => t.length > 1);
+  const joined = aToks.join("");
+  const apexNoDot = apex.replace(/\./g, "");
+  return aToks.every(t => apexNoDot.includes(t)) || apexNoDot.includes(joined);
+}
+
+function domainPrior(host: string, author: string): number {
+  if (isPersonalHostForAuthor(host, author)) return 2;  // strongest
+  if (isPlatformHost(host)) return 0;                   // weakest
+  return 1;                                             // neutral
+}
+
+/* =============================
+   Phase 2: Candidate URL scoring (helpers + threshold)
+   ============================= */
+const BLOCKED_DOMAINS = [
+  "wikipedia.org","goodreads.com","google.com","books.google.com","reddit.com",
+  "amazon.","barnesandnoble.com","bookshop.org","penguinrandomhouse.com",
+  "harpercollins.com","simonandschuster.com","macmillan.com","hachettebookgroup.com",
+  "spotify.com","apple.com"
+];
+
+function isBlockedHost(host: string): boolean {
+  return BLOCKED_DOMAINS.some((d) => host.includes(d));
+}
+
+function scoreCandidateUrl(u: URL, author: string): number {
+  let score = 0;
+  const pathDepth = u.pathname.split("/").filter(Boolean).length;
+  if (pathDepth === 0) score += 0.5;
+  if (u.protocol === "https:") score += 0.1;
+
+  const toks = tokens(author).filter(t => t.length > 2);
+  const host = u.host.toLowerCase();
+  for (const t of toks) if (host.includes(t)) score += 0.4;
+
+  return Math.min(1, score);
+}
+
+/* =============================
+   Website resolver with capped probes, early-accept, caching
+   ============================= */
+async function resolveWebsite(author: string, bookTitle: string): Promise<{ url: string|null, debug: any }> {
+  const cacheK = cacheKey(["site", RESOLVER_VERSION, author, bookTitle]);
+  const cached = lruSiteValidation.get(cacheK);
+  const now = Date.now();
+
+  const queries = [
+    `"${author}" official site`,
+    `"${author}" author website`,
+    `"${bookTitle}" "${author}" author website`,
+  ];
+
+  const candidates: Array<{ urlObj: URL; urlScore: number; fromQuery: string }> = [];
+  for (const q of queries) {
+    const items = await googleCSE(q, 10);
+    for (const it of items) {
+      let u: URL | null = null;
+      try { u = new URL(it.link); } catch { continue; }
+      const host = u.host.toLowerCase();
+      if (isBlockedHost(host)) continue;
+      const urlScore = scoreCandidateUrl(u, author);
+      if (!candidates.some(c => c.urlObj.host === u!.host)) {
+        candidates.push({ urlObj: u, urlScore, fromQuery: q });
+      }
+    }
+  }
+
+  if (!candidates.length) {
+    return { url: null, debug: { tried: "broad_author_query", threshold: WEBSITE_MIN_SCORE } };
+  }
+
+  const topFew = candidates
+    .sort((a, b) => {
+      if (b.urlScore !== a.urlScore) return b.urlScore - a.urlScore;
+      // deterministic tie-break: personal host > non-personal > platform, then lexicographic
+      const ap = domainPrior(a.urlObj.host, author);
+      const bp = domainPrior(b.urlObj.host, author);
+      if (bp !== ap) return bp - ap;
+      return a.urlObj.origin.localeCompare(b.urlObj.origin);
+    })
+    .slice(0, 5);
+
+  let validations:
+    Array<{
+      origin: string;
+      urlScore: number;
+      contentScore: number;
+      finalScore: number;
+      samples: Array<{ path: string; contentScore: number }>;
+      fromQuery: string;
+    }> = [];
+
+  if (cached && cached.expires > now) {
+    validations = cached.value;
+  } else {
+    for (const c of topFew) {
+      const origin = c.urlObj.origin;
+      const samples: Array<{ path: string; contentScore: number }> = [];
+
+      // probe "/"
+      const homeText = await fetchPageText(origin, FETCH_TIMEOUT_SAMPLE_MS);
+      let bestContent = contentSignalsForSite(homeText, author, bookTitle);
+      samples.push({ path: "/", contentScore: bestContent });
+
+      // probe "/about"
+      const aboutText = await fetchPageText(origin + "/about", FETCH_TIMEOUT_SAMPLE_MS);
+      const aboutScore = contentSignalsForSite(aboutText, author, bookTitle);
+      bestContent = Math.max(bestContent, aboutScore);
+      samples.push({ path: "/about", contentScore: aboutScore });
+
+      // early-accept on strong personal domains with signals
+      const host = new URL(origin).host.toLowerCase();
+      const mayEarlyAccept =
+        FLAG_EARLY_ACCEPT_PERSONAL_DOMAIN &&
+        isPersonalHostForAuthor(host, author);
+
+      let earlyAccepted = false;
+      if (mayEarlyAccept) {
+        const authorNameExact =
+          new RegExp(`\\b${norm(author).replace(/\s+/g, "\\s+")}\\b`, "i").test(homeText) ||
+          new RegExp(`\\b${norm(author).replace(/\s+/g, "\\s+")}\\b`, "i").test(aboutText);
+
+        const hasAboutOrBooksSignal =
+          /\b(about|bio|books|works|author)\b/i.test(homeText + " " + aboutText);
+
+        if (authorNameExact && hasAboutOrBooksSignal && bestContent >= 0.35) {
+          earlyAccepted = true;
+        }
+      }
+
+      // Optional third probe
+      if (!earlyAccepted && FLAG_CAP_PROBES && bestContent < 0.85) {
+        const text = await fetchPageText(origin + "/books", FETCH_TIMEOUT_SAMPLE_MS);
+        const s = contentSignalsForSite(text, author, bookTitle);
+        bestContent = Math.max(bestContent, s);
+        samples.push({ path: "/books", contentScore: s });
+      }
+
+      // Fallback site queries if weak
+      if (!earlyAccepted && bestContent < 0.5) {
+        for (const q of [`"${bookTitle}" site:${c.urlObj.host}`, `"${author}" site:${c.urlObj.host}`]) {
+          const siteHits = await googleCSE(q, 3);
+          const firstHit = siteHits?.find(h => {
+            try { return new URL(h.link).host === c.urlObj.host; } catch { return false; }
+          });
+          if (firstHit) {
+            const t = await fetchPageText(firstHit.link, FETCH_TIMEOUT_SAMPLE_MS);
+            const s = contentSignalsForSite(t, author, bookTitle);
+            bestContent = Math.max(bestContent, s);
+            samples.push({ path: new URL(firstHit.link).pathname, contentScore: s });
+            if (bestContent >= 0.85) break;
+          }
+        }
+      }
+
+      // Compose final score
+      let finalScore = 0.45 * c.urlScore + 0.55 * bestContent;
+
+      // Lift early-accepted personal domains to win near-ties
+      if (earlyAccepted) {
+        finalScore = Math.max(finalScore, WEBSITE_MIN_SCORE + DOMAIN_PRIOR_DELTA);
+      }
+
+      validations.push({
+        origin,
+        urlScore: c.urlScore,
+        contentScore: bestContent,
+        finalScore,
+        samples,
+        fromQuery: c.fromQuery,
+      });
+    }
+
+    lruSiteValidation.set(cacheK, { value: validations, expires: now + CACHE_TTL_POS_MS });
+  }
+
+  // Deterministic sort: by finalScore, then domain prior, then origin
+  validations.sort((a, b) => {
+    if (b.finalScore !== a.finalScore) return b.finalScore - a.finalScore;
+    const ap = domainPrior(new URL(a.origin).host, author);
+    const bp = domainPrior(new URL(b.origin).host, author);
+    if (bp !== ap) return bp - ap;
+    return a.origin.localeCompare(b.origin);
+  });
+
+  // Apply domain prior only on ties/near-ties
+  if (validations.length >= 2) {
+    const a = validations[0];
+    const b = validations[1];
+    const diff = a.finalScore - b.finalScore;
+    if (diff >= 0 && diff <= DOMAIN_PRIOR_DELTA) {
+      const ap = domainPrior(new URL(a.origin).host, author);
+      const bp = domainPrior(new URL(b.origin).host, author);
+      if (bp > ap) {
+        validations[0] = b;
+        validations[1] = a;
+      }
+    }
+  }
+
+  const top = validations[0];
+
+  const authorToks = tokens(author).filter(t => t.length > 2);
+  const host = new URL(top.origin).host.toLowerCase();
+  const hostHasAuthor = authorToks.some(t => host.includes(t));
+  const threshold = Math.max(WEBSITE_MIN_SCORE, hostHasAuthor ? 0.60 : 0.70);
+
+  const borderline = validations.length > 1
+    ? Math.abs(validations[0].finalScore - validations[1].finalScore) <= SITE_SCORE_BAND
+    : false;
+
+  if (top.finalScore >= threshold) {
+    return {
+      url: top.origin,
+      debug: {
+        threshold,
+        picked: top,
+        borderline,
+        candidates: validations.slice(0, 5),
+      }
+    };
+  }
+
+  return {
+    url: null,
+    debug: { threshold, borderline, candidates: validations.slice(0, 5) }
+  };
+}
+
+/* =============================
+   Handler
+   ============================= */
+export default async function handler(req: any, res: any) {
+  try {
+    if (req.method === "OPTIONS") return res.status(204).end();
+    if (req.method !== "POST") return res.status(405).json({ error: "POST required" });
+    if (!requireAuth(req, res)) return;
+
+    const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body;
+    const bookTitle: string = String(body.book_title || "").trim();
+    if (!bookTitle) return res.status(400).json({ error: "book_title required" });
+
+    const authorRes = await resolveAuthor(bookTitle);
+    if (!authorRes.primary) {
+      return res.status(200).json({
+        book_title: bookTitle,
+        primary_author: null,
+        co_authors: [],
+        inferred_author: null,
+        author_confidence: 0,
+        author_url: null,
+        confidence: 0,
+        error: "no_author_found",
+        _diag: {
+          flags: {
+            USE_SEARCH, CSE_KEY: !!CSE_KEY, CSE_ID: !!CSE_ID,
+            WEBSITE_MIN_SCORE, FLAG_EARLY_ACCEPT_PERSONAL_DOMAIN, FLAG_CAP_PROBES, FLAG_TOKEN_NAME_SCORE,
+            RESOLVER_VERSION
+          },
+          author: authorRes.debug
+        }
+      });
+    }
+
+    const siteRes = await resolveWebsite(authorRes.primary, bookTitle);
+
+    // Borderline telemetry for authors too (near cutoff)
+    const nearAuthorCutoff = authorRes.ranked.length > 1
+      ? Math.abs(authorRes.ranked[0].score - authorRes.ranked[1].score) <= AUTHOR_SCORE_BAND
+      : false;
+
+    return res.status(200).json({
+      book_title: bookTitle,
+      primary_author: authorRes.primary,
+      co_authors: authorRes.coAuthors,
+      authors_ranked: authorRes.ranked,
+      inferred_author: authorRes.primary,          // backward-compat
+      author_confidence: authorRes.confidence,     // backward-compat
+      author_url: siteRes.url,
+      confidence: siteRes.url ? 0.9 : 0,
+      _diag: {
+        flags: {
+          USE_SEARCH, CSE_KEY: !!CSE_KEY, CSE_ID: !!CSE_ID,
+          WEBSITE_MIN_SCORE, FLAG_EARLY_ACCEPT_PERSONAL_DOMAIN, FLAG_CAP_PROBES, FLAG_TOKEN_NAME_SCORE,
+          RESOLVER_VERSION
+        },
+        borderline: { author: nearAuthorCutoff, site: siteRes.debug?.borderline ?? false },
+        author: authorRes.debug,
+        site: siteRes.debug
+      }
+    });
+  } catch (err: any) {
+    console.error("handler_error", err);
+    return res.status(500).json({ error: String(err?.message || err) });
+  }
+}
