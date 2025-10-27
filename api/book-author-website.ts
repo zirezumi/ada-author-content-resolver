@@ -95,7 +95,7 @@ async function googleCSE(query: string, num = 10): Promise<any[]> {
   url.searchParams.set("cx", CSE_ID);
   url.searchParams.set("q", query);
   url.searchParams.set("num", String(num));
-  // Perf: only the fields we actually read
+  // Perf: request only fields we read
   url.searchParams.set("fields", "items(link,title,snippet,mime,pagemap/metatags)");
 
   const resp = await fetchWithTimeout(url.toString());
@@ -145,6 +145,16 @@ function normalizeCompareTitleRaw(s: string): string {
 }
 const normalizeCompareTitle = memoize1(normalizeCompareTitleRaw, 2000);
 
+// Count name mentions (for tiny, capped repetition bonuses)
+function countNameMentions(s: string, author: string): number {
+  if (!s || !author) return 0;
+  const a = author.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
+  const re = new RegExp(`\\b${a}\\b`, "gi");
+  let n = 0;
+  while (re.exec(s)) n++;
+  return n;
+}
+
 /* Helpers for subtitle tail hygiene */
 function stripSiteSuffix(s: string): string {
   return (s || "")
@@ -158,6 +168,21 @@ function cleanFirstSubtitleSegment(s: string): string {
   const cut = s.split(/[|•–—-]{1,2}|\b\|\b/)[0];
   return (cut || "").replace(/\s+/g, " ").trim();
 }
+// NEW: strip trailing “by <Name> …” from subtitle-ish strings
+function stripByAuthorTail(s: string): string {
+  return (s || "").replace(
+    /\s+\bby\b\s+[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,5}\s*(?:…|\.{3})?$/u,
+    ""
+  ).trim();
+}
+// For filtering only: remove ending “by <Name>” clause from a title string
+function stripTitleByClauseForFilter(title: string): string {
+  return (title || "")
+    .replace(/\b[:—-]\s*.+?\s+\bby\b\s+[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,5}\s*(?:…|\.{3})?$/u, "")
+    .replace(/\s+\bby\b\s+[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,5}\s*(?:…|\.{3})?$/u, "")
+    .trim();
+}
+
 function looksLikeISBNy(s: string): boolean {
   const d = (s.match(/\d/g) || []).length;
   return d >= 6 || /\b(?:ISBN|978|979)\b/i.test(s);
@@ -445,7 +470,7 @@ function normalizeNameCandidate(raw: string, title: string): string | null {
 
   // Early reject for common-word pairs (subtitle artifacts) and title echoes
   const partsEarly = s.split(/\s+/);
-  const titleToks = tokens(title);
+  const titleToks = tokens(stripTitleByClauseForFilter(title)); // NEW: filter-friendly title
   if (partsEarly.length === 2 && looksLikeCommonPair(s)) return null;
   if (titleToks.includes(s.toLowerCase())) return null;
   if (partsEarly.length === 2) {
@@ -488,6 +513,7 @@ function startsWithShortThenSubtitle(title: string, short: string): string | nul
   if (!m) return null;
   const subtitleRaw = m[1];
   let subtitle = cleanFirstSubtitleSegment(stripSiteSuffix(subtitleRaw));
+  subtitle = stripByAuthorTail(subtitle); // NEW: remove trailing “by Author …” from subtitle
   if (
     !subtitle ||
     looksLikeISBNy(subtitle) ||
@@ -541,6 +567,7 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
           if (colonIdx > 0) {
             const head = cand.slice(0, colonIdx).trim();
             let tail = cleanFirstSubtitleSegment(stripSiteSuffix(cand.slice(colonIdx + 1))).trim();
+            tail = stripByAuthorTail(tail); // NEW: remove “by Author” from colon tail
 
             if (!tail ||
                 /\bWikipedia\b/i.test(tail) ||
@@ -653,7 +680,7 @@ function extractAuthorSignals(text: string, opts?: { booky?: boolean; title?: st
   }
 
   // Filter out obvious false positives that echo the title content
-  const titleToks = tokens(title);
+  const titleToks = tokens(stripTitleByClauseForFilter(title)); // NEW: strip trailing “by …” for filtering
   return out.filter(sig => {
     const normed = tokens(sig.name);
     const overlap = normed.filter(t => titleToks.includes(t)).length;
@@ -752,7 +779,17 @@ async function resolveAuthor(bookTitle: string): Promise<{
 
       if ((sig.kind === "plain_last_first") && (maybeOrgish(normed) || looksLikeCommonPair(normed))) continue;
 
-      const w = weightForSignal(sig, host, expandedMatch);
+      // base weight
+      let w = weightForSignal(sig, host, expandedMatch);
+
+      // NEW: tiny, capped repetition bonus keyed to THIS candidate name within this item
+      const m = countNameMentions(haystack, normed);
+      if (m > 0 && (mtIsBook || PUBLISHERS.some(d => host.endsWith(d)))) {
+        // ~0.04 @1 hit, ~0.07 @2, capped 0.12
+        const bonus = Math.min(0.12, 0.04 * Math.log2(1 + m));
+        w += bonus;
+      }
+
       if (w <= 0) continue;
 
       const cur = aggs.get(normed) || { score: 0, roles: {}, positions: [], highSignals: 0 };
@@ -936,7 +973,7 @@ function overlapRatio(a: string[], b: string[]): number {
   return inter / Math.min(A.size, B.size);
 }
 
-/** Authorship-focused boosts */
+/** Authorship-focused boosts (+ NEW repetition nudge) */
 function hasJsonLdPersonOrBook(htmlOrText: string, author: string, bookTitle: string): { person: boolean; book: boolean } {
   const h = htmlOrText;
   const a = norm(author).replace(/"/g, '\\"');
@@ -958,13 +995,18 @@ function contentSignalsForSite(text: string, author: string, bookTitle: string):
 
   const { person, book } = hasJsonLdPersonOrBook(text, author, bookTitle);
 
+  // NEW: small repetition bonus (cap bytes when scanning)
+  const repeats = countNameMentions(String(text || "").slice(0, 20000), author);
+  const repBonus = Math.min(0.08, 0.03 * Math.log2(1 + repeats));
+
   let score =
     0.40 * Math.min(1, bookOverlap * 1.5) +
     0.18 * aExact +
     0.12 * hasBooksPage +
     0.10 * mentionsAuthorRole +
     0.12 * (person ? 1 : 0) +
-    0.08 * (book ? 1 : 0);
+    0.08 * (book ? 1 : 0) +
+    repBonus; // NEW
 
   return Math.min(1, score);
 }
