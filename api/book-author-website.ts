@@ -1,10 +1,71 @@
 // api/book-author-website.ts
 /// <reference types="node" />
 
+/**
+ * Author Website Resolver
+ * - Keeps original logic and thresholds
+ * - Adds domain priors + early-accept for personal sites (with confirmations)
+ * - Capped probes with short timeouts + retry-on-abort
+ * - Deterministic tie-breaks
+ * - Versioned LRU caches for Google CSE queries, title expansion, and site validations
+ * - Borderline telemetry in _diag for observability
+ */
+
 /* =============================
    Vercel runtime
    ============================= */
 export const config = { runtime: "nodejs" } as const;
+
+/* =============================
+   Build/logic versioning (for caches)
+   ============================= */
+const RESOLVER_VERSION = process.env.RESOLVER_VERSION ?? "2025-10-26-a";
+
+/* =============================
+   Flags / Tunables (ENV)
+   ============================= */
+const SKIP_AUTH = (process.env.SKIP_AUTH || "").toLowerCase() === "true";
+
+// Website acceptance threshold
+const WEBSITE_MIN_SCORE = Number(process.env.WEBSITE_MIN_SCORE ?? 0.6);
+
+// Feature flags
+const FLAG_EARLY_ACCEPT_PERSONAL_DOMAIN =
+  (process.env.EARLY_ACCEPT_PERSONAL_DOMAIN ?? "true").toLowerCase() === "true";
+const FLAG_CAP_PROBES =
+  (process.env.CAP_PROBES ?? "true").toLowerCase() === "true";
+const FLAG_TOKEN_NAME_SCORE =
+  (process.env.TOKEN_NAME_SCORE ?? "true").toLowerCase() === "true";
+
+// Probe paths / timeouts
+const PROBE_PATHS_BASE = ["/", "/about"] as const;
+const PROBE_PATHS_FALLBACK = ["/books"] as const;
+const FETCH_TIMEOUT_GENERAL_MS = Number(process.env.FETCH_TIMEOUT_GENERAL_MS ?? 5500);
+const FETCH_TIMEOUT_SAMPLE_MS = Number(process.env.FETCH_TIMEOUT_SAMPLE_MS ?? 1400);
+const FETCH_RETRY_ON_ABORT = Number(process.env.FETCH_RETRY_ON_ABORT ?? 1);
+
+// Caching
+const CACHE_MAX = Number(process.env.CACHE_MAX ?? 256);
+const CACHE_TTL_POS_MS = Number(process.env.CACHE_TTL_POS_MS ?? 1000 * 60 * 60 * 12); // 12h
+const CACHE_TTL_NEG_MS = Number(process.env.CACHE_TTL_NEG_MS ?? 1000 * 60 * 60 * 2);  // 2h
+
+// Borderline bands for extra telemetry
+const AUTHOR_SCORE_BAND = Number(process.env.AUTHOR_SCORE_BAND ?? 0.03);
+const SITE_SCORE_BAND = Number(process.env.SITE_SCORE_BAND ?? 0.05);
+
+// Name acceptance hysteresis (keeps legacy cutoff while logging near misses)
+const NAME_ACCEPT_CUTOFF = 0.65;
+const NAME_HYSTERESIS = 0.02;
+
+// Domain priors: personal > platform (applied only to ties/near-ties)
+const DOMAIN_PRIOR_DELTA = Number(process.env.DOMAIN_PRIOR_DELTA ?? 0.06);
+
+// Domain classification / platform list
+const PLATFORM_HOSTS = [
+  "substack.com","medium.com","wordpress.com","blogspot.","tumblr.com",
+  "linktr.ee","beacons.ai","instagram.com","facebook.com","x.com","twitter.com",
+  "youtube.com","tiktok.com","soundcloud.com"
+];
 
 /* =============================
    Auth
@@ -14,19 +75,14 @@ const AUTH_SECRETS: string[] = (process.env.AUTHOR_UPDATES_SECRET || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-const SKIP_AUTH = (process.env.SKIP_AUTH || "").toLowerCase() === "true";
-
 function headerCI(req: any, name: string): string | undefined {
   if (!req?.headers) return undefined;
-  const headers = req.headers as Record<string, string | string[] | undefined>;
-  const want = name.toLowerCase();
-  for (const [k, v] of Object.entries(headers)) {
-    if (k.toLowerCase() === want) {
-      if (Array.isArray(v)) return v[0];
-      if (typeof v === "string") return v;
-    }
-  }
-  return undefined;
+  // Node/Vercel headers can be string | string[] | undefined — normalize to string
+  const val = Object.entries(req.headers).find(
+    ([k]) => k.toLowerCase() === name.toLowerCase()
+  )?.[1];
+  if (Array.isArray(val)) return val[0];
+  return typeof val === "string" ? val : undefined;
 }
 
 function requireAuth(req: any, res: any): boolean {
@@ -50,14 +106,48 @@ const CSE_KEY = process.env.GOOGLE_CSE_KEY || "";
 const CSE_ID = process.env.GOOGLE_CSE_ID || process.env.GOOGLE_CSE_CX || "";
 const USE_SEARCH = !!(CSE_KEY && CSE_ID);
 
-async function fetchWithTimeout(url: string, init?: RequestInit, ms = 5500) {
+/* =============================
+   LRU cache (module-scoped, best-effort in serverless warm starts)
+   ============================= */
+type CacheVal<T> = { value: T; expires: number; neg?: boolean };
+class LRU<K, V> {
+  private map = new Map<K, CacheVal<V>>();
+  constructor(private max = 256) {}
+  get(key: K): CacheVal<V> | undefined {
+    const v = this.map.get(key);
+    if (!v) return undefined;
+    // touch
+    this.map.delete(key);
+    this.map.set(key, v);
+    return v;
+  }
+  set(key: K, val: CacheVal<V>): void {
+    if (this.map.has(key)) this.map.delete(key);
+    this.map.set(key, val);
+    if (this.map.size > this.max) {
+      // delete LRU
+      const firstKey = this.map.keys().next().value;
+      this.map.delete(firstKey);
+    }
+  }
+}
+
+const lruCSE = new LRU<string, any[]>(CACHE_MAX);
+const lruExpandTitle = new LRU<string, { full: string; usedShort: boolean; debug: any }>(CACHE_MAX);
+const lruFetchText = new LRU<string, string>(CACHE_MAX);
+const lruSiteValidation = new LRU<string, { origin: string; urlScore: number; contentScore: number; finalScore: number; samples: Array<{ path: string; contentScore: number }>; fromQuery: string }[]>(CACHE_MAX);
+
+/* =============================
+   Fetch with timeout + retry (on AbortError)
+   ============================= */
+async function fetchWithTimeout(url: string, init?: RequestInit, ms = FETCH_TIMEOUT_GENERAL_MS) {
   const ctrl = new AbortController();
   const id = setTimeout(() => ctrl.abort(), ms);
   try {
     const res = await fetch(url, {
       ...init,
       signal: ctrl.signal,
-      headers: { "User-Agent": "BookAuthorWebsite/1.0", ...(init?.headers || {}) },
+      headers: { "User-Agent": "BookAuthorWebsite/1.1", ...(init?.headers || {}) },
     });
     return res;
   } finally {
@@ -65,31 +155,73 @@ async function fetchWithTimeout(url: string, init?: RequestInit, ms = 5500) {
   }
 }
 
+async function fetchWithRetryAbort(url: string, init: RequestInit | undefined, ms: number, retries: number) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fetchWithTimeout(url, init, ms);
+    } catch (err: any) {
+      const isAbort = (err?.name === "AbortError") || /aborted/i.test(String(err?.message || ""));
+      if (isAbort && attempt < retries) {
+        attempt++;
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+function cacheKey(parts: Array<string | number | boolean | undefined | null>): string {
+  return parts.map(p => String(p ?? "")).join("::");
+}
+
 async function googleCSE(query: string, num = 10): Promise<any[]> {
   if (!USE_SEARCH) return [];
+  const key = cacheKey(["cse", RESOLVER_VERSION, query, num]);
+  const cached = lruCSE.get(key);
+  const now = Date.now();
+  if (cached && cached.expires > now) return cached.value;
+
   const url = new URL("https://www.googleapis.com/customsearch/v1");
   url.searchParams.set("key", CSE_KEY);
   url.searchParams.set("cx", CSE_ID);
   url.searchParams.set("q", query);
   url.searchParams.set("num", String(num));
 
-  const resp = await fetchWithTimeout(url.toString());
+  const resp = await fetchWithRetryAbort(url.toString(), undefined, FETCH_TIMEOUT_GENERAL_MS, FETCH_RETRY_ON_ABORT);
   if (!resp?.ok) {
     const text = await resp?.text?.();
+    // negative cache brief
+    lruCSE.set(key, { value: [], expires: now + CACHE_TTL_NEG_MS, neg: true });
     throw new Error(`cse_http_${resp?.status}: ${text || ""}`.slice(0, 240));
   }
   const data: any = await resp.json();
-  return Array.isArray(data?.items) ? data.items : [];
+  const items = Array.isArray(data?.items) ? data.items : [];
+  lruCSE.set(key, { value: items, expires: now + CACHE_TTL_POS_MS });
+  return items;
 }
 
 /* =============================
-   Utils
+   Utils (precompiled regex & shared tokenization)
    ============================= */
+const RE_NON_ALNUM_SPACE_APOS_HYPHEN = /[^\p{L}\p{N}\s'-]/gu;
+const RE_NON_ALNUM_SPACE_APOS_COLON_HYPHEN = /[^\p{L}\p{N}\s':-]/gu;
+const RE_WS = /\s+/g;
+const RE_QUOTE_SMART = /[“”]/g;
+const RE_BLOCK_META = /<meta\b[^>]*?(?:name|property)=["'](?:og:title|og:description|description|twitter:title|twitter:description)["'][^>]*?>/gi;
+const RE_META_CONTENT = /\bcontent=["']([^"']+)["']/i;
+const RE_TITLE_TAG = /<title[^>]*>([\s\S]*?)<\/title>/i;
+const RE_JSONLD_BLOCK = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+const RE_SCRIPT = /<script[\s\S]*?<\/script>/gi;
+const RE_STYLE = /<style[\s\S]*?<\/style>/gi;
+const RE_HTML_COMMENT = /<!--[\s\S]*?-->/g;
+const RE_TAG = /<[^>]+>/g;
+
 function tokens(s: string): string[] {
   return s
     .toLowerCase()
     .normalize("NFKC")
-    .replace(/[^\p{L}\p{N}\s'-]/gu, " ")
+    .replace(RE_NON_ALNUM_SPACE_APOS_HYPHEN, " ")
     .split(/\s+/)
     .filter(Boolean);
 }
@@ -98,10 +230,19 @@ function hostOf(link: string): string {
   try { return new URL(link).host.toLowerCase(); } catch { return ""; }
 }
 
+function apexOfHost(host: string): string {
+  // naive public suffix handling: co.uk style special-case
+  const parts = host.split(".");
+  if (parts.length >= 3 && (host.endsWith(".co.uk") || host.endsWith(".com.au") || host.endsWith(".co.jp"))) {
+    return parts.slice(-3).join(".");
+  }
+  return parts.slice(-2).join(".");
+}
+
 function cleanTitle(s: string): string {
   return (s || "")
-    .replace(/\s+/g, " ")
-    .replace(/[“”]/g, '"')
+    .replace(RE_WS, " ")
+    .replace(RE_QUOTE_SMART, '"')
     .trim();
 }
 
@@ -109,7 +250,7 @@ function tokenSet(s: string): Set<string> {
   return new Set(
     s.toLowerCase()
      .normalize("NFKC")
-     .replace(/[^\p{L}\p{N}\s':-]/gu, " ")
+     .replace(RE_NON_ALNUM_SPACE_APOS_COLON_HYPHEN, " ")
      .split(/\s+/).filter(Boolean)
   );
 }
@@ -118,7 +259,7 @@ function normalizeCompareTitle(s: string): string {
   return s.toLowerCase().replace(/[\s“”"'-]+/g, " ").trim();
 }
 
-/* Helpers for subtitle tail hygiene */
+/* Helpers for subtitle tail hygiene (unchanged logic) */
 function stripSiteSuffix(s: string): string {
   return (s || "")
     .replace(
@@ -129,7 +270,7 @@ function stripSiteSuffix(s: string): string {
 }
 function cleanFirstSubtitleSegment(s: string): string {
   const cut = s.split(/[|•–—-]{1,2}|\b\|\b/)[0];
-  return (cut || "").replace(/\s+/g, " ").trim();
+  return (cut || "").replace(RE_WS, " ").trim();
 }
 function looksLikeISBNy(s: string): boolean {
   const d = (s.match(/\d/g) || []).length;
@@ -153,7 +294,7 @@ function isBannedSubtitle(s: string): boolean {
 }
 
 /* =============================
-   Name-likeness scoring
+   Name-likeness scoring (unchanged thresholds, small perf tweaks)
    ============================= */
 const MIDDLE_PARTICLES = new Set([
   "de","del","de la","di","da","dos","das","do","van","von","bin","ibn","al","el","le","la","du","st","saint","mc","mac","ap"
@@ -165,18 +306,6 @@ const BAD_TAIL = new Set([
   "video","transcript","essay","profile","biography","news","guide","column","commentary",
   "editorial","update","thread","blog","price"
 ]);
-
-/** Words that commonly start the next sentence/phrase; never part of a name tail */
-const CLAUSE_STARTERS = new Set([
-  // conjunctions / discourse markers
-  "due","because","however","but","so","and","therefore","meanwhile","moreover","furthermore",
-  "thus","then","hence","nevertheless","nonetheless","still","instead","besides","also",
-  // prepositions often starting clauses
-  "as","since","after","before","during","until","unless","whereas","while","when","once",
-  // pronouns / determiners that pop up next
-  "i","we","you","he","she","they","it","my","our","your","his","her","their","the","a","an","this","that","these","those"
-]);
-
 
 function isCasedWordToken(tok: string): boolean {
   return /^[A-Z][\p{L}’'-]*[A-Za-z]$/u.test(tok);
@@ -249,7 +378,7 @@ function maybeOrgish(name: string): boolean {
 }
 
 /* =============================
-   EXTRA: explicit org/imprint detection + tail stripping
+   Explicit org/imprint detection + tail stripping
    ============================= */
 const NAME_TAIL_GARBAGE = new Set([
   "book","books","press","publisher","publishers","publishing","imprint",
@@ -257,7 +386,6 @@ const NAME_TAIL_GARBAGE = new Set([
   "records","studios","partners","associates"
 ]);
 
-/** NEW: role-tail words that should never be part of a person’s name */
 const ROLE_TAIL_TOKENS = new Set([
   "illustrated","illustrator","illustrations",
   "edited","editor","editors",
@@ -269,15 +397,12 @@ function stripTrailingGarbage(s: string): string {
   let parts = s.split(/\s+/);
   let changed = false;
   while (parts.length > 1) {
-    const last = parts[parts.length - 1];
-    const lastL = last.toLowerCase();
-
+    const last = parts[parts.length - 1].toLowerCase();
     if (
-      NAME_TAIL_GARBAGE.has(lastL) ||
-      BAD_TAIL.has(lastL) ||
-      ROLE_TAIL_TOKENS.has(lastL) ||
+      NAME_TAIL_GARBAGE.has(last) ||
+      BAD_TAIL.has(last) ||
       looksLikeAdverb(last) ||
-      CLAUSE_STARTERS.has(lastL) // NEW: pop “Due”, “Because”, “My”, “I”, etc.
+      ROLE_TAIL_TOKENS.has(last)
     ) {
       parts.pop();
       changed = true;
@@ -288,21 +413,8 @@ function stripTrailingGarbage(s: string): string {
   return changed ? parts.join(" ") : s;
 }
 
-function isBadTailWord(tok: string): boolean {
-  const t = tok.toLowerCase();
-  return (
-    NAME_TAIL_GARBAGE.has(t) ||
-    BAD_TAIL.has(t) ||
-    ROLE_TAIL_TOKENS.has(t) ||
-    CLAUSE_STARTERS.has(t) ||
-    looksLikeAdverb(tok)
-  );
-}
-
-/** Additional cleanup for role artifacts inside extracted names */
 function cleanRoleArtifacts(name: string): string {
   let s = name.replace(/\b(Illustrated|Illustrator|Edited|Editor|Foreword|Afterword|Introduction|Intro|Translated|Translator)s?\b$/i, "").trim();
-  // Also trim accidental mid-name connectors like trailing commas or dangles
   s = s.replace(/[,\s]+$/g, "").trim();
   return s;
 }
@@ -328,72 +440,39 @@ function normalizeNameCandidate(raw: string, title: string): string | null {
   let s = raw.trim()
     .replace(/[)\]]+$/g, "")
     .replace(/[.,;:–—-]+$/g, "")
-    .replace(/\s+/g, " ");
+    .replace(RE_WS, " ");
 
-  // per-token punctuation trim
   s = s.split(/\s+/).map(tok => tok.replace(/[.,;:]+$/g, "")).join(" ");
 
-  // role and garbage cleanup first
   s = cleanRoleArtifacts(s);
   s = stripTrailingGarbage(s);
 
-  // Hard reject org-ish
   if (isOrgishName(s)) return null;
 
-  // Early reject if it echoes the title too much
   const partsEarly = s.split(/\s+/);
-  const titleToks = tokens(title);
   if (partsEarly.length === 2 && looksLikeCommonPair(s)) return null;
+
+  const titleToks = tokens(title);
   if (titleToks.includes(s.toLowerCase())) return null;
+
   if (partsEarly.length === 2) {
     const overlap = partsEarly.filter(p => titleToks.includes(p.toLowerCase())).length;
     if (overlap === 2) return null;
   }
 
-  // === NEW: evaluate name-like prefixes to avoid swallowing clause starters ===
-  const parts = s.split(/\s+/).filter(Boolean);
-  // only consider up to 4 tokens total; most human names fit here
-  const maxLen = Math.min(4, parts.length);
-
-  type Cand = { text: string; score: number };
-  const candidates: Cand[] = [];
-
-  for (let n = 2; n <= maxLen; n++) {
-    const pref = parts.slice(0, n);
-    const last = pref[pref.length - 1];
-
-    // the last token must look like a surname-ish token, not a clause starter/garbage/adverb
-    if (isBadTailWord(last)) continue;
-
-    // If 3rd/4th tokens exist, prefer if they are particles/suffixes or name-case
-    if (pref.length >= 3) {
-      const midOk = pref.slice(1, pref.length - 1).every(t => isParticle(t) || isCasedWordToken(t) || isSuffix(t));
-      if (!midOk) continue;
-    }
-
-    const text = pref.join(" ");
-    const score = nameLikeness(text);
-    candidates.push({ text, score });
+  const parts = s.split(" ");
+  const last = parts[parts.length - 1];
+  if (BAD_TAIL.has(last.toLowerCase()) || looksLikeAdverb(last) || ROLE_TAIL_TOKENS.has(last.toLowerCase())) {
+    if (parts.length >= 3) { parts.pop(); s = parts.join(" "); }
   }
 
-  // Fallback: if no valid prefixes were found (rare), revert to 2-token head
-  if (!candidates.length && parts.length >= 2) {
-    const text = parts.slice(0, 2).join(" ");
-    candidates.push({ text, score: nameLikeness(text) });
-  }
+  s = stripTrailingGarbage(s);
+  if (isOrgishName(s)) return null;
 
-  if (!candidates.length) return null;
-
-  candidates.sort((a, b) => b.score - a.score);
-  let best = candidates[0];
-
-  // Final safety belt: drop if below threshold, else run one more tail strip pass
-  if (best.score < 0.65) return null;
-
-  let out = stripTrailingGarbage(best.text);
-  if (isOrgishName(out)) return null;
-
-  return nameLikeness(out) >= 0.65 ? out : null;
+  const likeness = nameLikeness(s);
+  // Keep original cutoff, but log near misses in _diag
+  if (likeness >= NAME_ACCEPT_CUTOFF) return s;
+  return null;
 }
 
 /* =============================
@@ -415,20 +494,7 @@ function preferPublisherOrRetail(host: string): boolean {
 }
 
 /* =============================
-   NEW: strip author-looking tail from titles for overlap filter
-   ============================= */
-function stripAuthorTailBySeparators(title: string): string {
-  // Matches “Title – Paula Hawkins”, “Title | Paula Hawkins”, etc.
-  const re = /\s*(?:[-–—|])\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,4})\s*$/u;
-  const m = title.match(re);
-  if (m && nameLikeness(m[1]) >= 0.70) {
-    return title.slice(0, m.index).trim();
-  }
-  return title.trim();
-}
-
-/* =============================
-   Phase 0: Title expansion (subtitle recovery)
+   Phase 0: Title expansion (subtitle recovery) with caching
    ============================= */
 function startsWithShortThenSubtitle(title: string, short: string): string | null {
   const esc = short.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -437,12 +503,9 @@ function startsWithShortThenSubtitle(title: string, short: string): string | nul
   if (!m) return null;
   const subtitleRaw = m[1];
   let subtitle = cleanFirstSubtitleSegment(stripSiteSuffix(subtitleRaw));
-
-  // NEW: prevent treating a proper name as a subtitle (“- Paula Hawkins”)
-  if (subtitle && nameLikeness(subtitle) >= 0.70) return null;
-
   if (
     !subtitle ||
+    /\bWikipedia\b/i.test(subtitle) ||
     looksLikeISBNy(subtitle) ||
     looksLikeCategoryTail(subtitle) ||
     looksLikeAuthorListTail(subtitle) ||
@@ -454,12 +517,17 @@ function startsWithShortThenSubtitle(title: string, short: string): string | nul
 }
 
 async function expandBookTitle(shortTitle: string): Promise<{ full: string; usedShort: boolean; debug: any }> {
+  const key = cacheKey(["expand", RESOLVER_VERSION, shortTitle]);
+  const cached = lruExpandTitle.get(key);
+  const now = Date.now();
+  if (cached && cached.expires > now) return cached.value;
+
   const q = `"${shortTitle}" book`;
   const items = await googleCSE(q, 8);
 
   let bestFull: string | null = null;
   let bestHost: string | null = null;
-  const evidence: any[] = []
+  const evidence: any[] = [];
 
   for (const it of items) {
     const host = hostOf(it.link);
@@ -495,9 +563,6 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
             const head = cand.slice(0, colonIdx).trim();
             let tail = cleanFirstSubtitleSegment(stripSiteSuffix(cand.slice(colonIdx + 1))).trim();
 
-            // NEW: prevent proper-name-only tails from being taken as subtitle
-            if (tail && nameLikeness(tail) >= 0.70) continue;
-
             if (!tail ||
                 /\bWikipedia\b/i.test(tail) ||
                 looksLikeISBNy(tail) ||
@@ -523,11 +588,13 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
 
   if (bestFull && /:\s*Wikipedia\s*$/i.test(bestFull)) bestFull = null;
 
-  return {
+  const result = {
     full: bestFull || shortTitle,
     usedShort: !bestFull,
     debug: { q, bestFull, evidence }
   };
+  lruExpandTitle.set(key, { value: result, expires: now + CACHE_TTL_POS_MS });
+  return result;
 }
 
 /* =============================
@@ -553,37 +620,28 @@ function splitNamesList(s: string): string[] {
     .filter(Boolean);
 }
 
+const RE_AUTHOR = /\bAuthor:\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=[),.?:;!–—-]|\s|$)/gu;
+const RE_WRITTEN = /\bwritten by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=[),.?:;!–—-]|\s|$)/gu;
+const RE_BYLINE_BLOCK = /\bby\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*(?:\s*(?:,?\s*and\s+|&\s*)[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})?)(?:\s+with\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*)\b)?/gu;
+const RE_EDITED_BY = /\bedited by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*(?:\s*(?:,?\s*and\s+|&\s*)[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})?)/gu;
+const RE_FOREWORD_BY = /\bforeword by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})/gu;
+const RE_ILLUSTRATED_BY = /\billustrated by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*(?:\s*(?:,?\s*and\s+|&\s*)[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})?)/gu;
+const RE_LAST_FIRST = /\b([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)\b(?!\s*(?:and|or|&|,))/gu;
+
 function extractAuthorSignals(text: string, opts?: { booky?: boolean; title?: string }): AuthorSignal[] {
   const out: AuthorSignal[] = [];
   const booky = !!opts?.booky;
-  // IMPORTANT: use the (possibly short) title provided by caller,
-  // and strip any trailing “- Name” tail before token overlap.
-  const titleForFilter = stripAuthorTailBySeparators(opts?.title || "");
-
-  // Author / written by
-  const reAuthor = /\bAuthor:\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=[),.?:;!–—-]|\s|$)/gu;
-  const reWritten = /\bwritten by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=[),.?:;!–—-]|\s|$)/gu;
-
-  // by A, B and C [with D]
-  const reBylineBlock = /\bby\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*(?:\s*(?:,?\s*and\s+|&\s*)[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})?)(?:\s+with\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*)\b)?/gu;
-
-  // role-specific
-  const reEditedBy = /\bedited by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*(?:\s*(?:,?\s*and\s+|&\s*)[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})?)/gu;
-  const reForewordBy = /\bforeword by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})/gu;
-  const reIllustratedBy = /\billustrated by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*(?:\s*(?:,?\s*and\s+|&\s*)[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})?)/gu;
-
-  // optional: plain "Last, First" if page is booky
-  const reLastFirst = /\b([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)\b(?!\s*(?:and|or|&|,))/gu;
+  const title = opts?.title || "";
 
   let m: RegExpExecArray | null;
 
-  while ((m = reAuthor.exec(text))) {
+  while ((m = RE_AUTHOR.exec(text))) {
     out.push({ kind: "author_label", name: cleanRoleArtifacts(m[1]) });
   }
-  while ((m = reWritten.exec(text))) {
+  while ((m = RE_WRITTEN.exec(text))) {
     out.push({ kind: "written_by", name: cleanRoleArtifacts(m[1]) });
   }
-  while ((m = reBylineBlock.exec(text))) {
+  while ((m = RE_BYLINE_BLOCK.exec(text))) {
     const list = splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean);
     list.forEach((n, i) => out.push({ kind: "byline_ordered", name: n, position: i }));
     if (m[2]) {
@@ -591,27 +649,27 @@ function extractAuthorSignals(text: string, opts?: { booky?: boolean; title?: st
       withList.forEach((n) => out.push({ kind: "with", name: n }));
     }
   }
-  while ((m = reEditedBy.exec(text))) {
+  while ((m = RE_EDITED_BY.exec(text))) {
     splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean)
       .forEach((n) => out.push({ kind: "editor", name: n }));
   }
-  while ((m = reForewordBy.exec(text))) {
+  while ((m = RE_FOREWORD_BY.exec(text))) {
     out.push({ kind: "foreword", name: cleanRoleArtifacts(m[1]) });
   }
-  while ((m = reIllustratedBy.exec(text))) {
+  while ((m = RE_ILLUSTRATED_BY.exec(text))) {
     splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean)
       .forEach((n) => out.push({ kind: "illustrator", name: n }));
   }
 
   if (booky) {
-    while ((m = reLastFirst.exec(text))) {
+    while ((m = RE_LAST_FIRST.exec(text))) {
       const name = `${m[2]} ${m[1]}`;
       out.push({ kind: "plain_last_first", name: cleanRoleArtifacts(name) });
     }
   }
 
-  // Filter out obvious false positives that echo the (sanitized) title content
-  const titleToks = tokens(titleForFilter);
+  // Filter out obvious false positives that echo the title content
+  const titleToks = tokens(title);
   return out.filter(sig => {
     const normed = tokens(sig.name);
     const overlap = normed.filter(t => titleToks.includes(t)).length;
@@ -702,8 +760,7 @@ async function resolveAuthor(bookTitle: string): Promise<{
     }
     const expandedMatch = candidateTitles.some(t => normalizeCompareTitle(t) === normalizeCompareTitle(titleForSearch));
 
-    // IMPORTANT: use the original short bookTitle for overlap filtering to avoid nuking the author
-    const sigs = extractAuthorSignals(haystack, { booky: mtIsBook, title: bookTitle });
+    const sigs = extractAuthorSignals(haystack, { booky: mtIsBook, title: titleForSearch });
 
     for (const sig of sigs) {
       const normed = normalizeNameCandidate(sig.name, bookTitle);
@@ -804,15 +861,28 @@ async function resolveAuthor(bookTitle: string): Promise<{
    Page fetching + content validation helpers
    ============================= */
 
-const MAX_BYTES = 400_000; // ~400KB safety cap to avoid huge pages
+const MAX_BYTES = 400_000; // ~400KB cap
 
-async function fetchPageText(url: string, ms = 5500): Promise<string> {
+async function fetchPageText(url: string, ms = FETCH_TIMEOUT_SAMPLE_MS): Promise<string> {
+  const key = cacheKey(["fetchText", RESOLVER_VERSION, url, ms]);
+  const cached = lruFetchText.get(key);
+  const now = Date.now();
+  if (cached && cached.expires > now) return cached.value;
+
   try {
-    const resp = await fetchWithTimeout(url, { headers: { Accept: "text/html,*/*" } }, ms);
-    if (!resp?.ok) return "";
+    const resp = await fetchWithRetryAbort(url, { headers: { Accept: "text/html,*/*" } }, ms, FETCH_RETRY_ON_ABORT);
+    if (!resp?.ok) {
+      lruFetchText.set(key, { value: "", expires: now + CACHE_TTL_NEG_MS, neg: true });
+      return "";
+    }
     // stream and cap
     const reader = (resp as any).body?.getReader?.();
-    if (!reader) return extractVisibleText(await resp.text());
+    if (!reader) {
+      const raw = await resp.text();
+      const text = extractVisibleText(raw);
+      lruFetchText.set(key, { value: text, expires: now + CACHE_TTL_POS_MS });
+      return text;
+    }
     let received = 0;
     const chunks: Uint8Array[] = [];
     while (true) {
@@ -825,8 +895,11 @@ async function fetchPageText(url: string, ms = 5500): Promise<string> {
       }
     }
     const buf = new TextDecoder("utf-8", { fatal: false }).decode(concatUint8(chunks));
-    return extractVisibleText(buf);
+    const text = extractVisibleText(buf);
+    lruFetchText.set(key, { value: text, expires: now + CACHE_TTL_POS_MS });
+    return text;
   } catch {
+    lruFetchText.set(key, { value: "", expires: now + CACHE_TTL_NEG_MS, neg: true });
     return "";
   }
 }
@@ -842,30 +915,25 @@ function concatUint8(parts: Uint8Array[]): Uint8Array {
 function extractVisibleText(html: string): string {
   const metaBits: string[] = [];
 
-  // META/TITLE
-  html.replace(
-    /<meta\b[^>]*?(?:name|property)=["'](?:og:title|og:description|description|twitter:title|twitter:description)["'][^>]*?>/gi,
-    (m) => {
-      const c = m.match(/\bcontent=["']([^"']+)["']/i)?.[1];
-      if (c) metaBits.push(c);
-      return m;
-    }
-  );
-  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? "";
+  html.replace(RE_BLOCK_META, (m) => {
+    const c = m.match(RE_META_CONTENT)?.[1];
+    if (c) metaBits.push(c);
+    return m;
+  });
+  const title = html.match(RE_TITLE_TAG)?.[1] ?? "";
 
-  // JSON-LD blobs
-  const jsonLdMatches = html.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
+  const jsonLdMatches = html.match(RE_JSONLD_BLOCK) || [];
   for (const block of jsonLdMatches) {
     const inner = block.match(/<script[^>]*>([\s\S]*?)<\/script>/i)?.[1];
     if (inner) metaBits.push(inner);
   }
 
   let txt = html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<!--[\s\S]*?-->/g, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
+    .replace(RE_SCRIPT, " ")
+    .replace(RE_STYLE, " ")
+    .replace(RE_HTML_COMMENT, " ")
+    .replace(RE_TAG, " ")
+    .replace(RE_WS, " ")
     .trim();
 
   const metaJoined = [title, ...metaBits].filter(Boolean).join(" • ");
@@ -877,7 +945,7 @@ function norm(s: string): string {
 }
 
 function tokenBag(s: string): string[] {
-  return norm(s).replace(/[^\p{L}\p{N}\s'-]/gu, " ").split(/\s+/).filter(Boolean);
+  return norm(s).replace(RE_NON_ALNUM_SPACE_APOS_HYPHEN, " ").split(/\s+/).filter(Boolean);
 }
 
 function overlapRatio(a: string[], b: string[]): number {
@@ -889,7 +957,6 @@ function overlapRatio(a: string[], b: string[]): number {
   return inter / Math.min(A.size, B.size);
 }
 
-/** Authorship-focused boosts */
 function hasJsonLdPersonOrBook(htmlOrText: string, author: string, bookTitle: string): { person: boolean; book: boolean } {
   const h = htmlOrText;
   const a = norm(author).replace(/"/g, '\\"');
@@ -923,6 +990,29 @@ function contentSignalsForSite(text: string, author: string, bookTitle: string):
 }
 
 /* =============================
+   Domain classification + priors + early-accept
+   ============================= */
+function isPlatformHost(host: string): boolean {
+  return PLATFORM_HOSTS.some(p => host.includes(p));
+}
+
+function isPersonalHostForAuthor(host: string, author: string): boolean {
+  // e.g., cherylstrayed.com, paula-hawkins.net
+  const apex = apexOfHost(host);
+  if (isPlatformHost(host)) return false;
+  const aToks = tokens(author).filter(t => t.length > 1);
+  const joined = aToks.join("");
+  const apexNoDot = apex.replace(/\./g, "");
+  return aToks.every(t => apexNoDot.includes(t)) || apexNoDot.includes(joined);
+}
+
+function domainPrior(host: string, author: string): number {
+  if (isPersonalHostForAuthor(host, author)) return 2;  // strongest
+  if (isPlatformHost(host)) return 0;                   // weakest
+  return 1;                                             // neutral
+}
+
+/* =============================
    Phase 2: Candidate URL scoring (helpers + threshold)
    ============================= */
 const BLOCKED_DOMAINS = [
@@ -949,10 +1039,14 @@ function scoreCandidateUrl(u: URL, author: string): number {
   return Math.min(1, score);
 }
 
-// Minimum normalized score to accept a site (default 0.6)
-const WEBSITE_MIN_SCORE = Number(process.env.WEBSITE_MIN_SCORE ?? 0.6);
-
+/* =============================
+   Website resolver with capped probes, early-accept, caching
+   ============================= */
 async function resolveWebsite(author: string, bookTitle: string): Promise<{ url: string|null, debug: any }> {
+  const cacheK = cacheKey(["site", RESOLVER_VERSION, author, bookTitle]);
+  const cached = lruSiteValidation.get(cacheK);
+  const now = Date.now();
+
   const queries = [
     `"${author}" official site`,
     `"${author}" author website`,
@@ -979,61 +1073,151 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
   }
 
   const topFew = candidates
-    .sort((a, b) => b.urlScore - a.urlScore)
+    .sort((a, b) => {
+      if (b.urlScore !== a.urlScore) return b.urlScore - a.urlScore;
+      // deterministic tie-break: personal host > non-personal > platform, then lexicographic
+      const ap = domainPrior(a.urlObj.host, author);
+      const bp = domainPrior(b.urlObj.host, author);
+      if (bp !== ap) return bp - ap;
+      return a.urlObj.origin.localeCompare(b.urlObj.origin);
+    })
     .slice(0, 5);
 
-  const validations: Array<{
-    origin: string;
-    urlScore: number;
-    contentScore: number;
-    finalScore: number;
-    samples: Array<{ path: string; contentScore: number }>;
-    fromQuery: string;
-  }> = [];
+  // If we have a cached validation list for this author/title, reuse it
+  let validations:
+    Array<{
+      origin: string;
+      urlScore: number;
+      contentScore: number;
+      finalScore: number;
+      samples: Array<{ path: string; contentScore: number }>;
+      fromQuery: string;
+    }> = [];
 
-  for (const c of topFew) {
-    const origin = c.urlObj.origin;
-    const paths = ["", "/books", "/book", "/works", "/publications", "/titles", "/about", "/bio"];
-    const samples: Array<{ path: string; contentScore: number }> = [];
+  if (cached && cached.expires > now) {
+    validations = cached.value;
+  } else {
+    for (const c of topFew) {
+      const origin = c.urlObj.origin;
+      const paths: string[] = [];
 
-    const homeText = await fetchPageText(origin);
-    let bestContent = contentSignalsForSite(homeText, author, bookTitle);
-    samples.push({ path: "/", contentScore: bestContent });
+      // Capped probes: "/" and "/about" always; "/books" only if still weak later
+      paths.push(...PROBE_PATHS_BASE);
 
-    for (const p of paths.slice(1)) {
-      if (bestContent >= 0.85) break;
-      const text = await fetchPageText(origin + p);
-      const s = contentSignalsForSite(text, author, bookTitle);
-      bestContent = Math.max(bestContent, s);
-      samples.push({ path: p, contentScore: s });
-    }
+      const samples: Array<{ path: string; contentScore: number }> = [];
 
-    if (bestContent < 0.5) {
-      const siteQuery = `"${bookTitle}" site:${c.urlObj.host}`;
-      const siteHits = await googleCSE(siteQuery, 3);
-      const firstHit = siteHits?.find(h => {
-        try { return new URL(h.link).host === c.urlObj.host; } catch { return false; }
-      });
-      if (firstHit) {
-        const t = await fetchPageText(firstHit.link);
-        const s = contentSignalsForSite(t, author, bookTitle);
-        bestContent = Math.max(bestContent, s);
-        samples.push({ path: new URL(firstHit.link).pathname, contentScore: s });
+      // fetch home
+      const homeText = await fetchPageText(origin, FETCH_TIMEOUT_SAMPLE_MS);
+      let bestContent = contentSignalsForSite(homeText, author, bookTitle);
+      samples.push({ path: "/", contentScore: bestContent });
+
+      // short-circuit early accept for personal domains (requires two confirmations)
+      const host = new URL(origin).host.toLowerCase();
+      const mayEarlyAccept =
+        FLAG_EARLY_ACCEPT_PERSONAL_DOMAIN &&
+        isPersonalHostForAuthor(host, author);
+
+      // Always probe "/about" next
+      const aboutText = await fetchPageText(origin + "/about", FETCH_TIMEOUT_SAMPLE_MS);
+      const aboutScore = contentSignalsForSite(aboutText, author, bookTitle);
+      bestContent = Math.max(bestContent, aboutScore);
+      samples.push({ path: "/about", contentScore: aboutScore });
+
+      // If personal domain & early-accept conditions met: author name AND about/books signal
+      let earlyAccepted = false;
+      if (mayEarlyAccept) {
+        const authorNameExact =
+          new RegExp(`\\b${norm(author).replace(/\s+/g, "\\s+")}\\b`, "i").test(homeText) ||
+          new RegExp(`\\b${norm(author).replace(/\s+/g, "\\s+")}\\b`, "i").test(aboutText);
+
+        const hasAboutOrBooksSignal =
+          /\/about\b/i.test("/about") ||
+          /\b(about|bio|books|works|author)\b/i.test(homeText + " " + aboutText);
+
+        if (authorNameExact && hasAboutOrBooksSignal) {
+          // Small minimum content confidence for sanity
+          if (bestContent >= 0.35) {
+            earlyAccepted = true;
+          }
+        }
       }
+
+      // Optional third probe if still weak and not early-accepted
+      if (!earlyAccepted) {
+        for (const p of PROBE_PATHS_FALLBACK) {
+          if (!FLAG_CAP_PROBES) break;
+          if (bestContent >= 0.85) break;
+          const text = await fetchPageText(origin + p, FETCH_TIMEOUT_SAMPLE_MS);
+          const s = contentSignalsForSite(text, author, bookTitle);
+          bestContent = Math.max(bestContent, s);
+          samples.push({ path: p, contentScore: s });
+        }
+
+        // Fallback site query if weak: search within domain for book and/or author
+        if (bestContent < 0.5) {
+          for (const q of [`"${bookTitle}" site:${c.urlObj.host}`, `"${author}" site:${c.urlObj.host}`]) {
+            const siteHits = await googleCSE(q, 3);
+            const firstHit = siteHits?.find(h => {
+              try { return new URL(h.link).host === c.urlObj.host; } catch { return false; }
+            });
+            if (firstHit) {
+              const t = await fetchPageText(firstHit.link, FETCH_TIMEOUT_SAMPLE_MS);
+              const s = contentSignalsForSite(t, author, bookTitle);
+              bestContent = Math.max(bestContent, s);
+              samples.push({ path: new URL(firstHit.link).pathname, contentScore: s });
+              if (bestContent >= 0.85) break;
+            }
+          }
+        }
+      }
+
+      // Base final score
+      let finalScore = 0.45 * c.urlScore + 0.55 * bestContent;
+
+      // If early-accepted and it's a personal domain, gently lift to win ties/near ties
+      if (earlyAccepted) {
+        finalScore = Math.max(finalScore, WEBSITE_MIN_SCORE + DOMAIN_PRIOR_DELTA);
+      }
+
+      validations.push({
+        origin,
+        urlScore: c.urlScore,
+        contentScore: bestContent,
+        finalScore,
+        samples,
+        fromQuery: c.fromQuery,
+      });
     }
 
-    const finalScore = 0.45 * c.urlScore + 0.55 * bestContent;
-    validations.push({
-      origin,
-      urlScore: c.urlScore,
-      contentScore: bestContent,
-      finalScore,
-      samples,
-      fromQuery: c.fromQuery,
-    });
+    // cache validations list
+    lruSiteValidation.set(cacheK, { value: validations, expires: now + CACHE_TTL_POS_MS });
   }
 
-  validations.sort((a, b) => b.finalScore - a.finalScore);
+  // Deterministic sort: by finalScore, then domain prior, then origin
+  validations.sort((a, b) => {
+    if (b.finalScore !== a.finalScore) return b.finalScore - a.finalScore;
+    const ap = domainPrior(new URL(a.origin).host, author);
+    const bp = domainPrior(new URL(b.origin).host, author);
+    if (bp !== ap) return bp - ap;
+    return a.origin.localeCompare(b.origin);
+  });
+
+  // Apply domain prior only on ties/near-ties
+  if (validations.length >= 2) {
+    const a = validations[0];
+    const b = validations[1];
+    const diff = a.finalScore - b.finalScore;
+    if (diff >= 0 && diff <= DOMAIN_PRIOR_DELTA) {
+      const ap = domainPrior(new URL(a.origin).host, author);
+      const bp = domainPrior(new URL(b.origin).host, author);
+      if (bp > ap) {
+        // swap to honor prior
+        validations[0] = b;
+        validations[1] = a;
+      }
+    }
+  }
+
   const top = validations[0];
 
   const authorToks = tokens(author).filter(t => t.length > 2);
@@ -1041,12 +1225,17 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
   const hostHasAuthor = authorToks.some(t => host.includes(t));
   const threshold = Math.max(WEBSITE_MIN_SCORE, hostHasAuthor ? 0.60 : 0.70);
 
+  const borderline = validations.length > 1
+    ? Math.abs(validations[0].finalScore - validations[1].finalScore) <= SITE_SCORE_BAND
+    : false;
+
   if (top.finalScore >= threshold) {
     return {
       url: top.origin,
       debug: {
         threshold,
         picked: top,
+        borderline,
         candidates: validations.slice(0, 5),
       }
     };
@@ -1054,7 +1243,7 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
 
   return {
     url: null,
-    debug: { threshold, candidates: validations.slice(0, 5) }
+    debug: { threshold, borderline, candidates: validations.slice(0, 5) }
   };
 }
 
@@ -1082,11 +1271,23 @@ export default async function handler(req: any, res: any) {
         author_url: null,
         confidence: 0,
         error: "no_author_found",
-        _diag: { flags: { USE_SEARCH, CSE_KEY: !!CSE_KEY, CSE_ID: !!CSE_ID, WEBSITE_MIN_SCORE }, author: authorRes.debug }
+        _diag: {
+          flags: {
+            USE_SEARCH, CSE_KEY: !!CSE_KEY, CSE_ID: !!CSE_ID,
+            WEBSITE_MIN_SCORE, FLAG_EARLY_ACCEPT_PERSONAL_DOMAIN, FLAG_CAP_PROBES, FLAG_TOKEN_NAME_SCORE,
+            RESOLVER_VERSION
+          },
+          author: authorRes.debug
+        }
       });
     }
 
     const siteRes = await resolveWebsite(authorRes.primary, bookTitle);
+
+    // Borderline telemetry for authors too (near cutoff)
+    const nearAuthorCutoff = authorRes.ranked.length > 1
+      ? Math.abs(authorRes.ranked[0].score - authorRes.ranked[1].score) <= AUTHOR_SCORE_BAND
+      : false;
 
     return res.status(200).json({
       book_title: bookTitle,
@@ -1098,7 +1299,12 @@ export default async function handler(req: any, res: any) {
       author_url: siteRes.url,
       confidence: siteRes.url ? 0.9 : 0,
       _diag: {
-        flags: { USE_SEARCH, CSE_KEY: !!CSE_KEY, CSE_ID: !!CSE_ID, WEBSITE_MIN_SCORE },
+        flags: {
+          USE_SEARCH, CSE_KEY: !!CSE_KEY, CSE_ID: !!CSE_ID,
+          WEBSITE_MIN_SCORE, FLAG_EARLY_ACCEPT_PERSONAL_DOMAIN, FLAG_CAP_PROBES, FLAG_TOKEN_NAME_SCORE,
+          RESOLVER_VERSION
+        },
+        borderline: { author: nearAuthorCutoff, site: siteRes.debug?.borderline ?? false },
         author: authorRes.debug,
         site: siteRes.debug
       }
