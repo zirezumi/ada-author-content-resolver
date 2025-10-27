@@ -247,6 +247,20 @@ const ROLE_TAIL_TOKENS = new Set([
   "translated","translator","translators"
 ]);
 
+/** NEW: honorifics and post-nominals commonly glued to names */
+const HONORIFICS = new Set([
+  "mr","mrs","ms","miss","mx","dr","prof","prof.","sir","dame","lord","lady","rev","rabbi","imam"
+]);
+const DEGREE_OR_POSTNOMINAL = new Set([
+  "phd","ph.d.","md","m.d.","mba","jd","j.d.","mph","mphil","m.phil.",
+  "obe","cbe","dbe","kbe","frs","fba","frsl","frhists","dlitt","dphil","d.phil."
+]);
+
+/** NEW: prepositional/connector tails that usually start a clause after a name */
+const NAME_FOLLOW_TAIL = new Set([
+  "on","at","for","from","about","regarding","with","via","in","of","by","speaks","interview","talks","discusses"
+]);
+
 function stripTrailingGarbage(s: string): string {
   let parts = s.split(/\s+/);
   let changed = false;
@@ -290,6 +304,84 @@ function isOrgishName(name: string): boolean {
 }
 
 /* =============================
+   NEW: stronger clause/paren/honorific trimming for names
+   ============================= */
+function stripTrailingParenBlock(s: string): string {
+  return s.replace(/\s*[\(\[\{][^()\[\]{}]{0,80}[\)\]\}]\s*$/u, "").trim();
+}
+
+function stripParentheticalSuffixes(s: string): string {
+  let prev: string;
+  let cur = s.trim();
+  do {
+    prev = cur;
+    cur = stripTrailingParenBlock(cur);
+  } while (cur !== prev);
+  return cur;
+}
+
+function stripClauseAfterPunct(name: string): string {
+  let s = name.replace(/\s+[–—-]\s+(\S.*)$/u, (m, tail) => {
+    const first = String(tail).split(/\s+/)[0] || "";
+    if (NAME_FOLLOW_TAIL.has(first.toLowerCase())) return "";
+    if (/^[a-z]/.test(first)) return "";
+    return m;
+  }).trim();
+
+  s = s.replace(/\s*,\s+(\S.*)$/u, (m, tail) => {
+    const first = String(tail).split(/\s+/)[0] || "";
+    if (NAME_FOLLOW_TAIL.has(first.toLowerCase())) return "";
+    if (/^(author|writer|editor|journalist|historian|novelist)\b/i.test(tail)) return "";
+    return m;
+  }).trim();
+
+  return s;
+}
+
+function stripHonorificsAndPostnominals(s: string): string {
+  let parts = s.split(/\s+/).filter(Boolean);
+  while (parts.length > 0 && HONORIFICS.has(parts[0].toLowerCase().replace(/\.$/, ""))) {
+    parts.shift();
+  }
+  while (parts.length > 1) {
+    const last = parts[parts.length - 1];
+    const low = last.toLowerCase();
+    if (isSuffix(last)) break;
+    if (DEGREE_OR_POSTNOMINAL.has(low.replace(/\.$/, ""))) { parts.pop(); continue; }
+    if (/^(?:19|20)\d{2}$/.test(low) || /^@\w{2,}$/.test(last)) { parts.pop(); continue; }
+    break;
+  }
+  return parts.join(" ");
+}
+
+function stripTrailingGarbageStrong(s: string): string {
+  let out = s.trim();
+  out = stripParentheticalSuffixes(out);
+  out = stripClauseAfterPunct(out);
+  out = stripHonorificsAndPostnominals(out);
+  out = stripTrailingGarbage(out);    // existing trimming of garbage/adverbs/roles
+  out = stripTrailingParenBlock(out); // one more safety pass
+  return out.trim();
+}
+
+function trimToBestNamePrefix(s: string): string {
+  const parts = s.split(/\s+/).filter(Boolean);
+  const maxLen = Math.min(6, parts.length);
+  let best = s;
+  let bestScore = nameLikeness(s);
+
+  for (let len = 2; len <= maxLen; len++) {
+    const cand = parts.slice(0, len).join(" ");
+    const sc = nameLikeness(cand);
+    if (sc > bestScore + 0.04 || (Math.abs(sc - bestScore) <= 0.04 && cand.split(" ").length > best.split(" ").length)) {
+      best = cand;
+      bestScore = sc;
+    }
+  }
+  return best;
+}
+
+/* =============================
    Clean + validate a candidate
    ============================= */
 function normalizeNameCandidate(raw: string, title: string): string | null {
@@ -298,37 +390,29 @@ function normalizeNameCandidate(raw: string, title: string): string | null {
     .replace(/[.,;:–—-]+$/g, "")
     .replace(/\s+/g, " ");
 
+  // scrub token punctuation
   s = s.split(/\s+/).map(tok => tok.replace(/[.,;:]+$/g, "")).join(" ");
 
-  // NEW: remove role artifacts and then garbage tails
+  // NEW stronger cleanup sequence
   s = cleanRoleArtifacts(s);
-  s = stripTrailingGarbage(s);
+  s = stripTrailingGarbageStrong(s);
+  s = trimToBestNamePrefix(s);
 
   // Hard reject organizations / imprints
   if (isOrgishName(s)) return null;
 
-  // Early reject for common-word pairs (subtitle artifacts)
+  // Early reject for common-word pairs (subtitle artifacts) and title echoes
   const partsEarly = s.split(/\s+/);
-  if (partsEarly.length === 2 && looksLikeCommonPair(s)) return null;
-
   const titleToks = tokens(title);
+  if (partsEarly.length === 2 && looksLikeCommonPair(s)) return null;
   if (titleToks.includes(s.toLowerCase())) return null;
-
-  // If it's a 2-word candidate and both words appear in the title, reject
   if (partsEarly.length === 2) {
     const overlap = partsEarly.filter(p => titleToks.includes(p.toLowerCase())).length;
     if (overlap === 2) return null;
   }
 
-  // Drop one trailing garbage token if present
-  const parts = s.split(" ");
-  const last = parts[parts.length - 1];
-  if (BAD_TAIL.has(last.toLowerCase()) || looksLikeAdverb(last) || ROLE_TAIL_TOKENS.has(last.toLowerCase())) {
-    if (parts.length >= 3) { parts.pop(); s = parts.join(" "); }
-  }
-
-  // Second pass strip + org re-check
-  s = stripTrailingGarbage(s);
+  // Second pass strong strip + org re-check
+  s = stripTrailingGarbageStrong(s);
   if (isOrgishName(s)) return null;
 
   return nameLikeness(s) >= 0.65 ? s : null;
@@ -480,7 +564,7 @@ function extractAuthorSignals(text: string, opts?: { booky?: boolean; title?: st
   const reAuthor = /\bAuthor:\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=[),.?:;!–—-]|\s|$)/gu;
   const reWritten = /\bwritten by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=[),.?:;!–—-]|\s|$)/gu;
 
-  // by A, B and C [with D]   (NOTE: we’ll post-clean role artifacts from each name)
+  // by A, B and C [with D]
   const reBylineBlock = /\bby\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*(?:\s*(?:,?\s*and\s+|&\s*)[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})?)(?:\s+with\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*)\b)?/gu;
 
   // role-specific
