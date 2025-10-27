@@ -10,6 +10,7 @@
  * - Versioned LRU caches for Google CSE queries, title expansion, and site validations
  * - Borderline telemetry in _diag for observability
  * - Hardened name-boundary detection and tail cleanup (prevents “Malcolm Gladwell Due”)
+ * - NEW: CSE name-frequency boost + "TITLE — Name" heuristic for author inference
  */
 
 /* =============================
@@ -20,7 +21,7 @@ export const config = { runtime: "nodejs" } as const;
 /* =============================
    Build/logic versioning (for caches)
    ============================= */
-const RESOLVER_VERSION = process.env.RESOLVER_VERSION ?? "2025-10-26-b";
+const RESOLVER_VERSION = process.env.RESOLVER_VERSION ?? "2025-10-26-c";
 
 /* =============================
    Flags / Tunables (ENV)
@@ -67,6 +68,14 @@ const PLATFORM_HOSTS = [
   "linktr.ee","beacons.ai","instagram.com","facebook.com","x.com","twitter.com",
   "youtube.com","tiktok.com","soundcloud.com"
 ];
+
+/* ===== NEW: CSE name-frequency tunables ===== */
+const CSE_NAME_FREQ_MIN = Number(process.env.CSE_NAME_FREQ_MIN ?? 3);   // min repeated hits to count
+const CSE_NAME_FREQ_BASE = Number(process.env.CSE_NAME_FREQ_BASE ?? 0.6);
+const CSE_NAME_FREQ_SCALE = Number(process.env.CSE_NAME_FREQ_SCALE ?? 0.35);
+const CSE_NAME_FIELD_W = {
+  title: 1.0, og: 0.9, snippet: 0.5, host: 0.9
+} as const;
 
 /* =============================
    Auth
@@ -185,9 +194,9 @@ async function googleCSE(query: string, num = 10): Promise<any[]> {
 
   const resp = await fetchWithRetryAbort(url.toString(), undefined, FETCH_TIMEOUT_GENERAL_MS, FETCH_RETRY_ON_ABORT);
   if (!resp?.ok) {
-    const text = await (resp as any)?.text?.();
+    const text = await resp?.text?.();
     lruCSE.set(key, { value: [], expires: now + CACHE_TTL_NEG_MS, neg: true });
-    throw new Error(`cse_http_${(resp as any)?.status}: ${text || ""}`.slice(0, 240));
+    throw new Error(`cse_http_${resp?.status}: ${text || ""}`.slice(0, 240));
   }
   const data: any = await resp.json();
   const items = Array.isArray(data?.items) ? data.items : [];
@@ -650,6 +659,9 @@ const RE_FOREWORD_BY = /\bforeword by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0
 const RE_ILLUSTRATED_BY = /\billustrated by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*(?:\s*(?:,?\s*and\s+|&\s*)[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})?)/gu;
 const RE_LAST_FIRST = /\b([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)\b(?!\s*(?:and|or|&|,))/gu;
 
+/* NEW: "TITLE — Name" pattern in titles */
+const RE_TITLE_DASH_NAME = /[-–—:]\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){1,3})\s*$/u;
+
 function extractAuthorSignals(text: string, opts?: { booky?: boolean; title?: string }): AuthorSignal[] {
   const out: AuthorSignal[] = [];
   const booky = !!opts?.booky;
@@ -723,6 +735,67 @@ function weightForSignal(sig: AuthorSignal, host: string, expandedMatch: boolean
   return w;
 }
 
+/* ===== NEW: helpers for global CSE name-frequency pass ===== */
+const RE_PROPER_SPAN = /\b([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){1,3})\b/gu;
+
+function capSpanCandidates(s: string): string[] {
+  const out: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = RE_PROPER_SPAN.exec(s))) out.push(m[1]);
+  return out;
+}
+
+function authorFromHost(host: string): string | null {
+  try {
+    const apex = apexOfHost(host);
+    const label = apex.split(".")[0]; // e.g. "paulahawkinsbooks"
+    if (!label) return null;
+    const cleaned = label.replace(/(?:books?|official|author|writer|press|media|blog|site|home)s?$/i, "");
+    if (!cleaned) return null;
+    const parts = cleaned.split(/[-_]/).filter(Boolean);
+    if (!parts.length) return null;
+    const joined = parts.join(" ");
+    const toks = joined.split(/\s+/).filter(Boolean);
+    const guess = toks.map(t => (t[0]?.toUpperCase() || "") + t.slice(1)).join(" ");
+    return guess.trim() || null;
+  } catch { return null; }
+}
+
+type NameFreqRow = { raw: string; weight: number; source: "title"|"og"|"snippet"|"host" };
+
+function harvestNameFreqFromItems(items: any[]): NameFreqRow[] {
+  const rows: NameFreqRow[] = [];
+  for (const it of items) {
+    const host = hostOf(it.link);
+    if (host) {
+      const guess = authorFromHost(host);
+      if (guess) rows.push({ raw: guess, weight: CSE_NAME_FIELD_W.host, source: "host" });
+    }
+    const title = typeof it.title === "string" ? cleanTitle(it.title) : "";
+    if (title) {
+      for (const span of capSpanCandidates(title)) {
+        rows.push({ raw: span, weight: CSE_NAME_FIELD_W.title, source: "title" });
+      }
+    }
+    const snippet = typeof it.snippet === "string" ? cleanTitle(it.snippet) : "";
+    if (snippet) {
+      for (const span of capSpanCandidates(snippet)) {
+        rows.push({ raw: span, weight: CSE_NAME_FIELD_W.snippet, source: "snippet" });
+      }
+    }
+    const mtList = Array.isArray(it.pagemap?.metatags) ? it.pagemap.metatags : [];
+    for (const mt of mtList) {
+      const og = (mt?.["og:title"] as string) || (mt?.title as string);
+      if (typeof og === "string") {
+        for (const span of capSpanCandidates(cleanTitle(og))) {
+          rows.push({ raw: span, weight: CSE_NAME_FIELD_W.og, source: "og" });
+        }
+      }
+    }
+  }
+  return rows;
+}
+
 async function resolveAuthor(bookTitle: string): Promise<{
   primary: string | null;
   coAuthors: string[];
@@ -782,6 +855,7 @@ async function resolveAuthor(bookTitle: string): Promise<{
     }
     const expandedMatch = candidateTitles.some(t => normalizeCompareTitle(t) === normalizeCompareTitle(titleForSearch));
 
+    // Standard signal extraction
     const sigs = extractAuthorSignals(haystack, { booky: mtIsBook, title: titleForSearch });
 
     for (const sig of sigs) {
@@ -800,6 +874,41 @@ async function resolveAuthor(bookTitle: string): Promise<{
       if (sig.kind === "author_label" || sig.kind === "written_by") cur.highSignals += 1;
       aggs.set(normed, cur);
     }
+
+    // NEW: "TITLE — Name" heuristic from titles
+    const titleLike = (typeof it.title === "string" ? it.title : "");
+    const dashM = titleLike.match(RE_TITLE_DASH_NAME);
+    if (dashM) {
+      const cand = normalizeNameCandidate(dashM[1], titleForSearch);
+      if (cand) {
+        const cur = aggs.get(cand) || { score: 0, roles: {}, positions: [], highSignals: 0 };
+        const w = 0.7;
+        cur.score += w;
+        cur.roles["title_dash_name"] = (cur.roles["title_dash_name"] || 0) + w;
+        aggs.set(cand, cur);
+      }
+    }
+  }
+
+  // ===== NEW: Global CSE name-frequency boost =====
+  const freqRows = harvestNameFreqFromItems(items);
+  const freqMap = new Map<string, { score: number, hits: number }>();
+  for (const r of freqRows) {
+    const normed = normalizeNameCandidate(stripSiteSuffix(r.raw), bookTitle);
+    if (!normed) continue;
+    const cur = freqMap.get(normed) || { score: 0, hits: 0 };
+    cur.score += r.weight;
+    cur.hits += 1;
+    freqMap.set(normed, cur);
+  }
+  for (const [name, { score: s, hits }] of freqMap) {
+    if (hits < CSE_NAME_FREQ_MIN) continue;
+    const boost = CSE_NAME_FREQ_BASE + CSE_NAME_FREQ_SCALE * Math.log1p(s);
+    const cur = aggs.get(name) || { score: 0, roles: {}, positions: [], highSignals: 0 };
+    cur.score += boost;
+    cur.roles["cse_name_freq"] = (cur.roles["cse_name_freq"] || 0) + boost;
+    if (hits >= CSE_NAME_FREQ_MIN + 2) cur.highSignals += 1;
+    aggs.set(name, cur);
   }
 
   if (aggs.size === 0) {
@@ -833,7 +942,6 @@ async function resolveAuthor(bookTitle: string): Promise<{
       return a.name.localeCompare(b.name);
     });
 
-    // Find shortest; if it lacks keepable suffix but a longer same-root has it, pick that longer
     let canonical = sorted[0].name;
     const withSuffix = arr.find(e => endsWithKeepableSuffix(e.name));
     if (withSuffix) {
@@ -842,7 +950,6 @@ async function resolveAuthor(bookTitle: string): Promise<{
       if (base === sufBase) canonical = withSuffix.name;
     }
 
-    // Sum scores across near-duplicates (prefix / suffix variants)
     const canonLow = canonical.toLowerCase();
     let score = 0;
     let high = 0;
@@ -1030,7 +1137,6 @@ function isPlatformHost(host: string): boolean {
 }
 
 function isPersonalHostForAuthor(host: string, author: string): boolean {
-  // e.g., cherylstrayed.com, paula-hawkins.net
   const apex = apexOfHost(host);
   if (isPlatformHost(host)) return false;
   const aToks = tokens(author).filter(t => t.length > 1);
@@ -1108,7 +1214,6 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
   const topFew = candidates
     .sort((a, b) => {
       if (b.urlScore !== a.urlScore) return b.urlScore - a.urlScore;
-      // deterministic tie-break: personal host > non-personal > platform, then lexicographic
       const ap = domainPrior(a.urlObj.host, author);
       const bp = domainPrior(b.urlObj.host, author);
       if (bp !== ap) return bp - ap;
@@ -1131,24 +1236,24 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
   } else {
     for (const c of topFew) {
       const origin = c.urlObj.origin;
+      const paths: string[] = [];
+      paths.push(...PROBE_PATHS_BASE);
+
       const samples: Array<{ path: string; contentScore: number }> = [];
 
-      // probe "/"
       const homeText = await fetchPageText(origin, FETCH_TIMEOUT_SAMPLE_MS);
       let bestContent = contentSignalsForSite(homeText, author, bookTitle);
       samples.push({ path: "/", contentScore: bestContent });
 
-      // probe "/about"
-      const aboutText = await fetchPageText(origin + "/about", FETCH_TIMEOUT_SAMPLE_MS);
-      const aboutScore = contentSignalsForSite(aboutText, author, bookTitle);
-      bestContent = Math.max(bestContent, aboutScore);
-      samples.push({ path: "/about", contentScore: aboutScore });
-
-      // early-accept on strong personal domains with signals
       const host = new URL(origin).host.toLowerCase();
       const mayEarlyAccept =
         FLAG_EARLY_ACCEPT_PERSONAL_DOMAIN &&
         isPersonalHostForAuthor(host, author);
+
+      const aboutText = await fetchPageText(origin + "/about", FETCH_TIMEOUT_SAMPLE_MS);
+      const aboutScore = contentSignalsForSite(aboutText, author, bookTitle);
+      bestContent = Math.max(bestContent, aboutScore);
+      samples.push({ path: "/about", contentScore: aboutScore });
 
       let earlyAccepted = false;
       if (mayEarlyAccept) {
@@ -1157,42 +1262,45 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
           new RegExp(`\\b${norm(author).replace(/\s+/g, "\\s+")}\\b`, "i").test(aboutText);
 
         const hasAboutOrBooksSignal =
+          /\/about\b/i.test("/about") ||
           /\b(about|bio|books|works|author)\b/i.test(homeText + " " + aboutText);
 
-        if (authorNameExact && hasAboutOrBooksSignal && bestContent >= 0.35) {
-          earlyAccepted = true;
-        }
-      }
-
-      // Optional third probe
-      if (!earlyAccepted && FLAG_CAP_PROBES && bestContent < 0.85) {
-        const text = await fetchPageText(origin + "/books", FETCH_TIMEOUT_SAMPLE_MS);
-        const s = contentSignalsForSite(text, author, bookTitle);
-        bestContent = Math.max(bestContent, s);
-        samples.push({ path: "/books", contentScore: s });
-      }
-
-      // Fallback site queries if weak
-      if (!earlyAccepted && bestContent < 0.5) {
-        for (const q of [`"${bookTitle}" site:${c.urlObj.host}`, `"${author}" site:${c.urlObj.host}`]) {
-          const siteHits = await googleCSE(q, 3);
-          const firstHit = siteHits?.find(h => {
-            try { return new URL(h.link).host === c.urlObj.host; } catch { return false; }
-          });
-          if (firstHit) {
-            const t = await fetchPageText(firstHit.link, FETCH_TIMEOUT_SAMPLE_MS);
-            const s = contentSignalsForSite(t, author, bookTitle);
-            bestContent = Math.max(bestContent, s);
-            samples.push({ path: new URL(firstHit.link).pathname, contentScore: s });
-            if (bestContent >= 0.85) break;
+        if (authorNameExact && hasAboutOrBooksSignal) {
+          if (bestContent >= 0.35) {
+            earlyAccepted = true;
           }
         }
       }
 
-      // Compose final score
+      if (!earlyAccepted) {
+        for (const p of PROBE_PATHS_FALLBACK) {
+          if (!FLAG_CAP_PROBES) break;
+          if (bestContent >= 0.85) break;
+          const text = await fetchPageText(origin + p, FETCH_TIMEOUT_SAMPLE_MS);
+          const s = contentSignalsForSite(text, author, bookTitle);
+          bestContent = Math.max(bestContent, s);
+          samples.push({ path: p, contentScore: s });
+        }
+
+        if (bestContent < 0.5) {
+          for (const q of [`"${bookTitle}" site:${c.urlObj.host}`, `"${author}" site:${c.urlObj.host}`]) {
+            const siteHits = await googleCSE(q, 3);
+            const firstHit = siteHits?.find(h => {
+              try { return new URL(h.link).host === c.urlObj.host; } catch { return false; }
+            });
+            if (firstHit) {
+              const t = await fetchPageText(firstHit.link, FETCH_TIMEOUT_SAMPLE_MS);
+              const s = contentSignalsForSite(t, author, bookTitle);
+              bestContent = Math.max(bestContent, s);
+              samples.push({ path: new URL(firstHit.link).pathname, contentScore: s });
+              if (bestContent >= 0.85) break;
+            }
+          }
+        }
+      }
+
       let finalScore = 0.45 * c.urlScore + 0.55 * bestContent;
 
-      // Lift early-accepted personal domains to win near-ties
       if (earlyAccepted) {
         finalScore = Math.max(finalScore, WEBSITE_MIN_SCORE + DOMAIN_PRIOR_DELTA);
       }
@@ -1210,7 +1318,6 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     lruSiteValidation.set(cacheK, { value: validations, expires: now + CACHE_TTL_POS_MS });
   }
 
-  // Deterministic sort: by finalScore, then domain prior, then origin
   validations.sort((a, b) => {
     if (b.finalScore !== a.finalScore) return b.finalScore - a.finalScore;
     const ap = domainPrior(new URL(a.origin).host, author);
@@ -1219,7 +1326,6 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     return a.origin.localeCompare(b.origin);
   });
 
-  // Apply domain prior only on ties/near-ties
   if (validations.length >= 2) {
     const a = validations[0];
     const b = validations[1];
@@ -1300,7 +1406,6 @@ export default async function handler(req: any, res: any) {
 
     const siteRes = await resolveWebsite(authorRes.primary, bookTitle);
 
-    // Borderline telemetry for authors too (near cutoff)
     const nearAuthorCutoff = authorRes.ranked.length > 1
       ? Math.abs(authorRes.ranked[0].score - authorRes.ranked[1].score) <= AUTHOR_SCORE_BAND
       : false;
@@ -1310,8 +1415,8 @@ export default async function handler(req: any, res: any) {
       primary_author: authorRes.primary,
       co_authors: authorRes.coAuthors,
       authors_ranked: authorRes.ranked,
-      inferred_author: authorRes.primary,          // backward-compat
-      author_confidence: authorRes.confidence,     // backward-compat
+      inferred_author: authorRes.primary,
+      author_confidence: authorRes.confidence,
       author_url: siteRes.url,
       confidence: siteRes.url ? 0.9 : 0,
       _diag: {
