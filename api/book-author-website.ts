@@ -7,6 +7,35 @@
 export const config = { runtime: "nodejs" } as const;
 
 /* =============================
+   Perf helpers (memo + concurrency)
+   ============================= */
+function memoize1<T extends (a: string) => any>(fn: T, max = 1000): T {
+  const m = new Map<string, any>();
+  return ((a: string) => {
+    if (m.has(a)) return m.get(a);
+    const v = fn(a);
+    m.set(a, v);
+    if (m.size > max) {
+      const k = m.keys().next().value;
+      m.delete(k);
+    }
+    return v;
+  }) as T;
+}
+
+function pLimit(n: number) {
+  const q = new Set<Promise<any>>();
+  return async <R>(fn: () => Promise<R>): Promise<R> => {
+    while (q.size >= n) {
+      await Promise.race(q);
+    }
+    const p = fn().finally(() => q.delete(p));
+    q.add(p);
+    return p;
+  };
+}
+
+/* =============================
    Auth
    ============================= */
 const AUTH_SECRETS: string[] = (process.env.AUTHOR_UPDATES_SECRET || "")
@@ -66,6 +95,8 @@ async function googleCSE(query: string, num = 10): Promise<any[]> {
   url.searchParams.set("cx", CSE_ID);
   url.searchParams.set("q", query);
   url.searchParams.set("num", String(num));
+  // Perf: only the fields we actually read
+  url.searchParams.set("fields", "items(link,title,snippet,mime,pagemap/metatags)");
 
   const resp = await fetchWithTimeout(url.toString());
   if (!resp?.ok) {
@@ -79,7 +110,7 @@ async function googleCSE(query: string, num = 10): Promise<any[]> {
 /* =============================
    Utils
    ============================= */
-function tokens(s: string): string[] {
+function tokensRaw(s: string): string[] {
   return s
     .toLowerCase()
     .normalize("NFKC")
@@ -87,6 +118,7 @@ function tokens(s: string): string[] {
     .split(/\s+/)
     .filter(Boolean);
 }
+const tokens = memoize1(tokensRaw, 2000);
 
 function hostOf(link: string): string {
   try { return new URL(link).host.toLowerCase(); } catch { return ""; }
@@ -108,9 +140,10 @@ function tokenSet(s: string): Set<string> {
   );
 }
 
-function normalizeCompareTitle(s: string): string {
+function normalizeCompareTitleRaw(s: string): string {
   return s.toLowerCase().replace(/[\s“”"'-]+/g, " ").trim();
 }
+const normalizeCompareTitle = memoize1(normalizeCompareTitleRaw, 2000);
 
 /* Helpers for subtitle tail hygiene */
 function stripSiteSuffix(s: string): string {
@@ -167,7 +200,7 @@ function isParticle(tok: string): boolean { return MIDDLE_PARTICLES.has(tok.toLo
 function isSuffix(tok: string): boolean { return GENERATIONAL_SUFFIX.has(tok.toLowerCase()); }
 function looksLikeAdverb(tok: string): boolean { return /^[A-Za-z]{3,}ly$/u.test(tok); }
 
-function nameLikeness(raw: string): number {
+function nameLikenessRaw(raw: string): number {
   const s = raw.trim().replace(/\s+/g, " ");
   if (!s) return 0;
 
@@ -208,6 +241,7 @@ function nameLikeness(raw: string): number {
 
   return Math.max(0, Math.min(1, score));
 }
+const nameLikeness = memoize1(nameLikenessRaw, 4000);
 
 /** Obvious non-name words that often appear capitalized in subtitles/titles */
 const COMMON_TITLE_WORDS = new Set([
@@ -261,7 +295,7 @@ const NAME_FOLLOW_TAIL = new Set([
   "on","at","for","from","about","regarding","with","via","in","of","by","speaks","interview","talks","discusses"
 ]);
 
-function stripTrailingGarbage(s: string): string {
+function stripTrailingGarbageBase(s: string): string {
   let parts = s.split(/\s+/);
   let changed = false;
   while (parts.length > 1) {
@@ -284,7 +318,6 @@ function stripTrailingGarbage(s: string): string {
 /** Additional cleanup for role artifacts inside extracted names */
 function cleanRoleArtifacts(name: string): string {
   let s = name.replace(/\b(Illustrated|Illustrator|Edited|Editor|Foreword|Afterword|Introduction|Intro|Translated|Translator)s?\b$/i, "").trim();
-  // Also trim accidental mid-name connectors like trailing commas or dangles
   s = s.replace(/[,\s]+$/g, "").trim();
   return s;
 }
@@ -354,13 +387,22 @@ function stripHonorificsAndPostnominals(s: string): string {
   return parts.join(" ");
 }
 
-function stripTrailingGarbageStrong(s: string): string {
+function stripTrailingGarbageStrongRaw(s: string): string {
   let out = s.trim();
   out = stripParentheticalSuffixes(out);
   out = stripClauseAfterPunct(out);
   out = stripHonorificsAndPostnominals(out);
-  out = stripTrailingGarbage(out);    // existing trimming of garbage/adverbs/roles
-  out = stripTrailingParenBlock(out); // one more safety pass
+  out = stripTrailingGarbageBase(out);
+  out = stripTrailingParenBlock(out);
+  return out.trim();
+}
+const stripTrailingGarbageStrong = memoize1(stripTrailingGarbageStrongRaw, 4000);
+
+function stripTrailingGarbageLight(s: string): string {
+  // cheaper first pass: honorifics + basic garbage, no clause/paren loop
+  let out = s.trim();
+  out = stripHonorificsAndPostnominals(out);
+  out = stripTrailingGarbageBase(out);
   return out.trim();
 }
 
@@ -390,12 +432,12 @@ function normalizeNameCandidate(raw: string, title: string): string | null {
     .replace(/[.,;:–—-]+$/g, "")
     .replace(/\s+/g, " ");
 
-  // scrub token punctuation
-  s = s.split(/\s+/).map(tok => tok.replace(/[.,;:]+$/g, "")).join(" ");
+  // scrub token punctuation (single pass)
+  s = s.replace(/\b([^\s]+)[.,;:]+(?=\s|$)/g, "$1");
 
-  // NEW stronger cleanup sequence
+  // Stronger cleanup with cheaper first pass, maintains logic
   s = cleanRoleArtifacts(s);
-  s = stripTrailingGarbageStrong(s);
+  s = stripTrailingGarbageLight(s);
   s = trimToBestNamePrefix(s);
 
   // Hard reject organizations / imprints
@@ -411,7 +453,7 @@ function normalizeNameCandidate(raw: string, title: string): string | null {
     if (overlap === 2) return null;
   }
 
-  // Second pass strong strip + org re-check
+  // Second pass full strip + org re-check
   s = stripTrailingGarbageStrong(s);
   if (isOrgishName(s)) return null;
 
@@ -584,22 +626,22 @@ function extractAuthorSignals(text: string, opts?: { booky?: boolean; title?: st
     out.push({ kind: "written_by", name: cleanRoleArtifacts(m[1]) });
   }
   while ((m = reBylineBlock.exec(text))) {
-    const list = splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean);
+    const list = splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbageBase).filter(Boolean);
     list.forEach((n, i) => out.push({ kind: "byline_ordered", name: n, position: i }));
     if (m[2]) {
-      const withList = splitNamesList(m[2]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean);
+      const withList = splitNamesList(m[2]).map(cleanRoleArtifacts).map(stripTrailingGarbageBase).filter(Boolean);
       withList.forEach((n) => out.push({ kind: "with", name: n }));
     }
   }
   while ((m = reEditedBy.exec(text))) {
-    splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean)
+    splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbageBase).filter(Boolean)
       .forEach((n) => out.push({ kind: "editor", name: n }));
   }
   while ((m = reForewordBy.exec(text))) {
     out.push({ kind: "foreword", name: cleanRoleArtifacts(m[1]) });
   }
   while ((m = reIllustratedBy.exec(text))) {
-    splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean)
+    splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbageBase).filter(Boolean)
       .forEach((n) => out.push({ kind: "illustrator", name: n }));
   }
 
@@ -809,6 +851,12 @@ async function fetchPageText(url: string, ms = 5500): Promise<string> {
   try {
     const resp = await fetchWithTimeout(url, { headers: { Accept: "text/html,*/*" } }, ms);
     if (!resp?.ok) return "";
+    // Perf: fast-reject non-HTML and huge blobs
+    const ct = resp.headers.get("content-type") || "";
+    if (!/text\/html/i.test(ct)) return "";
+    const cl = Number(resp.headers.get("content-length") || 0);
+    if (cl && cl > MAX_BYTES * 3) return "";
+
     // stream and cap
     const reader = (resp as any).body?.getReader?.();
     if (!reader) return extractVisibleText(await resp.text());
@@ -959,17 +1007,19 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
   ];
 
   const candidates: Array<{ urlObj: URL; urlScore: number; fromQuery: string }> = [];
-  for (const q of queries) {
-    const items = await googleCSE(q, 10);
+  const seenHosts = new Set<string>();
+
+  const itemsLists = await Promise.all(queries.map(q => googleCSE(q, 10)));
+  for (let i = 0; i < queries.length; i++) {
+    const items = itemsLists[i] || [];
     for (const it of items) {
       let u: URL | null = null;
       try { u = new URL(it.link); } catch { continue; }
       const host = u.host.toLowerCase();
-      if (isBlockedHost(host)) continue;
+      if (isBlockedHost(host) || seenHosts.has(host)) continue;
+      seenHosts.add(host);
       const urlScore = scoreCandidateUrl(u, author);
-      if (!candidates.some(c => c.urlObj.host === u!.host)) {
-        candidates.push({ urlObj: u, urlScore, fromQuery: q });
-      }
+      candidates.push({ urlObj: u, urlScore, fromQuery: queries[i] });
     }
   }
 
@@ -990,6 +1040,8 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     fromQuery: string;
   }> = [];
 
+  const run = pLimit(4); // cap parallel fetches per site
+
   for (const c of topFew) {
     const origin = c.urlObj.origin;
     const paths = ["", "/books", "/book", "/works", "/publications", "/titles", "/about", "/bio"];
@@ -999,12 +1051,22 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     let bestContent = contentSignalsForSite(homeText, author, bookTitle);
     samples.push({ path: "/", contentScore: bestContent });
 
-    for (const p of paths.slice(1)) {
-      if (bestContent >= 0.85) break;
-      const text = await fetchPageText(origin + p);
-      const s = contentSignalsForSite(text, author, bookTitle);
-      bestContent = Math.max(bestContent, s);
-      samples.push({ path: p, contentScore: s });
+    // compute acceptance threshold once per host
+    const authorToks = tokens(author).filter(t => t.length > 2);
+    const hostHasAuthor = authorToks.some(t => c.urlObj.host.toLowerCase().includes(t));
+    const minAccept = Math.max(WEBSITE_MIN_SCORE, hostHasAuthor ? 0.60 : 0.70);
+
+    if (bestContent < Math.max(0.85, minAccept)) {
+      const fetches = paths.slice(1).map(p => run(async () => {
+        const text = await fetchPageText(origin + p);
+        const s = contentSignalsForSite(text, author, bookTitle);
+        return { path: p, s };
+      }));
+      const results = await Promise.all(fetches);
+      for (const { path, s } of results) {
+        if (s > bestContent) bestContent = s;
+        samples.push({ path, contentScore: s });
+      }
     }
 
     if (bestContent < 0.5) {
@@ -1035,10 +1097,10 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
   validations.sort((a, b) => b.finalScore - a.finalScore);
   const top = validations[0];
 
-  const authorToks = tokens(author).filter(t => t.length > 2);
+  const authorToks2 = tokens(author).filter(t => t.length > 2);
   const host = new URL(top.origin).host.toLowerCase();
-  const hostHasAuthor = authorToks.some(t => host.includes(t));
-  const threshold = Math.max(WEBSITE_MIN_SCORE, hostHasAuthor ? 0.60 : 0.70);
+  const hostHasAuthor2 = authorToks2.some(t => host.includes(t));
+  const threshold = Math.max(WEBSITE_MIN_SCORE, hostHasAuthor2 ? 0.60 : 0.70);
 
   if (top.finalScore >= threshold) {
     return {
