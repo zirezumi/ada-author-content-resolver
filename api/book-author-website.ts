@@ -113,21 +113,26 @@ type CacheVal<T> = { value: T; expires: number; neg?: boolean };
 class LRU<K, V> {
   private map = new Map<K, CacheVal<V>>();
   constructor(private max = 256) {}
+
   get(key: K): CacheVal<V> | undefined {
     const v = this.map.get(key);
     if (!v) return undefined;
-    // touch
+    // touch (move to most-recent)
     this.map.delete(key);
     this.map.set(key, v);
     return v;
   }
+
   set(key: K, val: CacheVal<V>): void {
     if (this.map.has(key)) this.map.delete(key);
     this.map.set(key, val);
+
     if (this.map.size > this.max) {
-      // delete LRU
-      const firstKey = this.map.keys().next().value;
-      this.map.delete(firstKey);
+      const it = this.map.keys().next();
+      if (!it.done) {
+        const firstKey = it.value as K; // guarded by !done
+        this.map.delete(firstKey);
+      }
     }
   }
 }
