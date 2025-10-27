@@ -672,15 +672,28 @@ function concatUint8(parts: Uint8Array[]): Uint8Array {
 }
 
 function extractVisibleText(html: string): string {
-  // keep meta/title content; strip scripts/styles
+  // keep meta/title content; also capture JSON-LD before stripping scripts
   const metaBits: string[] = [];
-  html.replace(/<meta\b[^>]*?(?:name|property)=["'](?:og:title|og:description|description|twitter:title|twitter:description)["'][^>]*?>/gi, (m) => {
-    const c = m.match(/\bcontent=["']([^"']+)["']/i)?.[1];
-    if (c) metaBits.push(c);
-    return m;
-  });
+
+  // META/TITLE
+  html.replace(
+    /<meta\b[^>]*?(?:name|property)=["'](?:og:title|og:description|description|twitter:title|twitter:description)["'][^>]*?>/gi,
+    (m) => {
+      const c = m.match(/\bcontent=["']([^"']+)["']/i)?.[1];
+      if (c) metaBits.push(c);
+      return m;
+    }
+  );
   const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? "";
 
+  // JSON-LD (Person/Book signals)
+  const jsonLdMatches = html.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
+  for (const block of jsonLdMatches) {
+    const inner = block.match(/<script[^>]*>([\s\S]*?)<\/script>/i)?.[1];
+    if (inner) metaBits.push(inner);
+  }
+
+  // Strip scripts/styles/comments/tags for visible text
   let txt = html
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
@@ -752,8 +765,34 @@ function contentSignalsForSite(text: string, author: string, bookTitle: string):
 }
 
 /* =============================
-   Phase 2: Resolve Website (URL + content validation)
+   Phase 2: Candidate URL scoring (helpers + threshold)
    ============================= */
+const BLOCKED_DOMAINS = [
+  "wikipedia.org","goodreads.com","google.com","books.google.com","reddit.com",
+  "amazon.","barnesandnoble.com","bookshop.org","penguinrandomhouse.com",
+  "harpercollins.com","simonandschuster.com","macmillan.com","hachettebookgroup.com",
+  "spotify.com","apple.com"
+];
+
+function isBlockedHost(host: string): boolean {
+  return BLOCKED_DOMAINS.some((d) => host.includes(d));
+}
+
+function scoreCandidateUrl(u: URL, author: string): number {
+  let score = 0;
+  const pathDepth = u.pathname.split("/").filter(Boolean).length;
+  if (pathDepth === 0) score += 0.5;
+  if (u.protocol === "https:") score += 0.1;
+
+  const toks = tokens(author).filter(t => t.length > 2);
+  const host = u.host.toLowerCase();
+  for (const t of toks) if (host.includes(t)) score += 0.4;
+
+  return Math.min(1, score);
+}
+
+// Minimum normalized score to accept a site (default 0.6)
+const WEBSITE_MIN_SCORE = Number(process.env.WEBSITE_MIN_SCORE ?? 0.6);
 
 async function resolveWebsite(author: string, bookTitle: string): Promise<{ url: string|null, debug: any }> {
   const queries = [
