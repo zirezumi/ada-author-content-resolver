@@ -16,7 +16,7 @@ function memoize1<T extends (a: string) => any>(fn: T, max = 1000): T {
     const v = fn(a);
     m.set(a, v);
     if (m.size > max) {
-      const first = m.keys().next();
+      const first = m.keys().next(); // IteratorResult<string>
       if (!first.done) m.delete(first.value);
     }
     return v;
@@ -1021,6 +1021,24 @@ const BLOCKED_DOMAINS = [
   "spotify.com","apple.com"
 ];
 
+// NEW: treat platform hosts slightly below personal sites in near ties
+const PLATFORM_HOSTS = [
+  "substack.com","medium.com","wordpress.com","blogspot.","tumblr.com",
+  "linktr.ee","about.me","notion.site","notion.so","square.site","wixsite.com",
+  "weebly.com","ghost.io"
+];
+
+function isPlatformHost(host: string): boolean {
+  const h = host.toLowerCase();
+  return PLATFORM_HOSTS.some(p => h.endsWith(p) || h.includes(p));
+}
+
+function isApexOrWww(host: string): boolean {
+  // treat apex or “www.” as more “official” than deep subdomains
+  const parts = host.split(".").filter(Boolean);
+  return parts.length <= 2 || (parts.length === 3 && parts[0] === "www");
+}
+
 function isBlockedHost(host: string): boolean {
   return BLOCKED_DOMAINS.some((d) => host.includes(d));
 }
@@ -1035,7 +1053,13 @@ function scoreCandidateUrl(u: URL, author: string): number {
   const host = u.host.toLowerCase();
   for (const t of toks) if (host.includes(t)) score += 0.4;
 
-  return Math.min(1, score);
+  // NEW: small preference for custom apex/www domains
+  if (isApexOrWww(host)) score += 0.05;
+
+  // NEW: small platform penalty (Substack/Medium/etc.)
+  if (isPlatformHost(host)) score -= 0.08;
+
+  return Math.max(0, Math.min(1, score));
 }
 
 // Minimum normalized score to accept a site (default 0.6)
@@ -1086,7 +1110,11 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
 
   for (const c of topFew) {
     const origin = c.urlObj.origin;
-    const paths = ["", "/books", "/book", "/works", "/publications", "/titles", "/about", "/bio"];
+    const paths = [
+      "", "/books", "/book", "/works", "/publications", "/titles", "/about", "/bio",
+      // NEW: common book pages for author sites
+      "/wild", "/books/wild"
+    ];
     const samples: Array<{ path: string; contentScore: number }> = [];
 
     const homeText = await fetchPageText(origin);
@@ -1125,7 +1153,13 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
       }
     }
 
-    const finalScore = 0.45 * c.urlScore + 0.55 * bestContent;
+    let finalScore = 0.45 * c.urlScore + 0.55 * bestContent;
+
+    // NEW: tiny dampener for platforms so a personal site can win close races
+    if (isPlatformHost(c.urlObj.host)) {
+      finalScore *= 0.98; // 2% nudge
+    }
+
     validations.push({
       origin,
       urlScore: c.urlScore,
@@ -1137,9 +1171,30 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
   }
 
   validations.sort((a, b) => b.finalScore - a.finalScore);
-  const top = validations[0];
 
+  // NEW: Prefer a confident personal (non-platform) site in a near tie
   const authorToks2 = tokens(author).filter(t => t.length > 2);
+  const personalCandidates = validations.filter(v => {
+    const h = new URL(v.origin).host.toLowerCase();
+    const hasAuthor = authorToks2.some(t => h.includes(t));
+    const hostHasAuthor = hasAuthor;
+    const thresholdLike = Math.max(WEBSITE_MIN_SCORE, hostHasAuthor ? 0.60 : 0.70);
+    return !isPlatformHost(h) && hasAuthor && v.contentScore >= Math.max(0.55, thresholdLike);
+  }).sort((a, b) => b.finalScore - a.finalScore);
+
+  let top = validations[0];
+  const topHost = new URL(top.origin).host.toLowerCase();
+  const topIsPlatform = isPlatformHost(topHost);
+
+  if (topIsPlatform && personalCandidates.length) {
+    const bestPersonal = personalCandidates[0];
+    const closeDelta = 0.12; // within ~12% feels like “close enough”
+    if ((bestPersonal.finalScore + 0.001) >= (top.finalScore - closeDelta)) {
+      top = bestPersonal;
+    }
+  }
+
+  // Compute threshold for the chosen 'top'
   const host = new URL(top.origin).host.toLowerCase();
   const hostHasAuthor2 = authorToks2.some(t => host.includes(t));
   const threshold = Math.max(WEBSITE_MIN_SCORE, hostHasAuthor2 ? 0.60 : 0.70);
