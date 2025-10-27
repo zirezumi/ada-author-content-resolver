@@ -166,6 +166,18 @@ const BAD_TAIL = new Set([
   "editorial","update","thread","blog","price"
 ]);
 
+/** Words that commonly start the next sentence/phrase; never part of a name tail */
+const CLAUSE_STARTERS = new Set([
+  // conjunctions / discourse markers
+  "due","because","however","but","so","and","therefore","meanwhile","moreover","furthermore",
+  "thus","then","hence","nevertheless","nonetheless","still","instead","besides","also",
+  // prepositions often starting clauses
+  "as","since","after","before","during","until","unless","whereas","while","when","once",
+  // pronouns / determiners that pop up next
+  "i","we","you","he","she","they","it","my","our","your","his","her","their","the","a","an","this","that","these","those"
+]);
+
+
 function isCasedWordToken(tok: string): boolean {
   return /^[A-Z][\p{L}’'-]*[A-Za-z]$/u.test(tok);
 }
@@ -257,12 +269,15 @@ function stripTrailingGarbage(s: string): string {
   let parts = s.split(/\s+/);
   let changed = false;
   while (parts.length > 1) {
-    const last = parts[parts.length - 1].toLowerCase();
+    const last = parts[parts.length - 1];
+    const lastL = last.toLowerCase();
+
     if (
-      NAME_TAIL_GARBAGE.has(last) ||
-      BAD_TAIL.has(last) ||
+      NAME_TAIL_GARBAGE.has(lastL) ||
+      BAD_TAIL.has(lastL) ||
+      ROLE_TAIL_TOKENS.has(lastL) ||
       looksLikeAdverb(last) ||
-      ROLE_TAIL_TOKENS.has(last)
+      CLAUSE_STARTERS.has(lastL) // NEW: pop “Due”, “Because”, “My”, “I”, etc.
     ) {
       parts.pop();
       changed = true;
@@ -271,6 +286,17 @@ function stripTrailingGarbage(s: string): string {
     break;
   }
   return changed ? parts.join(" ") : s;
+}
+
+function isBadTailWord(tok: string): boolean {
+  const t = tok.toLowerCase();
+  return (
+    NAME_TAIL_GARBAGE.has(t) ||
+    BAD_TAIL.has(t) ||
+    ROLE_TAIL_TOKENS.has(t) ||
+    CLAUSE_STARTERS.has(t) ||
+    looksLikeAdverb(tok)
+  );
 }
 
 /** Additional cleanup for role artifacts inside extracted names */
@@ -304,40 +330,70 @@ function normalizeNameCandidate(raw: string, title: string): string | null {
     .replace(/[.,;:–—-]+$/g, "")
     .replace(/\s+/g, " ");
 
+  // per-token punctuation trim
   s = s.split(/\s+/).map(tok => tok.replace(/[.,;:]+$/g, "")).join(" ");
 
-  // NEW: remove role artifacts and then garbage tails
+  // role and garbage cleanup first
   s = cleanRoleArtifacts(s);
   s = stripTrailingGarbage(s);
 
-  // Hard reject organizations / imprints
+  // Hard reject org-ish
   if (isOrgishName(s)) return null;
 
-  // Early reject for common-word pairs (subtitle artifacts)
+  // Early reject if it echoes the title too much
   const partsEarly = s.split(/\s+/);
-  if (partsEarly.length === 2 && looksLikeCommonPair(s)) return null;
-
   const titleToks = tokens(title);
+  if (partsEarly.length === 2 && looksLikeCommonPair(s)) return null;
   if (titleToks.includes(s.toLowerCase())) return null;
-
-  // If it's a 2-word candidate and both words appear in the title, reject
   if (partsEarly.length === 2) {
     const overlap = partsEarly.filter(p => titleToks.includes(p.toLowerCase())).length;
     if (overlap === 2) return null;
   }
 
-  // Drop one trailing garbage token if present
-  const parts = s.split(" ");
-  const last = parts[parts.length - 1];
-  if (BAD_TAIL.has(last.toLowerCase()) || looksLikeAdverb(last) || ROLE_TAIL_TOKENS.has(last.toLowerCase())) {
-    if (parts.length >= 3) { parts.pop(); s = parts.join(" "); }
+  // === NEW: evaluate name-like prefixes to avoid swallowing clause starters ===
+  const parts = s.split(/\s+/).filter(Boolean);
+  // only consider up to 4 tokens total; most human names fit here
+  const maxLen = Math.min(4, parts.length);
+
+  type Cand = { text: string; score: number };
+  const candidates: Cand[] = [];
+
+  for (let n = 2; n <= maxLen; n++) {
+    const pref = parts.slice(0, n);
+    const last = pref[pref.length - 1];
+
+    // the last token must look like a surname-ish token, not a clause starter/garbage/adverb
+    if (isBadTailWord(last)) continue;
+
+    // If 3rd/4th tokens exist, prefer if they are particles/suffixes or name-case
+    if (pref.length >= 3) {
+      const midOk = pref.slice(1, pref.length - 1).every(t => isParticle(t) || isCasedWordToken(t) || isSuffix(t));
+      if (!midOk) continue;
+    }
+
+    const text = pref.join(" ");
+    const score = nameLikeness(text);
+    candidates.push({ text, score });
   }
 
-  // Second pass strip + org re-check
-  s = stripTrailingGarbage(s);
-  if (isOrgishName(s)) return null;
+  // Fallback: if no valid prefixes were found (rare), revert to 2-token head
+  if (!candidates.length && parts.length >= 2) {
+    const text = parts.slice(0, 2).join(" ");
+    candidates.push({ text, score: nameLikeness(text) });
+  }
 
-  return nameLikeness(s) >= 0.65 ? s : null;
+  if (!candidates.length) return null;
+
+  candidates.sort((a, b) => b.score - a.score);
+  let best = candidates[0];
+
+  // Final safety belt: drop if below threshold, else run one more tail strip pass
+  if (best.score < 0.65) return null;
+
+  let out = stripTrailingGarbage(best.text);
+  if (isOrgishName(out)) return null;
+
+  return nameLikeness(out) >= 0.65 ? out : null;
 }
 
 /* =============================
