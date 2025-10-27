@@ -10,10 +10,10 @@ export const config = { runtime: "nodejs" } as const;
    Tunables (perf + behavior)
    ============================= */
 // Hard caps to avoid slowdowns from crawling
-const WEBSITE_FETCH_TIMEOUT_MS = Number(process.env.WEBSITE_FETCH_TIMEOUT_MS ?? 2500); // per-page timeout
-const WEBSITE_TOTAL_BUDGET_MS  = Number(process.env.WEBSITE_TOTAL_BUDGET_MS ?? 6000); // total budget per request for resolveWebsite
-const WEBSITE_MAX_CANDIDATES   = Number(process.env.WEBSITE_MAX_CANDIDATES ?? 4);    // only validate top-N domains
-const WEBSITE_MAX_PATHS_PER    = Number(process.env.WEBSITE_MAX_PATHS_PER ?? 3);     // max paths per domain (including "/")
+const WEBSITE_FETCH_TIMEOUT_MS = Number(process.env.WEBSITE_FETCH_TIMEOUT_MS ?? 2000); // per-page timeout
+const WEBSITE_TOTAL_BUDGET_MS  = Number(process.env.WEBSITE_TOTAL_BUDGET_MS ?? 5000); // total budget per request for resolveWebsite
+const WEBSITE_MAX_CANDIDATES   = Number(process.env.WEBSITE_MAX_CANDIDATES ?? 3);    // only validate top-N domains
+const WEBSITE_MAX_PATHS_PER    = Number(process.env.WEBSITE_MAX_PATHS_PER ?? 2);     // max paths per domain (including "/")
 const WEBSITE_EARLY_SATURATE   = Number(process.env.WEBSITE_EARLY_SATURATE ?? 0.85); // early exit threshold for content score
 const WEBSITE_SITEQUERY_LIMIT  = Number(process.env.WEBSITE_SITEQUERY_LIMIT ?? 1);    // hits to try when doing site: query fallback
 const ENABLE_IN_MEMORY_CACHE   = (process.env.WEBSITE_ENABLE_CACHE ?? "true").toLowerCase() === "true";
