@@ -633,79 +633,245 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
 }
 
 /* =============================
-   Phase 2: Resolve Website (normalized 0–1 scoring + threshold)
+   Page fetching + content validation helpers
    ============================= */
-const BLOCKED_DOMAINS = [
-  "wikipedia.org","goodreads.com","google.com","books.google.com","reddit.com",
-  "amazon.","barnesandnoble.com","bookshop.org","penguinrandomhouse.com",
-  "harpercollins.com","simonandschuster.com","macmillan.com","hachettebookgroup.com",
-  "spotify.com","apple.com"
-];
 
-function isBlockedHost(host: string): boolean {
-  return BLOCKED_DOMAINS.some((d) => host.includes(d));
+const MAX_BYTES = 400_000; // ~400KB safety cap to avoid huge pages
+
+async function fetchPageText(url: string, ms = 5500): Promise<string> {
+  try {
+    const resp = await fetchWithTimeout(url, { headers: { Accept: "text/html,*/*" } }, ms);
+    if (!resp?.ok) return "";
+    // stream and cap
+    const reader = resp.body?.getReader();
+    if (!reader) return await resp.text();
+    let received = 0;
+    const chunks: Uint8Array[] = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        received += value.byteLength;
+        chunks.push(value);
+        if (received >= MAX_BYTES) break;
+      }
+    }
+    const buf = new TextDecoder("utf-8", { fatal: false }).decode(concatUint8(chunks));
+    return extractVisibleText(buf);
+  } catch {
+    return "";
+  }
 }
 
-function scoreCandidateUrl(u: URL, author: string): number {
-  let score = 0;
-  const pathDepth = u.pathname.split("/").filter(Boolean).length;
-  if (pathDepth === 0) score += 0.5;
-  if (u.protocol === "https:") score += 0.1;
+function concatUint8(parts: Uint8Array[]): Uint8Array {
+  const size = parts.reduce((n, p) => n + p.byteLength, 0);
+  const out = new Uint8Array(size);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.byteLength; }
+  return out;
+}
 
-  const toks = tokens(author).filter(t => t.length > 2);
-  const host = u.host.toLowerCase();
-  for (const t of toks) if (host.includes(t)) score += 0.4;
+function extractVisibleText(html: string): string {
+  // keep meta/title content; strip scripts/styles
+  const metaBits: string[] = [];
+  html.replace(/<meta\b[^>]*?(?:name|property)=["'](?:og:title|og:description|description|twitter:title|twitter:description)["'][^>]*?>/gi, (m) => {
+    const c = m.match(/\bcontent=["']([^"']+)["']/i)?.[1];
+    if (c) metaBits.push(c);
+    return m;
+  });
+  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? "";
 
+  let txt = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const metaJoined = [title, ...metaBits].filter(Boolean).join(" • ");
+  return [metaJoined, txt].filter(Boolean).join(" • ");
+}
+
+function norm(s: string): string {
+  return (s || "").toLowerCase().normalize("NFKC");
+}
+
+function tokenBag(s: string): string[] {
+  return norm(s).replace(/[^\p{L}\p{N}\s'-]/gu, " ").split(/\s+/).filter(Boolean);
+}
+
+function overlapRatio(a: string[], b: string[]): number {
+  const A = new Set(a.filter(t => t.length > 2));
+  const B = new Set(b.filter(t => t.length > 2));
+  if (!A.size || !B.size) return 0;
+  let inter = 0;
+  for (const t of A) if (B.has(t)) inter++;
+  return inter / Math.min(A.size, B.size);
+}
+
+function hasJsonLdPersonOrBook(htmlOrText: string, author: string, bookTitle: string): { person: boolean; book: boolean } {
+  // quick-and-dirty detection without a full HTML parser
+  const h = htmlOrText;
+  const a = norm(author).replace(/"/g, '\\"');
+  const b = norm(bookTitle).replace(/"/g, '\\"');
+
+  const hasPerson = /"@type"\s*:\s*"(?:Person|Author)"/i.test(h) && new RegExp(`"name"\\s*:\\s*"?${a.replace(/\s+/g, "\\s+")}"?`, "i").test(h);
+  const hasBook = /"@type"\s*:\s*"(?:Book|CreativeWork)"/i.test(h) && new RegExp(`"name"\\s*:\\s*".{0,20}${b.slice(0, 12).replace(/\s+/g, "\\s+")}.{0,20}"`, "i").test(h);
+  return { person: !!hasPerson, book: !!hasBook };
+}
+
+function contentSignalsForSite(text: string, author: string, bookTitle: string): number {
+  // weighted content-score 0..1
+  const a = norm(author);
+  const aFirst = a.split(/\s+/)[0] || "";
+  const aLast = a.split(/\s+/).slice(-1)[0] || "";
+
+  const bag = tokenBag(text);
+  const bookOverlap = overlapRatio(bag, tokenBag(bookTitle)); // 0..1
+  const aExact = new RegExp(`\\b${a.replace(/\s+/g, "\\s+")}\\b`, "i").test(text) ? 1 : 0;
+  const aboutName = new RegExp(`\\babout\\s+${a.replace(/\s+/g, "\\s+")}\\b`, "i").test(text) ? 1 : 0;
+  const byName = new RegExp(`\\bby\\s+${a.replace(/\s+/g, "\\s+")}\\b`, "i").test(text) ? 1 : 0;
+
+  const { person, book } = hasJsonLdPersonOrBook(text, author, bookTitle);
+
+  // penalties for obvious wrong-person cues when NO book signals are present
+  const sporty = /\b(olympian|olympics|ski|nfl|nba|cyclist|triathlete)\b/i.test(text) ? 1 : 0;
+  const altCareerPenalty = (sporty && bookOverlap < 0.2) ? 0.25 : 0;
+
+  // combine
+  let score =
+    0.45 * Math.min(1, bookOverlap * 1.5) +
+    0.2 * aExact +
+    0.1 * (aboutName || byName ? 1 : 0) +
+    0.15 * (person ? 1 : 0) +
+    0.1 * (book ? 1 : 0);
+
+  score = Math.max(0, score - altCareerPenalty);
   return Math.min(1, score);
 }
 
-// Minimum normalized score to accept a site (default 0.6)
-const WEBSITE_MIN_SCORE = Number(process.env.WEBSITE_MIN_SCORE ?? 0.6);
+
+/* =============================
+   Phase 2: Resolve Website (URL + content validation)
+   ============================= */
 
 async function resolveWebsite(author: string, bookTitle: string): Promise<{ url: string|null, debug: any }> {
   const queries = [
-    `"${author}" author website`,
     `"${author}" official site`,
+    `"${author}" author website`,
     `"${bookTitle}" "${author}" author website`,
   ];
 
+  // First pass: get a few distinct domains
+  const candidates: Array<{ urlObj: URL; urlScore: number; fromQuery: string }> = [];
   for (const q of queries) {
     const items = await googleCSE(q, 10);
-    const filtered = items.filter(it => {
-      try {
-        const host = new URL(it.link).host.toLowerCase();
-        return !isBlockedHost(host);
-      } catch { return false; }
-    });
-
-    if (!filtered.length) continue;
-
-    const ranked = filtered
-      .map(it => {
-        const urlObj = new URL(it.link);
-        const score = scoreCandidateUrl(urlObj, author);
-        return { it, urlObj, score };
-      })
-      .sort((a, b) => b.score - a.score);
-
-    const top = ranked[0];
-
-    if (top.score >= WEBSITE_MIN_SCORE) {
-      return {
-        url: top.urlObj.origin,
-        debug: {
-          query: q,
-          threshold: WEBSITE_MIN_SCORE,
-          topScore: top.score,
-          picked: top.it,
-          candidates: ranked.slice(0, 5).map(r => ({ url: r.urlObj.href, score: r.score }))
-        }
-      };
+    for (const it of items) {
+      let u: URL | null = null;
+      try { u = new URL(it.link); } catch { continue; }
+      const host = u.host.toLowerCase();
+      if (isBlockedHost(host)) continue;
+      const urlScore = scoreCandidateUrl(u, author);
+      // keep only one per domain
+      if (!candidates.some(c => c.urlObj.host === u!.host)) {
+        candidates.push({ urlObj: u, urlScore, fromQuery: q });
+      }
     }
   }
 
-  return { url: null, debug: { tried: queries, threshold: WEBSITE_MIN_SCORE } };
+  if (!candidates.length) {
+    return { url: null, debug: { tried: queries, threshold: WEBSITE_MIN_SCORE } };
+  }
+
+  // Validate content on top few domains
+  const topFew = candidates
+    .sort((a, b) => b.urlScore - a.urlScore)
+    .slice(0, 5);
+
+  const validations: Array<{
+    origin: string;
+    urlScore: number;
+    contentScore: number;
+    finalScore: number;
+    samples: Array<{ path: string; contentScore: number }>;
+    fromQuery: string;
+  }> = [];
+
+  for (const c of topFew) {
+    const origin = c.urlObj.origin;
+    const paths = ["", "/books", "/book", "/works", "/publications", "/titles", "/about", "/bio"];
+    const samples: Array<{ path: string; contentScore: number }> = [];
+
+    // homepage first
+    const homeText = await fetchPageText(origin);
+    let bestContent = contentSignalsForSite(homeText, author, bookTitle);
+    samples.push({ path: "/", contentScore: bestContent });
+
+    // try a few common paths until score saturates
+    for (const p of paths.slice(1)) {
+      if (bestContent >= 0.85) break; // good enough
+      const text = await fetchPageText(origin + p);
+      const s = contentSignalsForSite(text, author, bookTitle);
+      bestContent = Math.max(bestContent, s);
+      samples.push({ path: p, contentScore: s });
+    }
+
+    // If still weak, try a targeted site: query for the BOOK TITLE on this domain and fetch the first hit
+    if (bestContent < 0.5) {
+      const siteQuery = `"${bookTitle}" site:${c.urlObj.host}`;
+      const siteHits = await googleCSE(siteQuery, 3);
+      const firstHit = siteHits?.find(h => {
+        try { return new URL(h.link).host === c.urlObj.host; } catch { return false; }
+      });
+      if (firstHit) {
+        const t = await fetchPageText(firstHit.link);
+        const s = contentSignalsForSite(t, author, bookTitle);
+        bestContent = Math.max(bestContent, s);
+        samples.push({ path: new URL(firstHit.link).pathname, contentScore: s });
+      }
+    }
+
+    // Combine URL & content scores
+    const finalScore = 0.45 * c.urlScore + 0.55 * bestContent;
+    validations.push({
+      origin,
+      urlScore: c.urlScore,
+      contentScore: bestContent,
+      finalScore,
+      samples,
+      fromQuery: c.fromQuery,
+    });
+  }
+
+  // pick best validated site
+  validations.sort((a, b) => b.finalScore - a.finalScore);
+  const top = validations[0];
+
+  // slightly higher bar if the domain isn’t name-like (no last name in host)
+  const authorToks = tokens(author).filter(t => t.length > 2);
+  const host = new URL(top.origin).host.toLowerCase();
+  const hostHasAuthor = authorToks.some(t => host.includes(t));
+  const threshold = Math.max(WEBSITE_MIN_SCORE, hostHasAuthor ? 0.60 : 0.70);
+
+  if (top.finalScore >= threshold) {
+    return {
+      url: top.origin,
+      debug: {
+        threshold,
+        picked: top,
+        candidates: validations.slice(0, 5),
+      }
+    };
+  }
+
+  // No confident author site — return null so callers can treat as “no personal site”
+  return {
+    url: null,
+    debug: { threshold, candidates: validations.slice(0, 5) }
+  };
 }
+
 
 /* =============================
    Handler
