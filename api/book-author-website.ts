@@ -935,20 +935,38 @@ async function resolveAuthor(bookTitle: string): Promise<{
   const merged: Array<{ name: string; score: number; high: number }> = [];
   for (const arr of clusters.values()) {
     // Choose canonical: SHORTEST unless a longer ends with a keepable suffix (Jr., III, Ph.D., etc.)
-    const sorted = [...arr].sort((a, b) => {
-      const al = a.name.split(/\s+/).length, bl = b.name.split(/\s+/).length;
-      if (al !== bl) return al - bl; // shortest first
-      if (a.score !== b.score) return b.score - a.score;
-      return a.name.localeCompare(b.name);
-    });
-
-    let canonical = sorted[0].name;
-    const withSuffix = arr.find(e => endsWithKeepableSuffix(e.name));
-    if (withSuffix) {
-      const base = canonical.toLowerCase();
-      const sufBase = withSuffix.name.toLowerCase().replace(/\s+(?:jr\.?|sr\.?|ii|iii|iv|v|ph\.?d\.?|m\.?d\.?|obe|cbe)$/i, "");
-      if (base === sufBase) canonical = withSuffix.name;
-    }
+ 
+  const sorted = [...arr].sort((a, b) => {
+    const al = a.name.split(/\s+/).length, bl = b.name.split(/\s+/).length;
+    if (al !== bl) return bl - al; // longest first
+    if (a.high !== b.high) return b.high - a.high; // prefer variants supported by high signals
+    if (a.score !== b.score) return b.score - a.score;
+    return a.name.localeCompare(b.name);
+  });
+   
+   // Start with the longest; if it ends with obvious garbage, fall back.
+  let canonical = sorted[0].name;
+   
+   // If the longest ends with junk, try to find the next best clean variant.
+  const looksGarbageTail = (s: string) => {
+    const toks = s.trim().split(/\s+/);
+    const last = (toks[toks.length - 1] || "");
+    const low = last.toLowerCase();
+    return (
+      DROP_IF_TRAILING.has(low) ||
+      ROLE_TAIL_TOKENS.has(low) ||
+      NAME_TAIL_GARBAGE.has(low) ||
+      /^[a-z]+$/.test(last) ||
+      /^\d{1,4}$/.test(last)
+    );
+  };
+   
+   if (looksGarbageTail(canonical)) {
+     const alt = sorted.find(e => !looksGarbageTail(e.name));
+     if (alt) canonical = alt.name;
+   }
+   
+   // Keepable suffixes (Jr., III, Ph.D.) remain allowed as part of canonical.
 
     const canonLow = canonical.toLowerCase();
     let score = 0;
