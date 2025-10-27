@@ -122,12 +122,10 @@ function stripSiteSuffix(s: string): string {
     .trim();
 }
 function cleanFirstSubtitleSegment(s: string): string {
-  // Keep only the first clause-like segment; drop marketing add-ons
   const cut = s.split(/[|•–—-]{1,2}|\b\|\b/)[0];
   return (cut || "").replace(/\s+/g, " ").trim();
 }
 function looksLikeISBNy(s: string): boolean {
-  // heavy digit / ISBN-like
   const d = (s.match(/\d/g) || []).length;
   return d >= 6 || /\b(?:ISBN|978|979)\b/i.test(s);
 }
@@ -135,8 +133,17 @@ function looksLikeCategoryTail(s: string): boolean {
   return /\b(?:Books?|Book|Home|Official Site|Edit(?:ion)?|Paperback|Hardcover|Audiobook)\b/i.test(s);
 }
 function looksLikeAuthorListTail(s: string): boolean {
-  // Avoid “Obama, Barack: Books” / “by X and Y”
   return /(?:,|\band\b|\bwith\b)/i.test(s) && /\b[A-Z][\p{L}'-]+/u.test(s);
+}
+
+/* =============================
+   EXTRA: banned generic subtitles
+   ============================= */
+const BANNED_SUBTITLES = new Set([
+  "a novel","novel","a memoir","memoir","a biography","biography","an autobiography","autobiography"
+]);
+function isBannedSubtitle(s: string): boolean {
+  return BANNED_SUBTITLES.has((s || "").trim().toLowerCase());
 }
 
 /* =============================
@@ -150,7 +157,7 @@ const GENERATIONAL_SUFFIX = new Set(["jr","jr.","sr","sr.","ii","iii","iv","v"])
 const BAD_TAIL = new Set([
   "frankly","review","reviews","opinion","analysis","explainer","interview","podcast",
   "video","transcript","essay","profile","biography","news","guide","column","commentary",
-  "editorial","update","thread","blog","price" // <- avoid “Yuval Noah Harari Price”
+  "editorial","update","thread","blog","price"
 ]);
 
 function isCasedWordToken(tok: string): boolean {
@@ -223,25 +230,69 @@ function maybeOrgish(name: string): boolean {
   return toks.length === 2 && toks.every(t => ABSTRACT_TOKENS.has(t));
 }
 
-/** Clean + validate a candidate. Returns null if it fails the threshold. */
+/* =============================
+   EXTRA: explicit org/imprint detection + tail stripping
+   ============================= */
+const NAME_TAIL_GARBAGE = new Set([
+  "book","books","press","publisher","publishers","publishing","imprint",
+  "media","group","house","co","co.","company","inc","inc.","llc","ltd","ltd.","gmbh",
+  "records","studios","partners","associates"
+]);
+
+function stripTrailingGarbage(s: string): string {
+  let parts = s.split(/\s+/);
+  let changed = false;
+  while (parts.length > 1) {
+    const last = parts[parts.length - 1].toLowerCase();
+    if (NAME_TAIL_GARBAGE.has(last) || BAD_TAIL.has(last) || looksLikeAdverb(last)) {
+      parts.pop();
+      changed = true;
+      continue;
+    }
+    break;
+  }
+  return changed ? parts.join(" ") : s;
+}
+
+const ORG_TOKENS = new Set([
+  "books","press","publisher","publishers","publishing","imprint",
+  "group","house","media","studios","pictures","records",
+  "llc","inc","ltd","gmbh","company","co.","university","dept","department"
+]);
+
+function isOrgishName(name: string): boolean {
+  const toks = name.toLowerCase().split(/\s+/);
+  if (toks.some(t => ORG_TOKENS.has(t))) return true;
+  if (/[&]/.test(name)) return true; // “Simon & Schuster”
+  if (/\b(?:and|partners|associates)\b/i.test(name)) return true;
+  return false;
+}
+
+/* =============================
+   Clean + validate a candidate
+   ============================= */
 function normalizeNameCandidate(raw: string, title: string): string | null {
   let s = raw.trim()
     .replace(/[)\]]+$/g, "")
     .replace(/[.,;:–—-]+$/g, "")
     .replace(/\s+/g, " ");
 
-  // Token-level: drop trailing punctuation on tokens (e.g., "Gross,")
   s = s.split(/\s+/).map(tok => tok.replace(/[.,;:]+$/g, "")).join(" ");
+
+  // First pass: strip publisher-ish tails early
+  s = stripTrailingGarbage(s);
+
+  // Hard reject organizations / imprints
+  if (isOrgishName(s)) return null;
 
   // Early reject for common-word pairs (subtitle artifacts)
   const partsEarly = s.split(/\s+/);
   if (partsEarly.length === 2 && looksLikeCommonPair(s)) return null;
 
   const titleToks = tokens(title);
-  // Reject if equals a token in the title
   if (titleToks.includes(s.toLowerCase())) return null;
 
-  // If it's a 2-word candidate and both words appear in the title, reject (e.g., "Poet Lovelace")
+  // If it's a 2-word candidate and both words appear in the title, reject
   if (partsEarly.length === 2) {
     const overlap = partsEarly.filter(p => titleToks.includes(p.toLowerCase())).length;
     if (overlap === 2) return null;
@@ -254,11 +305,15 @@ function normalizeNameCandidate(raw: string, title: string): string | null {
     if (parts.length >= 3) { parts.pop(); s = parts.join(" "); }
   }
 
+  // Second pass strip + org re-check
+  s = stripTrailingGarbage(s);
+  if (isOrgishName(s)) return null;
+
   return nameLikeness(s) >= 0.65 ? s : null;
 }
 
 /* =============================
-   Extract names with strict rules
+   Extract names with strict rules (+publisher-context skip)
    ============================= */
 type Signal = "author_label" | "wrote_book" | "byline" | "plain_last_first";
 
@@ -273,12 +328,10 @@ function extractNamesFromText(
     { re: /\bAuthor:\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "author_label" },
     { re: /\bwritten by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "author_label" },
     { re: /\b([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})\s+(?:wrote|writes)\s+the\s+book\b/gu, signal: "wrote_book" },
-    // Ensure "by" captures a clean name; exclude “Price” trailing noise via punctuation lookahead above
     { re: /\bby\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "byline" },
     { re: /\bby\s+([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "byline", swap: true },
   ];
 
-  // Allow "Last, First" only on book-ish pages and not part of a list:
   if (booky) {
     patterns.push({
       re: /\b([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)\b(?!\s*(?:and|or|&|,))/gu,
@@ -290,6 +343,10 @@ function extractNamesFromText(
   for (const { re, signal, swap } of patterns) {
     let m: RegExpExecArray | null;
     while ((m = re.exec(text))) {
+      // Skip publisher contexts like “Published by Forge Books”
+      const left = text.slice(Math.max(0, m.index - 30), m.index);
+      if (/\b(Published|Imprint|Edition|Edited)\s+$/i.test(left)) continue;
+
       const name = swap ? `${m[2]} ${m[1]}` : m[1];
       out.push({ name: name.trim(), signal });
     }
@@ -325,7 +382,13 @@ function startsWithShortThenSubtitle(title: string, short: string): string | nul
   if (!m) return null;
   const subtitleRaw = m[1];
   let subtitle = cleanFirstSubtitleSegment(stripSiteSuffix(subtitleRaw));
-  if (!subtitle || looksLikeISBNy(subtitle) || looksLikeCategoryTail(subtitle) || looksLikeAuthorListTail(subtitle)) {
+  if (
+    !subtitle ||
+    looksLikeISBNy(subtitle) ||
+    looksLikeCategoryTail(subtitle) ||
+    looksLikeAuthorListTail(subtitle) ||
+    isBannedSubtitle(subtitle)
+  ) {
     return null;
   }
   return subtitle || null;
@@ -357,7 +420,7 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
       const subtitle = startsWithShortThenSubtitle(cand, shortTitle);
       if (subtitle) {
         const full = `${shortTitle}: ${subtitle}`;
-        if (/\bWikipedia\b/i.test(subtitle)) continue; // belt-and-suspenders
+        if (/\bWikipedia\b/i.test(subtitle)) continue;
         evidence.push({ host, cand, full, reason: "subtitle_from_prefix" });
         if (!bestFull || (preferPublisherOrRetail(host) && !preferPublisherOrRetail(hostOf(bestFull)))) {
           bestFull = full;
@@ -372,11 +435,14 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
             const head = cand.slice(0, colonIdx).trim();
             let tail = cleanFirstSubtitleSegment(stripSiteSuffix(cand.slice(colonIdx + 1))).trim();
 
-            if (!tail ||
-                /\bWikipedia\b/i.test(tail) ||
-                looksLikeISBNy(tail) ||
-                looksLikeCategoryTail(tail) ||
-                looksLikeAuthorListTail(tail)) {
+            if (
+              !tail ||
+              /\bWikipedia\b/i.test(tail) ||
+              looksLikeISBNy(tail) ||
+              looksLikeCategoryTail(tail) ||
+              looksLikeAuthorListTail(tail) ||
+              isBannedSubtitle(tail)
+            ) {
               continue;
             }
 
@@ -456,7 +522,6 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
     const haystack = fields.join(" • ");
     const matches = extractNamesFromText(haystack, { booky: mtIsBook });
 
-    // titles for small bonus when matching expanded title
     const candidateTitles: string[] = [];
     if (typeof it.title === "string") candidateTitles.push(it.title);
     for (const mt of mtList) {
@@ -469,7 +534,6 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
       const norm = normalizeNameCandidate(name, bookTitle);
       if (!norm) continue;
 
-      // Base weight by signal strength (downgrade plain_last_first)
       let w: number;
       switch (signal) {
         case "author_label":     w = 3.0; break;
@@ -492,7 +556,6 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
 
       candidates[norm] = (candidates[norm] || 0) + w;
 
-      // Only count truly high-signal evidence (not plain_last_first)
       if (signal === "author_label" || signal === "wrote_book") {
         highSignalSeen[norm] = (highSignalSeen[norm] || 0) + 1;
       }
@@ -537,10 +600,8 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
   if (merged.length) {
     merged.sort((a, b) => b.score - a.score);
 
-    // Prefer any candidate with high-signal evidence
     const withHigh = merged.filter(m => (highSignalSeen[m.name] || 0) > 0);
 
-    // Dominance rule: a no-high-signal winner must beat the best high-signal by 1.5x
     let pick = merged[0];
     if (withHigh.length) {
       const bestHigh = withHigh[0];
