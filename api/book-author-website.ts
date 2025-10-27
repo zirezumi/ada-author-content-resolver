@@ -326,9 +326,10 @@ function extractNamesFromText(
 
   const patterns: Array<{ re: RegExp; signal: Signal; swap?: boolean }> = [
     { re: /\bAuthor:\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "author_label" },
-    { re: /\bwritten by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "author_label" },
+    // Loosened lookahead to allow commas/parentheses/job-titles after the name
+    { re: /\bwritten by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=(?:\s*[),.?:;!–—-]|\s+\(|\s|$))/gu, signal: "author_label" },
     { re: /\b([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})\s+(?:wrote|writes)\s+the\s+book\b/gu, signal: "wrote_book" },
-    { re: /\bby\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "byline" },
+    { re: /\bby\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=(?:\s*[),.?:;!–—-]|\s+\(|\s|$))/gu, signal: "byline" },
     { re: /\bby\s+([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "byline", swap: true },
   ];
 
@@ -339,6 +340,18 @@ function extractNamesFromText(
       swap: true
     });
   }
+
+  // Extra weak-but-safe cues
+  patterns.push({
+    // “… Rick Smith … About the author”
+    re: /\b([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){1,3})\b.{0,30}\bAbout the author\b/gu,
+    signal: "author_label"
+  });
+  patterns.push({
+    // “Rick Smith, author/CEO/founder …”
+    re: /\b([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){1,3})\s*,\s*(?:author|writer|novelist|ceo|founder|co[-\s]?founder)\b/giu,
+    signal: "author_label"
+  });
 
   for (const { re, signal, swap } of patterns) {
     let m: RegExpExecArray | null;
@@ -399,7 +412,7 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
   const items = await googleCSE(q, 8);
 
   let bestFull: string | null = null;
-  let bestHost: string | null = null;  // <--- track host
+  let bestHost: string | null = null;
   const evidence: any[] = [];
 
   for (const it of items) {
@@ -424,7 +437,7 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
         evidence.push({ host, cand, full, reason: "subtitle_from_prefix" });
         if (!bestFull || (preferPublisherOrRetail(host) && !(bestHost && preferPublisherOrRetail(bestHost)))) {
           bestFull = full;
-          bestHost = host;        // <---
+          bestHost = host;
         }
       } else {
         const shortToks = tokenSet(shortTitle);
@@ -450,9 +463,29 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
               evidence.push({ host, cand, full, reason: "subtitle_from_colon" });
               if (!bestFull || (preferPublisherOrRetail(host) && !(bestHost && preferPublisherOrRetail(bestHost)))) {
                 bestFull = full;
-                bestHost = host;  // <---
+                bestHost = host;
               }
             }
+          } else {
+            // Optional: upgrade head by adding a missing leading article (The/A/An)
+            const head = cand.split(":")[0].trim();
+            const normA = head.replace(/^(the|a|an)\s+/i, "").toLowerCase();
+            const normB = shortTitle.replace(/^(the|a|an)\s+/i, "").toLowerCase();
+            if (!bestFull && head.length > shortTitle.length && normA === normB) {
+              bestFull = head;
+              bestHost = host;
+              evidence.push({ host, cand, full: head, reason: "head_article_upgrade" });
+            }
+          }
+        } else {
+          // Consider head-only article upgrade when no colon is present
+          const head = cand.split(":")[0].trim();
+          const normA = head.replace(/^(the|a|an)\s+/i, "").toLowerCase();
+          const normB = shortTitle.replace(/^(the|a|an)\s+/i, "").toLowerCase();
+          if (!bestFull && head.length > shortTitle.length && normA === normB) {
+            bestFull = head;
+            bestHost = host;
+            evidence.push({ host, cand, full: head, reason: "head_article_upgrade" });
           }
         }
       }
@@ -557,6 +590,42 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
 
       if (signal === "author_label" || signal === "wrote_book") {
         highSignalSeen[norm] = (highSignalSeen[norm] || 0) + 1;
+      }
+    }
+  }
+
+  // ===== Proximity fallback if nothing matched strict rules =====
+  if (Object.keys(candidates).length === 0) {
+    const wanted = tokenSet(titleForSearch);
+    function containsTitleTokens(s: string): boolean {
+      const bag = tokenSet(s);
+      let hit = 0;
+      for (const t of wanted) if (bag.has(t)) hit++;
+      return hit >= Math.min(2, wanted.size); // require >= 2 tokens to avoid noise
+    }
+
+    for (const it of items) {
+      const fields: string[] = [];
+      if (typeof it.title === "string") fields.push(it.title);
+      if (typeof it.snippet === "string") fields.push(it.snippet);
+      const mtList = Array.isArray(it.pagemap?.metatags) ? it.pagemap.metatags : [];
+      for (const mt of mtList) {
+        const t =
+          (mt?.["og:description"] as string) ||
+          (mt?.description as string) ||
+          (mt?.title as string) ||
+          (mt?.["og:title"] as string);
+        if (typeof t === "string") fields.push(t);
+      }
+      const blob = fields.join(" • ");
+      if (!containsTitleTokens(blob)) continue;
+
+      const nameRe = /\b([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){1,3})\b/guy;
+      let m: RegExpExecArray | null;
+      while ((m = nameRe.exec(blob))) {
+        const cand = normalizeNameCandidate(m[1], bookTitle);
+        if (!cand) continue;
+        candidates[cand] = (candidates[cand] || 0) + 0.6; // weak weight
       }
     }
   }
