@@ -65,7 +65,6 @@ class LruTtl<K, V> {
     while (this.map.size > this.max) {
       const it = this.map.keys().next();
       if (it.done) break;
-      // it.value is K when not done
       this.map.delete(it.value as K);
     }
   }
@@ -516,17 +515,14 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
   const cached = authorCache.get(bookTitle);
   if (cached) return { name: cached.name, confidence: cached.confidence, debug: { cached: true } };
 
-  // Phase 0: expand title
   const expanded = await expandBookTitle(bookTitle);
   const titleForSearch = expanded.full;
 
   let query = `"${titleForSearch}" book written by -film -movie -screenplay -soundtrack -director`;
   let items = await googleCSE(query, 10);
 
-  // Evaluate "publisher-backed expansion" for an early-exit allowance
   const expansionBackedByPublisher = /amazon\.|goodreads\.com|barnesandnoble\.com|penguinrandomhouse\.com|harpercollins\.com|simonandschuster\.com|macmillan\.com|hachettebookgroup\.com/i.test(JSON.stringify(items).toLowerCase());
 
-  // Fallback if expansion was suspicious or results are junky (all PDFs/wiki)
   const looksSuspiciousExpansion = /:\s*Wikipedia\s*$/i.test(titleForSearch);
   const allPdfOrWiki = (items || []).length > 0 && (items || []).every(it => {
     const h = hostOf(it.link);
@@ -535,7 +531,6 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
   });
 
   if ((!items || items.length === 0) || looksSuspiciousExpansion || allPdfOrWiki) {
-    // Only make this extra call if expansion wasn't clearly publisher-backed (efficiency)
     if (!expansionBackedByPublisher) {
       query = `"${bookTitle}" book written by -film -movie -screenplay -soundtrack -director`;
       items = await googleCSE(query, 10);
@@ -591,16 +586,12 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
         case "plain_last_first": w = 0.6; break;
       }
 
-      // Reject org-ish or common-word pairs for weak signals
       if ((signal === "byline" || signal === "plain_last_first") &&
           (maybeOrgish(norm) || looksLikeCommonPair(norm))) {
         continue;
       }
 
-      // Publisher boost
       if (host && PUBLISHERS.some(d => host.endsWith(d))) w *= 1.4;
-
-      // Expanded title exact-match nudge
       if (expandedMatch) w *= 1.15;
 
       candidates[norm] = (candidates[norm] || 0) + w;
@@ -617,7 +608,6 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
     return { name: null, confidence: 0, debug: { expanded, query, items, candidates } };
   }
 
-  // Cluster variants (merge prefixes/supersets)
   const clusters = new Map<string, Array<{ name: string; count: number }>>();
   for (const [name, count] of entries) {
     const toks = name.split(/\s+/);
@@ -650,7 +640,6 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
   merged.sort((a, b) => b.score - a.score);
   let pick = merged[0];
 
-  // Prefer a cluster that has any high-signal support if scores are close
   const withHigh = merged.filter(m => (highSignalSeen[m.name] || 0) > 0);
   if (withHigh.length) {
     const bestHigh = withHigh[0];
@@ -661,8 +650,6 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
 
   const confidence = pick.score >= 2 ? 0.95 : 0.8;
 
-  // Early-exit rule: if expansion was publisher-backed AND top cluster is very strong,
-  // we won't do the earlier fallback (already applied) nor any extra author queries.
   authorCache.set(bookTitle, { name: pick.name, confidence });
 
   return {
@@ -682,7 +669,6 @@ async function fetchPageText(url: string, ms = 3000): Promise<string> {
   try {
     const resp = await fetchWithTimeout(url, { headers: { Accept: "text/html,*/*" } }, ms);
     if (!resp?.ok) return "";
-    // stream and cap
     const reader = resp.body?.getReader();
     if (!reader) return await resp.text();
     let received = 0;
@@ -712,10 +698,8 @@ function concatUint8(parts: Uint8Array[]): Uint8Array {
 }
 
 function extractVisibleText(html: string): string {
-  // keep meta/title content; also capture JSON-LD before stripping scripts
   const metaBits: string[] = [];
 
-  // META/TITLE
   html.replace(
     /<meta\b[^>]*?(?:name|property)=["'](?:og:title|og:description|description|twitter:title|twitter:description)["'][^>]*?>/gi,
     (m) => {
@@ -726,14 +710,12 @@ function extractVisibleText(html: string): string {
   );
   const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? "";
 
-  // JSON-LD (Person/Book signals)
   const jsonLdMatches = html.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
   for (const block of jsonLdMatches) {
     const inner = block.match(/<script[^>]*>([\s\S]*?)<\/script>/i)?.[1];
     if (inner) metaBits.push(inner);
   }
 
-  // Strip scripts/styles/comments/tags for visible text
   let txt = html
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
@@ -812,15 +794,21 @@ function isBlockedHost(host: string): boolean {
   return BLOCKED_DOMAINS.some((d) => host.includes(d));
 }
 
-function scoreCandidateUrl(u: URL, author: string): number {
+function scoreCandidateUrl(u: URL, author: string, bookTitleBoost?: string): number {
   let score = 0;
   const pathDepth = u.pathname.split("/").filter(Boolean).length;
   if (pathDepth === 0) score += 0.5;
   if (u.protocol === "https:") score += 0.1;
 
-  const toks = tokens(author).filter(t => t.length > 2);
   const host = u.host.toLowerCase();
-  for (const t of toks) if (host.includes(t)) score += 0.4;
+
+  const nameToks = tokens(author).filter(t => t.length > 2);
+  for (const t of nameToks) if (host.includes(t)) score += 0.4;
+
+  if (bookTitleBoost) {
+    const bookToks = tokens(bookTitleBoost).filter(t => t.length > 3);
+    for (const t of bookToks) if (host.includes(t)) score += 0.2;
+  }
 
   return Math.min(1, score);
 }
@@ -829,41 +817,62 @@ function scoreCandidateUrl(u: URL, author: string): number {
 const WEBSITE_MIN_SCORE = Number(process.env.WEBSITE_MIN_SCORE ?? 0.6);
 
 /* =============================
-   Phase 2: Resolve Website
+   Phase 2: Resolve Website (with author-first, book-fallback, and no "empty cache")
    ============================= */
 async function resolveWebsite(author: string, bookTitle: string): Promise<{ url: string|null, debug: any }> {
   const cacheKey = `${author}::cands`;
   const cachedCands = siteCandidatesCache.get(cacheKey);
 
-  let candidates: Array<{ host: string; origin: string; urlScore: number }>;
+  let candidates: Array<{ host: string; origin: string; urlScore: number }> | null = cachedCands ?? null;
 
-  if (cachedCands) {
-    candidates = cachedCands;
-  } else {
-    const q = `"${author}" (official|homepage|site|"author website"|bio|books) -twitter -facebook -linkedin -instagram`;
-    const items = await googleCSE(q, 10);
-
+  const gatherCandidates = async (queries: string[]) => {
     const seen = new Set<string>();
     const tmp: Array<{ host: string; origin: string; urlScore: number }> = [];
+    for (const q of queries) {
+      const items = await googleCSE(q, 10);
+      for (const it of items) {
+        let u: URL | null = null;
+        try { u = new URL(it.link); } catch { continue; }
+        const host = u.host.toLowerCase();
+        if (isBlockedHost(host)) continue;
+        if (seen.has(host)) continue;
+        seen.add(host);
+        const urlScore = scoreCandidateUrl(u, author, bookTitle);
+        if (urlScore < 0.3) continue;
+        tmp.push({ host, origin: u.origin, urlScore });
+      }
+      if (tmp.length >= 5) break; // enough variety
+    }
+    return tmp.sort((a, b) => b.urlScore - a.urlScore).slice(0, 5);
+  };
 
-    for (const it of items) {
-      let u: URL | null = null;
-      try { u = new URL(it.link); } catch { continue; }
-      const host = u.host.toLowerCase();
-      if (isBlockedHost(host)) continue;
-      if (seen.has(host)) continue;
-      seen.add(host);
-      const urlScore = scoreCandidateUrl(u, author);
-      if (urlScore < 0.3) continue;
-      tmp.push({ host, origin: u.origin, urlScore });
+  if (!candidates) {
+    // Author-centric first (fast)
+    const authorQueries = [
+      `"${author}" official site`,
+      `"${author}" author website`,
+      `"${author}" (homepage|site|bio|books) -twitter -facebook -linkedin -instagram`,
+    ];
+    candidates = await gatherCandidates(authorQueries);
+
+    // Fallback to book-centric (brand sites like thesecret.tv)
+    if (!candidates.length) {
+      const bookQueries = [
+        `"${bookTitle}" official site`,
+        `"${bookTitle}" "${author}" official site`,
+        `"${bookTitle}" website`,
+      ];
+      candidates = await gatherCandidates(bookQueries);
     }
 
-    candidates = tmp.sort((a, b) => b.urlScore - a.urlScore).slice(0, 5);
-    siteCandidatesCache.set(cacheKey, candidates);
+    // Only cache if we actually found something
+    if (candidates.length) {
+      siteCandidatesCache.set(cacheKey, candidates);
+    }
   }
 
   if (!candidates.length) {
-    return { url: null, debug: { tried: "broad_author_query", threshold: WEBSITE_MIN_SCORE } };
+    return { url: null, debug: { tried: "author_first_then_book_fallback", threshold: WEBSITE_MIN_SCORE } };
   }
 
   const validations: Array<{
@@ -876,8 +885,11 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
   }> = [];
 
   const authorToks = tokens(author).filter(t => t.length > 2);
+  const bookToks = tokens(bookTitle).filter(t => t.length > 3);
+
   const combineScore = (urlScore: number, contentScore: number) => 0.45 * urlScore + 0.55 * contentScore;
 
+  // Fetch multiple common paths in parallel per host
   for (const c of candidates) {
     const origin = c.origin;
     const paths = ["/", "/books", "/book", "/works", "/publications", "/titles", "/about", "/bio"];
@@ -901,20 +913,26 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
       contentScore: bestContent,
       finalScore: combineScore(c.urlScore, bestContent),
       samples,
-      fromQuery: "broad_author_query"
+      fromQuery: "author_first_or_book_fallback"
     });
   }
 
   validations.sort((a, b) => b.finalScore - a.finalScore);
   const prelimTop = validations[0];
 
-  const hostHasAuthor = authorToks.some(t => new URL(prelimTop.origin).host.toLowerCase().includes(t));
-  const thresholdPrelim = Math.max(WEBSITE_MIN_SCORE, hostHasAuthor ? 0.60 : 0.70);
+  // Thresholds: prefer author-in-host; allow book-in-host slightly softer than generic
+  const host = new URL(prelimTop.origin).host.toLowerCase();
+  const hostHasAuthor = authorToks.some(t => host.includes(t));
+  const hostHasBook = bookToks.some(t => host.includes(t));
+  const thresholdPrelim = hostHasAuthor ? Math.max(WEBSITE_MIN_SCORE, 0.60)
+                        : hostHasBook  ? Math.max(WEBSITE_MIN_SCORE, 0.65)
+                                       : Math.max(WEBSITE_MIN_SCORE, 0.70);
 
   if (prelimTop.finalScore >= thresholdPrelim) {
     return { url: prelimTop.origin, debug: { threshold: thresholdPrelim, picked: prelimTop, candidates: validations.slice(0, 5) } };
   }
 
+  // Batch: search book title across all candidate domains and boost those that mention it
   const domains = validations.map(v => new URL(v.origin).host);
   const orSites = domains.map(d => `site:${d}`).join(" OR ");
   const multiSiteQ = `"${bookTitle}" (${orSites})`;
@@ -925,32 +943,32 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
   for (const h of multiHits) {
     let u: URL | null = null;
     try { u = new URL(h.link); } catch { continue; }
-    const host = u.host.toLowerCase();
-    if (!domains.includes(host)) continue;
-    boostedByHost.set(host, Math.max(0.12, boostedByHost.get(host) ?? 0.12));
-    hitLinksByHost.set(host, u.toString());
+    const hh = u.host.toLowerCase();
+    if (!domains.includes(hh)) continue;
+    boostedByHost.set(hh, Math.max(0.12, boostedByHost.get(hh) ?? 0.12));
+    hitLinksByHost.set(hh, u.toString());
   }
 
   await Promise.allSettled(validations.map(async (v) => {
-    const host = new URL(v.origin).host.toLowerCase();
-    const key = `${host}::${norm(bookTitle)}`;
+    const hh = new URL(v.origin).host.toLowerCase();
+    const key = `${hh}::${norm(bookTitle)}`;
     const cached = siteMentionCache.get(key);
     if (cached !== undefined) {
       v.contentScore = Math.max(v.contentScore, cached);
       v.finalScore = combineScore(v.urlScore, v.contentScore);
       return;
     }
-    const hit = hitLinksByHost.get(host);
+    const hit = hitLinksByHost.get(hh);
     if (hit) {
       const txt = await fetchPageText(hit, 2500);
       const s = contentSignalsForSite(txt, author, bookTitle);
-      const presenceBoost = boostedByHost.get(host) ?? 0;
+      const presenceBoost = boostedByHost.get(hh) ?? 0;
       const combined = Math.min(1, Math.max(v.contentScore, s) + presenceBoost);
       siteMentionCache.set(key, combined);
       v.contentScore = combined;
       v.finalScore = combineScore(v.urlScore, v.contentScore);
-    } else if (boostedByHost.has(host)) {
-      const combined = Math.min(1, v.contentScore + (boostedByHost.get(host) ?? 0));
+    } else if (boostedByHost.has(hh)) {
+      const combined = Math.min(1, v.contentScore + (boostedByHost.get(hh) ?? 0));
       siteMentionCache.set(key, combined);
       v.contentScore = combined;
       v.finalScore = combineScore(v.urlScore, v.contentScore);
@@ -960,9 +978,12 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
   validations.sort((a, b) => b.finalScore - a.finalScore);
   const top = validations[0];
 
-  const host = new URL(top.origin).host.toLowerCase();
-  const hostHasAuthor2 = authorToks.some(t => host.includes(t));
-  const threshold = Math.max(WEBSITE_MIN_SCORE, hostHasAuthor2 ? 0.60 : 0.70);
+  const h2 = new URL(top.origin).host.toLowerCase();
+  const hostHasAuthor2 = authorToks.some(t => h2.includes(t));
+  const hostHasBook2 = bookToks.some(t => h2.includes(t));
+  const threshold = hostHasAuthor2 ? Math.max(WEBSITE_MIN_SCORE, 0.60)
+                     : hostHasBook2  ? Math.max(WEBSITE_MIN_SCORE, 0.65)
+                                     : Math.max(WEBSITE_MIN_SCORE, 0.70);
 
   if (top.finalScore >= threshold) {
     return {
