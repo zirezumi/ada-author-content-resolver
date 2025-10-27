@@ -751,7 +751,6 @@ function contentSignalsForSite(text: string, author: string, bookTitle: string):
   return Math.min(1, score);
 }
 
-
 /* =============================
    Phase 2: Resolve Website (URL + content validation)
    ============================= */
@@ -871,7 +870,6 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     debug: { threshold, candidates: validations.slice(0, 5) }
   };
 }
-
 
 /* =============================
    Handler
