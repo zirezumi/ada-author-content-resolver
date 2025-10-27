@@ -19,7 +19,7 @@ const SKIP_AUTH = (process.env.SKIP_AUTH || "").toLowerCase() === "true";
 function headerCI(req: any, name: string): string | undefined {
   if (!req?.headers) return undefined;
   const entries = Object.entries(req.headers) as Array<[string, string]>;
-  const hit = entries.find(([k]) => k?.toLowerCase?.() === name.toLowerCase());
+  const hit = entries.find(([k]) => k.toLowerCase() === name.toLowerCase());
   return hit?.[1];
 }
 
@@ -313,48 +313,6 @@ function normalizeNameCandidate(raw: string, title: string): string | null {
 }
 
 /* =============================
-   Extract names with strict rules (+publisher-context skip)
-   ============================= */
-type Signal = "author_label" | "wrote_book" | "byline" | "plain_last_first";
-
-function extractNamesFromText(
-  text: string,
-  opts?: { booky?: boolean }
-): Array<{ name: string; signal: Signal }> {
-  const booky = !!opts?.booky;
-  const out: Array<{ name: string; signal: Signal }> = [];
-
-  const patterns: Array<{ re: RegExp; signal: Signal; swap?: boolean }> = [
-    { re: /\bAuthor:\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "author_label" },
-    { re: /\bwritten by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "author_label" },
-    { re: /\b([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})\s+(?:wrote|writes)\s+the\s+book\b/gu, signal: "wrote_book" },
-    { re: /\bby\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "byline" },
-    { re: /\bby\s+([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)(?=\s*(?:[),.?:;!–—-]\s|$))/gu, signal: "byline", swap: true },
-  ];
-
-  if (booky) {
-    patterns.push({
-      re: /\b([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)\b(?!\s*(?:and|or|&|,))/gu,
-      signal: "plain_last_first",
-      swap: true
-    });
-  }
-
-  for (const { re, signal, swap } of patterns) {
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(text))) {
-      // Skip publisher contexts like “Published by Forge Books”
-      const left = text.slice(Math.max(0, m.index - 30), m.index);
-      if (/\b(Published|Imprint|Edition|Edited)\s+$/i.test(left)) continue;
-
-      const name = swap ? `${m[2]} ${m[1]}` : m[1];
-      out.push({ name: name.trim(), signal });
-    }
-  }
-  return out;
-}
-
-/* =============================
    Publisher/retailer domain hints
    ============================= */
 const PUBLISHERS = [
@@ -436,14 +394,12 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
             const head = cand.slice(0, colonIdx).trim();
             let tail = cleanFirstSubtitleSegment(stripSiteSuffix(cand.slice(colonIdx + 1))).trim();
 
-            if (
-              !tail ||
-              /\bWikipedia\b/i.test(tail) ||
-              looksLikeISBNy(tail) ||
-              looksLikeCategoryTail(tail) ||
-              looksLikeAuthorListTail(tail) ||
-              isBannedSubtitle(tail)
-            ) {
+            if (!tail ||
+                /\bWikipedia\b/i.test(tail) ||
+                looksLikeISBNy(tail) ||
+                looksLikeCategoryTail(tail) ||
+                looksLikeAuthorListTail(tail) ||
+                isBannedSubtitle(tail)) {
               continue;
             }
 
@@ -471,17 +427,133 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
 }
 
 /* =============================
-   Phase 1: Determine Author (with title expansion + robust fallback)
+   Phase 1: Determine Author(s)
    ============================= */
-async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, confidence: number, debug: any }> {
-  // Phase 0: expand title
+
+/** signals now encode role + position for multi-author bylines */
+type AuthorSignal =
+  | { kind: "author_label"; name: string }
+  | { kind: "written_by"; name: string }
+  | { kind: "byline_ordered"; name: string; position: number }
+  | { kind: "with"; name: string }
+  | { kind: "editor"; name: string }
+  | { kind: "foreword"; name: string }
+  | { kind: "illustrator"; name: string }
+  | { kind: "plain_last_first"; name: string };
+
+const POSITION_WEIGHTS = [1.0, 0.9, 0.85, 0.8, 0.75, 0.7];
+
+function splitNamesList(s: string): string[] {
+  // split on commas and " and " / " & "
+  return s
+    .split(/\s*,\s*|\s+and\s+|\s*&\s+/i)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+function extractAuthorSignals(text: string, opts?: { booky?: boolean; title?: string }): AuthorSignal[] {
+  const out: AuthorSignal[] = [];
+  const booky = !!opts?.booky;
+  const title = opts?.title || "";
+
+  // Author: NAME / written by NAME
+  const reAuthor = /\bAuthor:\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=[),.?:;!–—-]|\s|$)/gu;
+  const reWritten = /\bwritten by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=[),.?:;!–—-]|\s|$)/gu;
+
+  // by A, B and C [with D]
+  const reBylineBlock = /\bby\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*(?:\s*(?:,?\s*and\s+|&\s*)[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})?)(?:\s+with\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*)\b)?/gu;
+
+  // role-specific
+  const reEditedBy = /\bedited by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*(?:\s*(?:,?\s*and\s+|&\s*)[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})?)/gu;
+  const reForewordBy = /\bforeword by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})/gu;
+  const reIllustratedBy = /\billustrated by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*(?:\s*(?:,?\s*and\s+|&\s*)[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})?)/gu;
+
+  // optional: plain "Last, First" if page is booky (schema or OG book)
+  const reLastFirst = /\b([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)\b(?!\s*(?:and|or|&|,))/gu;
+
+  let m: RegExpExecArray | null;
+
+  while ((m = reAuthor.exec(text))) {
+    out.push({ kind: "author_label", name: m[1] });
+  }
+  while ((m = reWritten.exec(text))) {
+    out.push({ kind: "written_by", name: m[1] });
+  }
+  while ((m = reBylineBlock.exec(text))) {
+    const list = splitNamesList(m[1]);
+    list.forEach((n, i) => out.push({ kind: "byline_ordered", name: n, position: i }));
+    if (m[2]) {
+      const withList = splitNamesList(m[2]);
+      withList.forEach((n) => out.push({ kind: "with", name: n }));
+    }
+  }
+  while ((m = reEditedBy.exec(text))) {
+    splitNamesList(m[1]).forEach((n) => out.push({ kind: "editor", name: n }));
+  }
+  while ((m = reForewordBy.exec(text))) {
+    out.push({ kind: "foreword", name: m[1] });
+  }
+  while ((m = reIllustratedBy.exec(text))) {
+    splitNamesList(m[1]).forEach((n) => out.push({ kind: "illustrator", name: n }));
+  }
+
+  if (booky) {
+    while ((m = reLastFirst.exec(text))) {
+      const name = `${m[2]} ${m[1]}`;
+      out.push({ kind: "plain_last_first", name });
+    }
+  }
+
+  // Filter out obvious false positives that echo the title content
+  const titleToks = tokens(title);
+  return out.filter(sig => {
+    const normed = tokens(sig.name);
+    const overlap = normed.filter(t => titleToks.includes(t)).length;
+    return overlap < Math.min(2, normed.length); // don’t keep if it’s basically title words
+  });
+}
+
+type AuthorAgg = {
+  score: number;
+  roles: Record<string, number>;
+  positions: number[]; // for byline order seen
+  highSignals: number; // author_label / written_by
+};
+
+function weightForSignal(sig: AuthorSignal, host: string, expandedMatch: boolean): number {
+  // base weights per role/signal
+  let w =
+    sig.kind === "author_label" ? 1.0 :
+    sig.kind === "written_by" ? 1.0 :
+    sig.kind === "byline_ordered" ? 0.8 * (POSITION_WEIGHTS[sig.position] || POSITION_WEIGHTS[POSITION_WEIGHTS.length - 1]) :
+    sig.kind === "with" ? 0.35 :
+    sig.kind === "editor" ? 0.2 :
+    sig.kind === "foreword" ? 0.1 :
+    sig.kind === "illustrator" ? 0.1 :
+    sig.kind === "plain_last_first" ? 0.6 :
+    0.0;
+
+  // publisher/imprint boost
+  if (host && PUBLISHERS.some(d => host.endsWith(d))) w *= 1.4;
+  // exact expanded-title page nudge
+  if (expandedMatch) w *= 1.15;
+
+  return w;
+}
+
+async function resolveAuthor(bookTitle: string): Promise<{
+  primary: string | null;
+  coAuthors: string[];
+  confidence: number;
+  ranked: Array<{ name: string; score: number }>;
+  debug: any;
+}> {
   const expanded = await expandBookTitle(bookTitle);
   const titleForSearch = expanded.full;
 
   let query = `"${titleForSearch}" book written by -film -movie -screenplay -soundtrack -director`;
   let items = await googleCSE(query, 10);
 
-  // Fallback if expansion was suspicious or results are junky (all PDFs/wiki)
   const looksSuspiciousExpansion = /:\s*Wikipedia\s*$/i.test(titleForSearch);
   const allPdfOrWiki = (items || []).length > 0 && (items || []).every(it => {
     const h = hostOf(it.link);
@@ -494,8 +566,8 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
     items = await googleCSE(query, 10);
   }
 
-  const candidates: Record<string, number> = {};
-  const highSignalSeen: Record<string, number> = {};
+  const aggs = new Map<string, AuthorAgg>();
+  const mtBookyByUrl = new Map<string, boolean>();
 
   for (const it of items) {
     const fields: string[] = [];
@@ -508,21 +580,20 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
       if (mt && typeof mt === "object") {
         const t1 = (mt as any).title;
         const t2 = (mt as any)["og:title"];
-        const t3 = (mt as any)["book:author"];
+        const t3 = (mt as any)["book:author"]; // may be string
         const ogType = (mt as any)["og:type"];
         if (typeof t1 === "string") fields.push(t1);
         if (typeof t2 === "string") fields.push(t2);
-        if (typeof t3 === "string") fields.push(t3);
+        if (typeof t3 === "string") fields.push(`Author: ${t3}`); // nudge as explicit author signal
         if (ogType && String(ogType).toLowerCase().includes("book")) mtIsBook = true;
       }
     }
+    mtBookyByUrl.set(it.link, mtIsBook);
 
     let host = "";
     try { host = new URL(it.link).host.toLowerCase(); } catch {}
 
     const haystack = fields.join(" • ");
-    const matches = extractNamesFromText(haystack, { booky: mtIsBook });
-
     const candidateTitles: string[] = [];
     if (typeof it.title === "string") candidateTitles.push(it.title);
     for (const mt of mtList) {
@@ -531,106 +602,99 @@ async function resolveAuthor(bookTitle: string): Promise<{ name: string|null, co
     }
     const expandedMatch = candidateTitles.some(t => normalizeCompareTitle(t) === normalizeCompareTitle(titleForSearch));
 
-    for (const { name, signal } of matches) {
-      const normName = normalizeNameCandidate(name, bookTitle);
-      if (!normName) continue;
+    // extract multi-author aware signals
+    const sigs = extractAuthorSignals(haystack, { booky: mtIsBook, title: titleForSearch });
 
-      let w: number;
-      switch (signal) {
-        case "author_label":     w = 3.0; break;
-        case "wrote_book":       w = 2.0; break;
-        case "byline":           w = 1.0; break;
-        case "plain_last_first": w = 0.6; break;
-      }
+    for (const sig of sigs) {
+      const normed = normalizeNameCandidate(sig.name, bookTitle);
+      if (!normed) continue;
 
-      // Reject org-ish or common-word pairs for weak signals
-      if ((signal === "byline" || signal === "plain_last_first") &&
-          (maybeOrgish(normName) || looksLikeCommonPair(normName))) {
-        continue;
-      }
+      // discard org/common-pair when the signal is weak-ish
+      if ((sig.kind === "plain_last_first") && (maybeOrgish(normed) || looksLikeCommonPair(normed))) continue;
 
-      // Publisher boost
-      if (host && PUBLISHERS.some(d => host.endsWith(d))) w *= 1.4;
+      const w = weightForSignal(sig, host, expandedMatch);
+      if (w <= 0) continue;
 
-      // Expanded title exact-match nudge
-      if (expandedMatch) w *= 1.15;
-
-      candidates[normName] = (candidates[normName] || 0) + w;
-
-      if (signal === "author_label" || signal === "wrote_book") {
-        highSignalSeen[normName] = (highSignalSeen[normName] || 0) + 1;
-      }
+      const cur = aggs.get(normed) || { score: 0, roles: {}, positions: [], highSignals: 0 };
+      cur.score += w;
+      cur.roles[sig.kind] = (cur.roles[sig.kind] || 0) + w;
+      if (sig.kind === "byline_ordered") cur.positions.push(sig.position);
+      if (sig.kind === "author_label" || sig.kind === "written_by") cur.highSignals += 1;
+      aggs.set(normed, cur);
     }
   }
 
-  const entries = Object.entries(candidates);
-  if (entries.length === 0) {
-    return { name: null, confidence: 0, debug: { expanded, query, items, candidates } };
+  if (aggs.size === 0) {
+    return {
+      primary: null,
+      coAuthors: [],
+      confidence: 0,
+      ranked: [],
+      debug: { expanded, query, items, aggs: {} }
+    };
   }
 
-  // Cluster variants (merge prefixes/supersets)
-  const clusters = new Map<string, Array<{ name: string; count: number }>>();
-  for (const [name, count] of entries) {
+  // Merge short/long variants by first two tokens, prefer longest
+  const clusters = new Map<string, Array<{ name: string; score: number; high: number }>>();
+  for (const [name, a] of aggs) {
     const toks = name.split(/\s+/);
     if (toks.length < 2) continue;
     const key = toks.slice(0, 2).join(" ").toLowerCase();
     const arr = clusters.get(key) || [];
-    arr.push({ name, count });
+    arr.push({ name, score: a.score, high: a.highSignals });
     clusters.set(key, arr);
   }
 
-  const merged: Array<{ name: string; score: number }> = [];
+  const merged: Array<{ name: string; score: number; high: number }> = [];
   for (const arr of clusters.values()) {
     arr.sort((a, b) => {
       const al = a.name.split(/\s+/).length, bl = b.name.split(/\s+/).length;
       if (al !== bl) return bl - al;
-      if (a.count !== b.count) return b.count - a.count;
+      if (a.score !== b.score) return b.score - a.score;
       return a.name.localeCompare(b.name);
     });
-
     const longest = arr[0].name;
     const longLower = longest.toLowerCase();
     let score = 0;
-    for (const { name, count } of arr) {
-      const nLower = name.toLowerCase();
-      if (longLower.startsWith(nLower) || nLower.startsWith(longLower)) score += count;
+    let high = 0;
+    for (const e of arr) {
+      const nLower = e.name.toLowerCase();
+      if (longLower.startsWith(nLower) || nLower.startsWith(longLower)) { score += e.score; high += e.high; }
     }
-    merged.push({ name: longest, score });
+    merged.push({ name: longest, score, high });
   }
 
-  if (merged.length) {
-    merged.sort((a, b) => b.score - a.score);
+  merged.sort((a, b) => b.score - a.score);
 
-    const withHigh = merged.filter(m => (highSignalSeen[m.name] || 0) > 0);
-
-    let pick = merged[0];
-    if (withHigh.length) {
-      const bestHigh = withHigh[0];
-      const bestOverall = merged[0];
-
-      if ((highSignalSeen[bestOverall.name] || 0) === 0) {
-        if (bestOverall.score < 1.5 * bestHigh.score) {
-          pick = bestHigh;
-        } else {
-          pick = bestOverall;
-        }
-      } else {
-        pick = bestOverall;
-      }
+  // pick primary; prefer one with high signals unless another has massively more score
+  let primary = merged[0];
+  const withHigh = merged.filter(m => m.high > 0);
+  if (withHigh.length) {
+    const bestHigh = withHigh[0];
+    if (primary.high === 0 && primary.score < 1.5 * bestHigh.score) {
+      primary = bestHigh;
     }
-
-    const confidence = pick.score >= 2 ? 0.95 : 0.8;
-    return { name: pick.name, confidence, debug: { expanded, query, items, candidates, merged, highSignalSeen, picked: pick.name } };
   }
 
-  // Fallback
-  const sorted = entries.sort((a, b) => {
-    if (b[1] !== a[1]) return b[1] - a[1];
-    return b[0].split(/\s+/).length - a[0].split(/\s+/).length;
-  });
-  const [best, count] = sorted[0];
-  const confidence = count >= 2 ? 0.95 : 0.8;
-  return { name: best, confidence, debug: { expanded, query, items, candidates, picked: best } };
+  // confidence heuristic
+  const second = merged[1];
+  let confidence = primary.score >= 1.6 ? 0.95 : 0.8;
+  if (second) {
+    const gap = (primary.score - second.score) / Math.max(1, primary.score);
+    if (gap < 0.1 && (primary.high > 0 && second.high > 0)) {
+      confidence = Math.max(0.85, confidence - 0.05);
+    }
+  }
+
+  const coAuthors = merged.slice(1).map(m => m.name);
+
+  return {
+    primary: primary?.name || null,
+    coAuthors,
+    confidence,
+    ranked: merged.map(m => ({ name: m.name, score: Number(m.score.toFixed(3)) })),
+    debug: { expanded, query, items, aggs: Object.fromEntries([...aggs].map(([k, v]) => [k, { ...v, score: Number(v.score.toFixed(3)) }])) }
+  };
 }
 
 /* =============================
@@ -644,8 +708,8 @@ async function fetchPageText(url: string, ms = 5500): Promise<string> {
     const resp = await fetchWithTimeout(url, { headers: { Accept: "text/html,*/*" } }, ms);
     if (!resp?.ok) return "";
     // stream and cap
-    const reader = resp.body?.getReader();
-    if (!reader) return await resp.text();
+    const reader = (resp as any).body?.getReader?.();
+    if (!reader) return extractVisibleText(await resp.text());
     let received = 0;
     const chunks: Uint8Array[] = [];
     while (true) {
@@ -673,7 +737,6 @@ function concatUint8(parts: Uint8Array[]): Uint8Array {
 }
 
 function extractVisibleText(html: string): string {
-  // keep meta/title content; also capture JSON-LD before stripping scripts
   const metaBits: string[] = [];
 
   // META/TITLE
@@ -687,14 +750,13 @@ function extractVisibleText(html: string): string {
   );
   const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? "";
 
-  // JSON-LD (Person/Book signals)
+  // JSON-LD blobs
   const jsonLdMatches = html.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
   for (const block of jsonLdMatches) {
     const inner = block.match(/<script[^>]*>([\s\S]*?)<\/script>/i)?.[1];
     if (inner) metaBits.push(inner);
   }
 
-  // Strip scripts/styles/comments/tags for visible text
   let txt = html
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
@@ -724,8 +786,8 @@ function overlapRatio(a: string[], b: string[]): number {
   return inter / Math.min(A.size, B.size);
 }
 
+/** Boost *authorship* indicators instead of penalizing "sporty" content */
 function hasJsonLdPersonOrBook(htmlOrText: string, author: string, bookTitle: string): { person: boolean; book: boolean } {
-  // quick-and-dirty detection without a full HTML parser
   const h = htmlOrText;
   const a = norm(author).replace(/"/g, '\\"');
   const b = norm(bookTitle).replace(/"/g, '\\"');
@@ -735,55 +797,27 @@ function hasJsonLdPersonOrBook(htmlOrText: string, author: string, bookTitle: st
   return { person: !!hasPerson, book: !!hasBook };
 }
 
-/* ============================================================================
-   NEW: Authorish cue boost (replaces sporty penalty) + revised content scoring
-   ========================================================================== */
-function authorishCueScore(text: string): number {
-  // Count lightweight authorship indicators; saturate around 4 hits.
-  const cues = [
-    /\b(author|novelist|writer|essayist|poet)\b/i,
-    /\bbooks?\b/i,
-    /\b(publications?|works|writing|bibliography)\b/i,
-    /\bmy\s+(new|latest)?\s*book\b/i,
-    /\b(isbn|hardcover|paperback|audiobook|ebook)\b/i,
-    /\b(published|publisher|imprint)\b/i,
-    /\btable\s+of\s+contents\b/i,
-    /\b(excerpt|sample chapter)\b/i
-  ];
-  let hits = 0;
-  for (const re of cues) if (re.test(text)) hits++;
-  // map 0..4+ hits -> 0..1
-  return Math.min(1, hits * 0.25);
-}
-
 function contentSignalsForSite(text: string, author: string, bookTitle: string): number {
-  // weighted content-score 0..1 (favor positive evidence)
   const a = norm(author);
-
   const bag = tokenBag(text);
   const bookOverlap = overlapRatio(bag, tokenBag(bookTitle)); // 0..1
   const aExact = new RegExp(`\\b${a.replace(/\s+/g, "\\s+")}\\b`, "i").test(text) ? 1 : 0;
-  const aboutName = new RegExp(`\\babout\\s+${a.replace(/\s+/g, "\\s+")}\\b`, "i").test(text) ? 1 : 0;
-  const byName = new RegExp(`\\bby\\s+${a.replace(/\s+/g, "\\s+")}\\b`, "i").test(text) ? 1 : 0;
+
+  // authorship indicators (boosts)
+  const hasBooksPage = /\b(books|publications|titles|works)\b/i.test(text) ? 1 : 0;
+  const mentionsAuthorRole = /\b(author|writer|written by|byline)\b/i.test(text) ? 1 : 0;
 
   const { person, book } = hasJsonLdPersonOrBook(text, author, bookTitle);
-  const authorCues = authorishCueScore(text);
 
-  // Weighting sums to 1.0; emphasizes book/author linkage + explicit author cues.
   let score =
-    0.35 * Math.min(1, bookOverlap * 1.5) +
-    0.20 * aExact +
-    0.05 * (aboutName || byName ? 1 : 0) +
-    0.15 * (person ? 1 : 0) +
-    0.10 * (book ? 1 : 0) +
-    0.15 * authorCues;
+    0.40 * Math.min(1, bookOverlap * 1.5) +
+    0.18 * aExact +
+    0.12 * hasBooksPage +
+    0.10 * mentionsAuthorRole +
+    0.12 * (person ? 1 : 0) +
+    0.08 * (book ? 1 : 0);
 
-  // OPTIONAL tie-breaker: cap score for pages with no cues and no book overlap.
-  if (authorCues < 0.1 && bookOverlap < 0.1) {
-    score = Math.min(score, 0.55);
-  }
-
-  return Math.max(0, Math.min(1, score));
+  return Math.min(1, score);
 }
 
 /* =============================
@@ -833,7 +867,6 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
       const host = u.host.toLowerCase();
       if (isBlockedHost(host)) continue;
       const urlScore = scoreCandidateUrl(u, author);
-      // keep only one per domain
       if (!candidates.some(c => c.urlObj.host === u!.host)) {
         candidates.push({ urlObj: u, urlScore, fromQuery: q });
       }
@@ -841,7 +874,7 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
   }
 
   if (!candidates.length) {
-    return { url: null, debug: { tried: queries, threshold: WEBSITE_MIN_SCORE } };
+    return { url: null, debug: { tried: "broad_author_query", threshold: WEBSITE_MIN_SCORE } };
   }
 
   // Validate content on top few domains
@@ -892,7 +925,6 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
       }
     }
 
-    // Combine URL & content scores
     const finalScore = 0.45 * c.urlScore + 0.55 * bestContent;
     validations.push({
       origin,
@@ -925,7 +957,6 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     };
   }
 
-  // No confident author site — return null so callers can treat as “no personal site”
   return {
     url: null,
     debug: { threshold, candidates: validations.slice(0, 5) }
@@ -946,21 +977,29 @@ export default async function handler(req: any, res: any) {
     if (!bookTitle) return res.status(400).json({ error: "book_title required" });
 
     const authorRes = await resolveAuthor(bookTitle);
-    if (!authorRes.name) {
+    if (!authorRes.primary) {
       return res.status(200).json({
         book_title: bookTitle,
-        inferred_author: null,
+        primary_author: null,
+        co_authors: [],
+        inferred_author: null,              // backward-compat
+        author_confidence: 0,               // backward-compat
+        author_url: null,
         confidence: 0,
         error: "no_author_found",
         _diag: { flags: { USE_SEARCH, CSE_KEY: !!CSE_KEY, CSE_ID: !!CSE_ID, WEBSITE_MIN_SCORE }, author: authorRes.debug }
       });
     }
 
-    const siteRes = await resolveWebsite(authorRes.name, bookTitle);
+    const siteRes = await resolveWebsite(authorRes.primary, bookTitle);
 
     return res.status(200).json({
       book_title: bookTitle,
-      inferred_author: authorRes.name,
+      primary_author: authorRes.primary,
+      co_authors: authorRes.coAuthors,
+      authors_ranked: authorRes.ranked,
+      // backward-compat fields
+      inferred_author: authorRes.primary,
       author_confidence: authorRes.confidence,
       author_url: siteRes.url,
       confidence: siteRes.url ? 0.9 : 0,
