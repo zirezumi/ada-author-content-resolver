@@ -63,8 +63,10 @@ class LruTtl<K, V> {
     if (this.map.has(k)) this.map.delete(k);
     this.map.set(k, { v, exp: Date.now() + (ttlMs ?? this.defaultTtlMs) });
     while (this.map.size > this.max) {
-      const first = this.map.keys().next().value;
-      this.map.delete(first);
+      const it = this.map.keys().next();
+      if (it.done) break;
+      // it.value is K when not done
+      this.map.delete(it.value as K);
     }
   }
 }
@@ -762,7 +764,6 @@ function overlapRatio(a: string[], b: string[]): number {
 }
 
 function hasJsonLdPersonOrBook(htmlOrText: string, author: string, bookTitle: string): { person: boolean; book: boolean } {
-  // quick-and-dirty detection without a full HTML parser
   const h = htmlOrText;
   const a = norm(author).replace(/"/g, '\\"');
   const b = norm(bookTitle).replace(/"/g, '\\"');
@@ -773,22 +774,19 @@ function hasJsonLdPersonOrBook(htmlOrText: string, author: string, bookTitle: st
 }
 
 function contentSignalsForSite(text: string, author: string, bookTitle: string): number {
-  // weighted content-score 0..1
   const a = norm(author);
 
   const bag = tokenBag(text);
-  const bookOverlap = overlapRatio(bag, tokenBag(bookTitle)); // 0..1
+  const bookOverlap = overlapRatio(bag, tokenBag(bookTitle));
   const aExact = new RegExp(`\\b${a.replace(/\s+/g, "\\s+")}\\b`, "i").test(text) ? 1 : 0;
   const aboutName = new RegExp(`\\babout\\s+${a.replace(/\s+/g, "\\s+")}\\b`, "i").test(text) ? 1 : 0;
   const byName = new RegExp(`\\bby\\s+${a.replace(/\s+/g, "\\s+")}\\b`, "i").test(text) ? 1 : 0;
 
   const { person, book } = hasJsonLdPersonOrBook(text, author, bookTitle);
 
-  // penalties for obvious wrong-person cues when NO book signals are present
   const sporty = /\b(olympian|olympics|ski|nfl|nba|cyclist|triathlete)\b/i.test(text) ? 1 : 0;
   const altCareerPenalty = (sporty && bookOverlap < 0.2) ? 0.25 : 0;
 
-  // combine
   let score =
     0.45 * Math.min(1, bookOverlap * 1.5) +
     0.2 * aExact +
@@ -831,7 +829,7 @@ function scoreCandidateUrl(u: URL, author: string): number {
 const WEBSITE_MIN_SCORE = Number(process.env.WEBSITE_MIN_SCORE ?? 0.6);
 
 /* =============================
-   Phase 2: Resolve Website (single CSE domain discovery + parallel validation + one multi-site query)
+   Phase 2: Resolve Website
    ============================= */
 async function resolveWebsite(author: string, bookTitle: string): Promise<{ url: string|null, debug: any }> {
   const cacheKey = `${author}::cands`;
@@ -842,7 +840,6 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
   if (cachedCands) {
     candidates = cachedCands;
   } else {
-    // Single broad query for author website discovery (collapses 3 calls into 1)
     const q = `"${author}" (official|homepage|site|"author website"|bio|books) -twitter -facebook -linkedin -instagram`;
     const items = await googleCSE(q, 10);
 
@@ -857,12 +854,10 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
       if (seen.has(host)) continue;
       seen.add(host);
       const urlScore = scoreCandidateUrl(u, author);
-      // prune weak non-name-like hosts early
       if (urlScore < 0.3) continue;
       tmp.push({ host, origin: u.origin, urlScore });
     }
 
-    // keep top 5 by URL score
     candidates = tmp.sort((a, b) => b.urlScore - a.urlScore).slice(0, 5);
     siteCandidatesCache.set(cacheKey, candidates);
   }
@@ -871,7 +866,6 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     return { url: null, debug: { tried: "broad_author_query", threshold: WEBSITE_MIN_SCORE } };
   }
 
-  // Validate top few domains in PARALLEL with early bail when threshold crossed
   const validations: Array<{
     origin: string;
     urlScore: number;
@@ -882,11 +876,8 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
   }> = [];
 
   const authorToks = tokens(author).filter(t => t.length > 2);
-
-  // helper to compute final score
   const combineScore = (urlScore: number, contentScore: number) => 0.45 * urlScore + 0.55 * contentScore;
 
-  // fetch paths in parallel per domain
   for (const c of candidates) {
     const origin = c.origin;
     const paths = ["/", "/books", "/book", "/works", "/publications", "/titles", "/about", "/bio"];
@@ -901,7 +892,6 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
       const s = contentSignalsForSite(txt, author, bookTitle);
       samples.push({ path: paths[i], contentScore: s });
       bestContent = Math.max(bestContent, s);
-      // EARLY BAIL: if strong enough, no more work for this domain
       if (bestContent >= 0.85) break;
     }
 
@@ -915,7 +905,6 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     });
   }
 
-  // If any domain already crosses threshold, pick the best and return
   validations.sort((a, b) => b.finalScore - a.finalScore);
   const prelimTop = validations[0];
 
@@ -926,26 +915,22 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     return { url: prelimTop.origin, debug: { threshold: thresholdPrelim, picked: prelimTop, candidates: validations.slice(0, 5) } };
   }
 
-  // ONE multi-site query to check if the book appears on any of the candidate domains
-  // (replaces up to 5 individual site:<host> queries)
   const domains = validations.map(v => new URL(v.origin).host);
   const orSites = domains.map(d => `site:${d}`).join(" OR ");
   const multiSiteQ = `"${bookTitle}" (${orSites})`;
   const multiHits = await googleCSE(multiSiteQ, 6);
 
-  // Boost content score for domains that receive a hit, and (optionally) fetch ONE hit page per domain for better scoring
-  const boostedByHost = new Map<string, number>(); // host -> extra
+  const boostedByHost = new Map<string, number>();
   const hitLinksByHost = new Map<string, string>();
   for (const h of multiHits) {
     let u: URL | null = null;
     try { u = new URL(h.link); } catch { continue; }
     const host = u.host.toLowerCase();
     if (!domains.includes(host)) continue;
-    boostedByHost.set(host, Math.max(0.12, boostedByHost.get(host) ?? 0.12)); // modest boost for presence
-    hitLinksByHost.set(host, u.toString()); // remember one concrete page to score
+    boostedByHost.set(host, Math.max(0.12, boostedByHost.get(host) ?? 0.12));
+    hitLinksByHost.set(host, u.toString());
   }
 
-  // Optionally fetch the hit page (not another CSE call) to improve contentScore cheaply
   await Promise.allSettled(validations.map(async (v) => {
     const host = new URL(v.origin).host.toLowerCase();
     const key = `${host}::${norm(bookTitle)}`;
@@ -959,14 +944,12 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     if (hit) {
       const txt = await fetchPageText(hit, 2500);
       const s = contentSignalsForSite(txt, author, bookTitle);
-      // store in cache and apply extra presence boost
       const presenceBoost = boostedByHost.get(host) ?? 0;
       const combined = Math.min(1, Math.max(v.contentScore, s) + presenceBoost);
       siteMentionCache.set(key, combined);
       v.contentScore = combined;
       v.finalScore = combineScore(v.urlScore, v.contentScore);
     } else if (boostedByHost.has(host)) {
-      // No fetch, but still apply small boost
       const combined = Math.min(1, v.contentScore + (boostedByHost.get(host) ?? 0));
       siteMentionCache.set(key, combined);
       v.contentScore = combined;
@@ -974,7 +957,6 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     }
   }));
 
-  // pick best validated site
   validations.sort((a, b) => b.finalScore - a.finalScore);
   const top = validations[0];
 
@@ -994,7 +976,6 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     };
   }
 
-  // No confident author site — return null so callers can treat as “no personal site”
   return {
     url: null,
     debug: { threshold, candidates: validations.slice(0, 5), multiSiteQuery: multiSiteQ }
