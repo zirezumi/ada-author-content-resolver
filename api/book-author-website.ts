@@ -9,6 +9,7 @@
  * - Deterministic tie-breaks
  * - Versioned LRU caches for Google CSE queries, title expansion, and site validations
  * - Borderline telemetry in _diag for observability
+ * - Hardened name-boundary detection and tail cleanup (prevents “Malcolm Gladwell Due”)
  */
 
 /* =============================
@@ -19,7 +20,7 @@ export const config = { runtime: "nodejs" } as const;
 /* =============================
    Build/logic versioning (for caches)
    ============================= */
-const RESOLVER_VERSION = process.env.RESOLVER_VERSION ?? "2025-10-26-a";
+const RESOLVER_VERSION = process.env.RESOLVER_VERSION ?? "2025-10-26-b";
 
 /* =============================
    Flags / Tunables (ENV)
@@ -77,11 +78,10 @@ const AUTH_SECRETS: string[] = (process.env.AUTHOR_UPDATES_SECRET || "")
 
 function headerCI(req: any, name: string): string | undefined {
   if (!req?.headers) return undefined;
-  // Node/Vercel headers can be string | string[] | undefined — normalize to string
-  const val = Object.entries(req.headers).find(
-    ([k]) => k.toLowerCase() === name.toLowerCase()
-  )?.[1];
-  if (Array.isArray(val)) return val[0];
+  const ent = Object.entries(req.headers).find(([k]) => k.toLowerCase() === name.toLowerCase());
+  if (!ent) return undefined;
+  const val = ent[1] as any;
+  if (Array.isArray(val)) return val[0] as string;
   return typeof val === "string" ? val : undefined;
 }
 
@@ -113,26 +113,19 @@ type CacheVal<T> = { value: T; expires: number; neg?: boolean };
 class LRU<K, V> {
   private map = new Map<K, CacheVal<V>>();
   constructor(private max = 256) {}
-
   get(key: K): CacheVal<V> | undefined {
     const v = this.map.get(key);
     if (!v) return undefined;
-    // touch (move to most-recent)
     this.map.delete(key);
     this.map.set(key, v);
     return v;
   }
-
   set(key: K, val: CacheVal<V>): void {
     if (this.map.has(key)) this.map.delete(key);
     this.map.set(key, val);
-
     if (this.map.size > this.max) {
       const it = this.map.keys().next();
-      if (!it.done) {
-        const firstKey = it.value as K; // guarded by !done
-        this.map.delete(firstKey);
-      }
+      if (!it.done) this.map.delete(it.value as K);
     }
   }
 }
@@ -167,10 +160,7 @@ async function fetchWithRetryAbort(url: string, init: RequestInit | undefined, m
       return await fetchWithTimeout(url, init, ms);
     } catch (err: any) {
       const isAbort = (err?.name === "AbortError") || /aborted/i.test(String(err?.message || ""));
-      if (isAbort && attempt < retries) {
-        attempt++;
-        continue;
-      }
+      if (isAbort && attempt < retries) { attempt++; continue; }
       throw err;
     }
   }
@@ -196,7 +186,6 @@ async function googleCSE(query: string, num = 10): Promise<any[]> {
   const resp = await fetchWithRetryAbort(url.toString(), undefined, FETCH_TIMEOUT_GENERAL_MS, FETCH_RETRY_ON_ABORT);
   if (!resp?.ok) {
     const text = await resp?.text?.();
-    // negative cache brief
     lruCSE.set(key, { value: [], expires: now + CACHE_TTL_NEG_MS, neg: true });
     throw new Error(`cse_http_${resp?.status}: ${text || ""}`.slice(0, 240));
   }
@@ -236,7 +225,6 @@ function hostOf(link: string): string {
 }
 
 function apexOfHost(host: string): string {
-  // naive public suffix handling: co.uk style special-case
   const parts = host.split(".");
   if (parts.length >= 3 && (host.endsWith(".co.uk") || host.endsWith(".com.au") || host.endsWith(".co.jp"))) {
     return parts.slice(-3).join(".");
@@ -319,6 +307,35 @@ function isParticle(tok: string): boolean { return MIDDLE_PARTICLES.has(tok.toLo
 function isSuffix(tok: string): boolean { return GENERATIONAL_SUFFIX.has(tok.toLowerCase()); }
 function looksLikeAdverb(tok: string): boolean { return /^[A-Za-z]{3,}ly$/u.test(tok); }
 
+/** NEW: Keepable & droppable suffix logic */
+const KEEPABLE_SUFFIX = new Set([
+  "jr","jr.","sr","sr.","ii","iii","iv","v","phd","ph.d.","md","m.d.","obe","cbe"
+]);
+
+const DROP_IF_TRAILING = new Set([
+  "due","because","however","meanwhile","thus","therefore","but","review","interview","analysis","explained","explainer","says","writes"
+]);
+
+function endsWithKeepableSuffix(name: string): boolean {
+  const toks = name.trim().split(/\s+/);
+  const last = (toks[toks.length - 1] || "").toLowerCase();
+  return KEEPABLE_SUFFIX.has(last);
+}
+
+function stripDiscourseTail(name: string): string {
+  let toks = name.trim().split(/\s+/);
+  while (toks.length > 1) {
+    const last = toks[toks.length - 1];
+    const low = last.toLowerCase();
+    if (KEEPABLE_SUFFIX.has(low)) break;
+    if (DROP_IF_TRAILING.has(low)) { toks.pop(); continue; }
+    if (/^\d{1,4}$/.test(last)) { toks.pop(); continue; } // drop year/artifact
+    if (/^[a-z]+$/.test(last)) { toks.pop(); continue; }  // trailing lowercase token
+    break;
+  }
+  return toks.join(" ");
+}
+
 function nameLikeness(raw: string): number {
   const s = raw.trim().replace(/\s+/g, " ");
   if (!s) return 0;
@@ -351,6 +368,7 @@ function nameLikeness(raw: string): number {
 
   if (BAD_TAIL.has(last.toLowerCase())) score -= 0.7;
   if (!lastIsSuffix && looksLikeAdverb(last)) score -= 0.6;
+  if (DROP_IF_TRAILING.has(last.toLowerCase())) score -= 0.6; // NEW: penalize discourse tails
   if (/\d/.test(s)) score -= 0.8;
   if (/[;:!?]$/.test(s)) score -= 0.2;
 
@@ -402,12 +420,16 @@ function stripTrailingGarbage(s: string): string {
   let parts = s.split(/\s+/);
   let changed = false;
   while (parts.length > 1) {
-    const last = parts[parts.length - 1].toLowerCase();
+    const last = parts[parts.length - 1];
+    const low = last.toLowerCase();
     if (
-      NAME_TAIL_GARBAGE.has(last) ||
-      BAD_TAIL.has(last) ||
+      NAME_TAIL_GARBAGE.has(low) ||
+      BAD_TAIL.has(low) ||
       looksLikeAdverb(last) ||
-      ROLE_TAIL_TOKENS.has(last)
+      ROLE_TAIL_TOKENS.has(low) ||
+      DROP_IF_TRAILING.has(low) ||      // NEW: discourse tails
+      /^[a-z]+$/.test(last) ||          // NEW: trailing lowercase token
+      /^\d{1,4}$/.test(last)            // NEW: trailing year/number artifact
     ) {
       parts.pop();
       changed = true;
@@ -439,7 +461,7 @@ function isOrgishName(name: string): boolean {
 }
 
 /* =============================
-   Clean + validate a candidate
+   Clean + validate a candidate (HARDENED)
    ============================= */
 function normalizeNameCandidate(raw: string, title: string): string | null {
   let s = raw.trim()
@@ -450,7 +472,8 @@ function normalizeNameCandidate(raw: string, title: string): string | null {
   s = s.split(/\s+/).map(tok => tok.replace(/[.,;:]+$/g, "")).join(" ");
 
   s = cleanRoleArtifacts(s);
-  s = stripTrailingGarbage(s);
+  s = stripDiscourseTail(s);   // NEW: drop “Due”, “Because”, etc.
+  s = stripTrailingGarbage(s); // existing + NEW tails
 
   if (isOrgishName(s)) return null;
 
@@ -465,19 +488,13 @@ function normalizeNameCandidate(raw: string, title: string): string | null {
     if (overlap === 2) return null;
   }
 
-  const parts = s.split(" ");
-  const last = parts[parts.length - 1];
-  if (BAD_TAIL.has(last.toLowerCase()) || looksLikeAdverb(last) || ROLE_TAIL_TOKENS.has(last.toLowerCase())) {
-    if (parts.length >= 3) { parts.pop(); s = parts.join(" "); }
-  }
-
+  // One more pass in case tail rules exposed new garbage
+  s = stripDiscourseTail(s);
   s = stripTrailingGarbage(s);
   if (isOrgishName(s)) return null;
 
   const likeness = nameLikeness(s);
-  // Keep original cutoff, but log near misses in _diag
-  if (likeness >= NAME_ACCEPT_CUTOFF) return s;
-  return null;
+  return likeness >= NAME_ACCEPT_CUTOFF ? s : null;
 }
 
 /* =============================
@@ -647,29 +664,29 @@ function extractAuthorSignals(text: string, opts?: { booky?: boolean; title?: st
     out.push({ kind: "written_by", name: cleanRoleArtifacts(m[1]) });
   }
   while ((m = RE_BYLINE_BLOCK.exec(text))) {
-    const list = splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean);
+    const list = splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).map(stripDiscourseTail).filter(Boolean);
     list.forEach((n, i) => out.push({ kind: "byline_ordered", name: n, position: i }));
     if (m[2]) {
-      const withList = splitNamesList(m[2]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean);
+      const withList = splitNamesList(m[2]).map(cleanRoleArtifacts).map(stripTrailingGarbage).map(stripDiscourseTail).filter(Boolean);
       withList.forEach((n) => out.push({ kind: "with", name: n }));
     }
   }
   while ((m = RE_EDITED_BY.exec(text))) {
-    splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean)
+    splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).map(stripDiscourseTail).filter(Boolean)
       .forEach((n) => out.push({ kind: "editor", name: n }));
   }
   while ((m = RE_FOREWORD_BY.exec(text))) {
-    out.push({ kind: "foreword", name: cleanRoleArtifacts(m[1]) });
+    out.push({ kind: "foreword", name: cleanRoleArtifacts(stripDiscourseTail(m[1])) });
   }
   while ((m = RE_ILLUSTRATED_BY.exec(text))) {
-    splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean)
+    splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).map(stripDiscourseTail).filter(Boolean)
       .forEach((n) => out.push({ kind: "illustrator", name: n }));
   }
 
   if (booky) {
     while ((m = RE_LAST_FIRST.exec(text))) {
       const name = `${m[2]} ${m[1]}`;
-      out.push({ kind: "plain_last_first", name: cleanRoleArtifacts(name) });
+      out.push({ kind: "plain_last_first", name: cleanRoleArtifacts(stripDiscourseTail(name)) });
     }
   }
 
@@ -795,7 +812,7 @@ async function resolveAuthor(bookTitle: string): Promise<{
     };
   }
 
-  // Merge short/long variants by first two tokens, prefer longest
+  // Merge short/long variants by first two tokens, now preferring SHORTEST canonical
   const clusters = new Map<string, Array<{ name: string; score: number; high: number }>>();
   for (const [name, a] of aggs) {
     const toks = name.split(/\s+/);
@@ -808,21 +825,33 @@ async function resolveAuthor(bookTitle: string): Promise<{
 
   const merged: Array<{ name: string; score: number; high: number }> = [];
   for (const arr of clusters.values()) {
-    arr.sort((a, b) => {
+    // Choose canonical: SHORTEST unless a longer ends with a keepable suffix (Jr., III, Ph.D., etc.)
+    const sorted = [...arr].sort((a, b) => {
       const al = a.name.split(/\s+/).length, bl = b.name.split(/\s+/).length;
-      if (al !== bl) return bl - al;
+      if (al !== bl) return al - bl; // shortest first
       if (a.score !== b.score) return b.score - a.score;
       return a.name.localeCompare(b.name);
     });
-    const longest = arr[0].name;
-    const longLower = longest.toLowerCase();
+
+    // Find shortest; if it lacks keepable suffix but a longer same-root has it, pick that longer
+    let canonical = sorted[0].name;
+    const withSuffix = arr.find(e => endsWithKeepableSuffix(e.name));
+    if (withSuffix) {
+      const base = canonical.toLowerCase();
+      const sufBase = withSuffix.name.toLowerCase().replace(/\s+(?:jr\.?|sr\.?|ii|iii|iv|v|ph\.?d\.?|m\.?d\.?|obe|cbe)$/i, "");
+      if (base === sufBase) canonical = withSuffix.name;
+    }
+
+    // Sum scores across near-duplicates (prefix / suffix variants)
+    const canonLow = canonical.toLowerCase();
     let score = 0;
     let high = 0;
     for (const e of arr) {
-      const nLower = e.name.toLowerCase();
-      if (longLower.startsWith(nLower) || nLower.startsWith(longLower)) { score += e.score; high += e.high; }
+      const nLow = e.name.toLowerCase();
+      const sameRoot = nLow === canonLow || nLow.startsWith(canonLow + " ") || canonLow.startsWith(nLow + " ");
+      if (sameRoot) { score += e.score; high += e.high; }
     }
-    merged.push({ name: longest, score, high });
+    merged.push({ name: canonical, score, high });
   }
 
   merged.sort((a, b) => b.score - a.score);
@@ -880,7 +909,6 @@ async function fetchPageText(url: string, ms = FETCH_TIMEOUT_SAMPLE_MS): Promise
       lruFetchText.set(key, { value: "", expires: now + CACHE_TTL_NEG_MS, neg: true });
       return "";
     }
-    // stream and cap
     const reader = (resp as any).body?.getReader?.();
     if (!reader) {
       const raw = await resp.text();
@@ -978,344 +1006,4 @@ function contentSignalsForSite(text: string, author: string, bookTitle: string):
   const bookOverlap = overlapRatio(bag, tokenBag(bookTitle)); // 0..1
   const aExact = new RegExp(`\\b${a.replace(/\s+/g, "\\s+")}\\b`, "i").test(text) ? 1 : 0;
 
-  const hasBooksPage = /\b(books|publications|titles|works)\b/i.test(text) ? 1 : 0;
-  const mentionsAuthorRole = /\b(author|writer|written by|byline)\b/i.test(text) ? 1 : 0;
-
-  const { person, book } = hasJsonLdPersonOrBook(text, author, bookTitle);
-
-  let score =
-    0.40 * Math.min(1, bookOverlap * 1.5) +
-    0.18 * aExact +
-    0.12 * hasBooksPage +
-    0.10 * mentionsAuthorRole +
-    0.12 * (person ? 1 : 0) +
-    0.08 * (book ? 1 : 0);
-
-  return Math.min(1, score);
-}
-
-/* =============================
-   Domain classification + priors + early-accept
-   ============================= */
-function isPlatformHost(host: string): boolean {
-  return PLATFORM_HOSTS.some(p => host.includes(p));
-}
-
-function isPersonalHostForAuthor(host: string, author: string): boolean {
-  // e.g., cherylstrayed.com, paula-hawkins.net
-  const apex = apexOfHost(host);
-  if (isPlatformHost(host)) return false;
-  const aToks = tokens(author).filter(t => t.length > 1);
-  const joined = aToks.join("");
-  const apexNoDot = apex.replace(/\./g, "");
-  return aToks.every(t => apexNoDot.includes(t)) || apexNoDot.includes(joined);
-}
-
-function domainPrior(host: string, author: string): number {
-  if (isPersonalHostForAuthor(host, author)) return 2;  // strongest
-  if (isPlatformHost(host)) return 0;                   // weakest
-  return 1;                                             // neutral
-}
-
-/* =============================
-   Phase 2: Candidate URL scoring (helpers + threshold)
-   ============================= */
-const BLOCKED_DOMAINS = [
-  "wikipedia.org","goodreads.com","google.com","books.google.com","reddit.com",
-  "amazon.","barnesandnoble.com","bookshop.org","penguinrandomhouse.com",
-  "harpercollins.com","simonandschuster.com","macmillan.com","hachettebookgroup.com",
-  "spotify.com","apple.com"
-];
-
-function isBlockedHost(host: string): boolean {
-  return BLOCKED_DOMAINS.some((d) => host.includes(d));
-}
-
-function scoreCandidateUrl(u: URL, author: string): number {
-  let score = 0;
-  const pathDepth = u.pathname.split("/").filter(Boolean).length;
-  if (pathDepth === 0) score += 0.5;
-  if (u.protocol === "https:") score += 0.1;
-
-  const toks = tokens(author).filter(t => t.length > 2);
-  const host = u.host.toLowerCase();
-  for (const t of toks) if (host.includes(t)) score += 0.4;
-
-  return Math.min(1, score);
-}
-
-/* =============================
-   Website resolver with capped probes, early-accept, caching
-   ============================= */
-async function resolveWebsite(author: string, bookTitle: string): Promise<{ url: string|null, debug: any }> {
-  const cacheK = cacheKey(["site", RESOLVER_VERSION, author, bookTitle]);
-  const cached = lruSiteValidation.get(cacheK);
-  const now = Date.now();
-
-  const queries = [
-    `"${author}" official site`,
-    `"${author}" author website`,
-    `"${bookTitle}" "${author}" author website`,
-  ];
-
-  const candidates: Array<{ urlObj: URL; urlScore: number; fromQuery: string }> = [];
-  for (const q of queries) {
-    const items = await googleCSE(q, 10);
-    for (const it of items) {
-      let u: URL | null = null;
-      try { u = new URL(it.link); } catch { continue; }
-      const host = u.host.toLowerCase();
-      if (isBlockedHost(host)) continue;
-      const urlScore = scoreCandidateUrl(u, author);
-      if (!candidates.some(c => c.urlObj.host === u!.host)) {
-        candidates.push({ urlObj: u, urlScore, fromQuery: q });
-      }
-    }
-  }
-
-  if (!candidates.length) {
-    return { url: null, debug: { tried: "broad_author_query", threshold: WEBSITE_MIN_SCORE } };
-  }
-
-  const topFew = candidates
-    .sort((a, b) => {
-      if (b.urlScore !== a.urlScore) return b.urlScore - a.urlScore;
-      // deterministic tie-break: personal host > non-personal > platform, then lexicographic
-      const ap = domainPrior(a.urlObj.host, author);
-      const bp = domainPrior(b.urlObj.host, author);
-      if (bp !== ap) return bp - ap;
-      return a.urlObj.origin.localeCompare(b.urlObj.origin);
-    })
-    .slice(0, 5);
-
-  // If we have a cached validation list for this author/title, reuse it
-  let validations:
-    Array<{
-      origin: string;
-      urlScore: number;
-      contentScore: number;
-      finalScore: number;
-      samples: Array<{ path: string; contentScore: number }>;
-      fromQuery: string;
-    }> = [];
-
-  if (cached && cached.expires > now) {
-    validations = cached.value;
-  } else {
-    for (const c of topFew) {
-      const origin = c.urlObj.origin;
-      const paths: string[] = [];
-
-      // Capped probes: "/" and "/about" always; "/books" only if still weak later
-      paths.push(...PROBE_PATHS_BASE);
-
-      const samples: Array<{ path: string; contentScore: number }> = [];
-
-      // fetch home
-      const homeText = await fetchPageText(origin, FETCH_TIMEOUT_SAMPLE_MS);
-      let bestContent = contentSignalsForSite(homeText, author, bookTitle);
-      samples.push({ path: "/", contentScore: bestContent });
-
-      // short-circuit early accept for personal domains (requires two confirmations)
-      const host = new URL(origin).host.toLowerCase();
-      const mayEarlyAccept =
-        FLAG_EARLY_ACCEPT_PERSONAL_DOMAIN &&
-        isPersonalHostForAuthor(host, author);
-
-      // Always probe "/about" next
-      const aboutText = await fetchPageText(origin + "/about", FETCH_TIMEOUT_SAMPLE_MS);
-      const aboutScore = contentSignalsForSite(aboutText, author, bookTitle);
-      bestContent = Math.max(bestContent, aboutScore);
-      samples.push({ path: "/about", contentScore: aboutScore });
-
-      // If personal domain & early-accept conditions met: author name AND about/books signal
-      let earlyAccepted = false;
-      if (mayEarlyAccept) {
-        const authorNameExact =
-          new RegExp(`\\b${norm(author).replace(/\s+/g, "\\s+")}\\b`, "i").test(homeText) ||
-          new RegExp(`\\b${norm(author).replace(/\s+/g, "\\s+")}\\b`, "i").test(aboutText);
-
-        const hasAboutOrBooksSignal =
-          /\/about\b/i.test("/about") ||
-          /\b(about|bio|books|works|author)\b/i.test(homeText + " " + aboutText);
-
-        if (authorNameExact && hasAboutOrBooksSignal) {
-          // Small minimum content confidence for sanity
-          if (bestContent >= 0.35) {
-            earlyAccepted = true;
-          }
-        }
-      }
-
-      // Optional third probe if still weak and not early-accepted
-      if (!earlyAccepted) {
-        for (const p of PROBE_PATHS_FALLBACK) {
-          if (!FLAG_CAP_PROBES) break;
-          if (bestContent >= 0.85) break;
-          const text = await fetchPageText(origin + p, FETCH_TIMEOUT_SAMPLE_MS);
-          const s = contentSignalsForSite(text, author, bookTitle);
-          bestContent = Math.max(bestContent, s);
-          samples.push({ path: p, contentScore: s });
-        }
-
-        // Fallback site query if weak: search within domain for book and/or author
-        if (bestContent < 0.5) {
-          for (const q of [`"${bookTitle}" site:${c.urlObj.host}`, `"${author}" site:${c.urlObj.host}`]) {
-            const siteHits = await googleCSE(q, 3);
-            const firstHit = siteHits?.find(h => {
-              try { return new URL(h.link).host === c.urlObj.host; } catch { return false; }
-            });
-            if (firstHit) {
-              const t = await fetchPageText(firstHit.link, FETCH_TIMEOUT_SAMPLE_MS);
-              const s = contentSignalsForSite(t, author, bookTitle);
-              bestContent = Math.max(bestContent, s);
-              samples.push({ path: new URL(firstHit.link).pathname, contentScore: s });
-              if (bestContent >= 0.85) break;
-            }
-          }
-        }
-      }
-
-      // Base final score
-      let finalScore = 0.45 * c.urlScore + 0.55 * bestContent;
-
-      // If early-accepted and it's a personal domain, gently lift to win ties/near ties
-      if (earlyAccepted) {
-        finalScore = Math.max(finalScore, WEBSITE_MIN_SCORE + DOMAIN_PRIOR_DELTA);
-      }
-
-      validations.push({
-        origin,
-        urlScore: c.urlScore,
-        contentScore: bestContent,
-        finalScore,
-        samples,
-        fromQuery: c.fromQuery,
-      });
-    }
-
-    // cache validations list
-    lruSiteValidation.set(cacheK, { value: validations, expires: now + CACHE_TTL_POS_MS });
-  }
-
-  // Deterministic sort: by finalScore, then domain prior, then origin
-  validations.sort((a, b) => {
-    if (b.finalScore !== a.finalScore) return b.finalScore - a.finalScore;
-    const ap = domainPrior(new URL(a.origin).host, author);
-    const bp = domainPrior(new URL(b.origin).host, author);
-    if (bp !== ap) return bp - ap;
-    return a.origin.localeCompare(b.origin);
-  });
-
-  // Apply domain prior only on ties/near-ties
-  if (validations.length >= 2) {
-    const a = validations[0];
-    const b = validations[1];
-    const diff = a.finalScore - b.finalScore;
-    if (diff >= 0 && diff <= DOMAIN_PRIOR_DELTA) {
-      const ap = domainPrior(new URL(a.origin).host, author);
-      const bp = domainPrior(new URL(b.origin).host, author);
-      if (bp > ap) {
-        // swap to honor prior
-        validations[0] = b;
-        validations[1] = a;
-      }
-    }
-  }
-
-  const top = validations[0];
-
-  const authorToks = tokens(author).filter(t => t.length > 2);
-  const host = new URL(top.origin).host.toLowerCase();
-  const hostHasAuthor = authorToks.some(t => host.includes(t));
-  const threshold = Math.max(WEBSITE_MIN_SCORE, hostHasAuthor ? 0.60 : 0.70);
-
-  const borderline = validations.length > 1
-    ? Math.abs(validations[0].finalScore - validations[1].finalScore) <= SITE_SCORE_BAND
-    : false;
-
-  if (top.finalScore >= threshold) {
-    return {
-      url: top.origin,
-      debug: {
-        threshold,
-        picked: top,
-        borderline,
-        candidates: validations.slice(0, 5),
-      }
-    };
-  }
-
-  return {
-    url: null,
-    debug: { threshold, borderline, candidates: validations.slice(0, 5) }
-  };
-}
-
-/* =============================
-   Handler
-   ============================= */
-export default async function handler(req: any, res: any) {
-  try {
-    if (req.method === "OPTIONS") return res.status(204).end();
-    if (req.method !== "POST") return res.status(405).json({ error: "POST required" });
-    if (!requireAuth(req, res)) return;
-
-    const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body;
-    const bookTitle: string = String(body.book_title || "").trim();
-    if (!bookTitle) return res.status(400).json({ error: "book_title required" });
-
-    const authorRes = await resolveAuthor(bookTitle);
-    if (!authorRes.primary) {
-      return res.status(200).json({
-        book_title: bookTitle,
-        primary_author: null,
-        co_authors: [],
-        inferred_author: null,
-        author_confidence: 0,
-        author_url: null,
-        confidence: 0,
-        error: "no_author_found",
-        _diag: {
-          flags: {
-            USE_SEARCH, CSE_KEY: !!CSE_KEY, CSE_ID: !!CSE_ID,
-            WEBSITE_MIN_SCORE, FLAG_EARLY_ACCEPT_PERSONAL_DOMAIN, FLAG_CAP_PROBES, FLAG_TOKEN_NAME_SCORE,
-            RESOLVER_VERSION
-          },
-          author: authorRes.debug
-        }
-      });
-    }
-
-    const siteRes = await resolveWebsite(authorRes.primary, bookTitle);
-
-    // Borderline telemetry for authors too (near cutoff)
-    const nearAuthorCutoff = authorRes.ranked.length > 1
-      ? Math.abs(authorRes.ranked[0].score - authorRes.ranked[1].score) <= AUTHOR_SCORE_BAND
-      : false;
-
-    return res.status(200).json({
-      book_title: bookTitle,
-      primary_author: authorRes.primary,
-      co_authors: authorRes.coAuthors,
-      authors_ranked: authorRes.ranked,
-      inferred_author: authorRes.primary,          // backward-compat
-      author_confidence: authorRes.confidence,     // backward-compat
-      author_url: siteRes.url,
-      confidence: siteRes.url ? 0.9 : 0,
-      _diag: {
-        flags: {
-          USE_SEARCH, CSE_KEY: !!CSE_KEY, CSE_ID: !!CSE_ID,
-          WEBSITE_MIN_SCORE, FLAG_EARLY_ACCEPT_PERSONAL_DOMAIN, FLAG_CAP_PROBES, FLAG_TOKEN_NAME_SCORE,
-          RESOLVER_VERSION
-        },
-        borderline: { author: nearAuthorCutoff, site: siteRes.debug?.borderline ?? false },
-        author: authorRes.debug,
-        site: siteRes.debug
-      }
-    });
-  } catch (err: any) {
-    console.error("handler_error", err);
-    return res.status(500).json({ error: String(err?.message || err) });
-  }
-}
+  const hasBooksPage = /\b(books|publications|titles|works)\b/i.test(text) ? 1 : 0
