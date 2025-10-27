@@ -1021,7 +1021,7 @@ const BLOCKED_DOMAINS = [
   "spotify.com","apple.com"
 ];
 
-// NEW: treat platform hosts slightly below personal sites in near ties
+// NEW: treat platform hosts below personal sites in close calls
 const PLATFORM_HOSTS = [
   "substack.com","medium.com","wordpress.com","blogspot.","tumblr.com",
   "linktr.ee","about.me","notion.site","notion.so","square.site","wixsite.com",
@@ -1034,9 +1034,19 @@ function isPlatformHost(host: string): boolean {
 }
 
 function isApexOrWww(host: string): boolean {
-  // treat apex or “www.” as more “official” than deep subdomains
   const parts = host.split(".").filter(Boolean);
   return parts.length <= 2 || (parts.length === 3 && parts[0] === "www");
+}
+
+/** NEW: host contains at least the surname (and usually first) */
+function hostHasAuthorName(host: string, author: string): boolean {
+  const h = host.toLowerCase();
+  const toks = tokens(author).filter(t => t.length > 2);
+  const last = toks[toks.length - 1];
+  if (!last || !h.includes(last)) return false;
+  const first = toks[0];
+  if (first && h.includes(first)) return true;
+  return true;
 }
 
 function isBlockedHost(host: string): boolean {
@@ -1053,11 +1063,11 @@ function scoreCandidateUrl(u: URL, author: string): number {
   const host = u.host.toLowerCase();
   for (const t of toks) if (host.includes(t)) score += 0.4;
 
-  // NEW: small preference for custom apex/www domains
+  // small preference for custom apex/www domains
   if (isApexOrWww(host)) score += 0.05;
 
-  // NEW: small platform penalty (Substack/Medium/etc.)
-  if (isPlatformHost(host)) score -= 0.08;
+  // STRONGER: platform penalty to help personal sites in close calls
+  if (isPlatformHost(host)) score -= 0.12;
 
   return Math.max(0, Math.min(1, score));
 }
@@ -1112,8 +1122,8 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     const origin = c.urlObj.origin;
     const paths = [
       "", "/books", "/book", "/works", "/publications", "/titles", "/about", "/bio",
-      // NEW: common book pages for author sites
-      "/wild", "/books/wild"
+      // extra likely book pages on author sites
+      "/wild", "/books/wild", "/wild.html", "/books/wild.html", "/works/wild"
     ];
     const samples: Array<{ path: string; contentScore: number }> = [];
 
@@ -1153,11 +1163,21 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
       }
     }
 
-    let finalScore = 0.45 * c.urlScore + 0.55 * bestContent;
+    // --- NEW: Official-site evidence floor (helps JS-heavy official sites) ---
+    const host = c.urlObj.host.toLowerCase();
+    const looksPersonal =
+      !isPlatformHost(host) &&
+      isApexOrWww(host) &&
+      hostHasAuthorName(host, author);
+    const cameFromOfficialQuery = /official site/i.test(c.fromQuery);
+    if (looksPersonal && cameFromOfficialQuery && bestContent < 0.58) {
+      bestContent = 0.58; // conservative content floor
+    }
 
-    // NEW: tiny dampener for platforms so a personal site can win close races
+    let finalScore = 0.45 * c.urlScore + 0.55 * bestContent;
+    // NEW: slightly stronger dampener for platforms
     if (isPlatformHost(c.urlObj.host)) {
-      finalScore *= 0.98; // 2% nudge
+      finalScore *= 0.96;
     }
 
     validations.push({
@@ -1176,10 +1196,9 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
   const authorToks2 = tokens(author).filter(t => t.length > 2);
   const personalCandidates = validations.filter(v => {
     const h = new URL(v.origin).host.toLowerCase();
-    const hasAuthor = authorToks2.some(t => h.includes(t));
-    const hostHasAuthor = hasAuthor;
-    const thresholdLike = Math.max(WEBSITE_MIN_SCORE, hostHasAuthor ? 0.60 : 0.70);
-    return !isPlatformHost(h) && hasAuthor && v.contentScore >= Math.max(0.55, thresholdLike);
+    const hasAuthor = hostHasAuthorName(h, author);
+    const thresholdLike = Math.max(WEBSITE_MIN_SCORE, hasAuthor ? 0.60 : 0.70);
+    return !isPlatformHost(h) && hasAuthor && v.contentScore >= Math.max(0.55, thresholdLike - 0.02);
   }).sort((a, b) => b.finalScore - a.finalScore);
 
   let top = validations[0];
@@ -1188,15 +1207,25 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
 
   if (topIsPlatform && personalCandidates.length) {
     const bestPersonal = personalCandidates[0];
-    const closeDelta = 0.12; // within ~12% feels like “close enough”
-    if ((bestPersonal.finalScore + 0.001) >= (top.finalScore - closeDelta)) {
+
+    // If best personal site has decent content AND URL looks authorish,
+    // allow a larger override window (platforms tend to over-index on content score).
+    const delta = top.finalScore - bestPersonal.finalScore;
+    const personalIsApex = isApexOrWww(new URL(bestPersonal.origin).host);
+
+    const allowOverride =
+      delta <= 0.20 &&                    // up to 20% behind is okay
+      bestPersonal.contentScore >= 0.58 && // shows author/book signal
+      personalIsApex;                      // official-ish domain shape
+
+    if (allowOverride) {
       top = bestPersonal;
     }
   }
 
   // Compute threshold for the chosen 'top'
-  const host = new URL(top.origin).host.toLowerCase();
-  const hostHasAuthor2 = authorToks2.some(t => host.includes(t));
+  const hostChosen = new URL(top.origin).host.toLowerCase();
+  const hostHasAuthor2 = authorToks2.some(t => hostChosen.includes(t));
   const threshold = Math.max(WEBSITE_MIN_SCORE, hostHasAuthor2 ? 0.60 : 0.70);
 
   if (top.finalScore >= threshold) {
