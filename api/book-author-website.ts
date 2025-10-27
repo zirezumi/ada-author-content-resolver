@@ -7,35 +7,6 @@
 export const config = { runtime: "nodejs" } as const;
 
 /* =============================
-   Perf helpers (memo + concurrency)
-   ============================= */
-function memoize1<T extends (a: string) => any>(fn: T, max = 1000): T {
-  const m: Map<string, any> = new Map();
-  return ((a: string) => {
-    if (m.has(a)) return m.get(a);
-    const v = fn(a);
-    m.set(a, v);
-    if (m.size > max) {
-      const first = m.keys().next(); // IteratorResult<string>
-      if (!first.done) m.delete(first.value);
-    }
-    return v;
-  }) as T;
-}
-
-function pLimit(n: number) {
-  const q = new Set<Promise<any>>();
-  return async <R>(fn: () => Promise<R>): Promise<R> => {
-    while (q.size >= n) {
-      await Promise.race(q);
-    }
-    const p = fn().finally(() => q.delete(p));
-    q.add(p);
-    return p;
-  };
-}
-
-/* =============================
    Auth
    ============================= */
 const AUTH_SECRETS: string[] = (process.env.AUTHOR_UPDATES_SECRET || "")
@@ -47,9 +18,15 @@ const SKIP_AUTH = (process.env.SKIP_AUTH || "").toLowerCase() === "true";
 
 function headerCI(req: any, name: string): string | undefined {
   if (!req?.headers) return undefined;
-  const entries = Object.entries(req.headers) as Array<[string, string]>;
-  const hit = entries.find(([k]) => k.toLowerCase() === name.toLowerCase());
-  return hit?.[1];
+  const headers = req.headers as Record<string, string | string[] | undefined>;
+  const want = name.toLowerCase();
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === want) {
+      if (Array.isArray(v)) return v[0];
+      if (typeof v === "string") return v;
+    }
+  }
+  return undefined;
 }
 
 function requireAuth(req: any, res: any): boolean {
@@ -95,8 +72,6 @@ async function googleCSE(query: string, num = 10): Promise<any[]> {
   url.searchParams.set("cx", CSE_ID);
   url.searchParams.set("q", query);
   url.searchParams.set("num", String(num));
-  // Perf: request only fields we read
-  url.searchParams.set("fields", "items(link,title,snippet,mime,pagemap/metatags)");
 
   const resp = await fetchWithTimeout(url.toString());
   if (!resp?.ok) {
@@ -110,7 +85,7 @@ async function googleCSE(query: string, num = 10): Promise<any[]> {
 /* =============================
    Utils
    ============================= */
-function tokensRaw(s: string): string[] {
+function tokens(s: string): string[] {
   return s
     .toLowerCase()
     .normalize("NFKC")
@@ -118,7 +93,6 @@ function tokensRaw(s: string): string[] {
     .split(/\s+/)
     .filter(Boolean);
 }
-const tokens = memoize1(tokensRaw, 2000);
 
 function hostOf(link: string): string {
   try { return new URL(link).host.toLowerCase(); } catch { return ""; }
@@ -140,19 +114,8 @@ function tokenSet(s: string): Set<string> {
   );
 }
 
-function normalizeCompareTitleRaw(s: string): string {
+function normalizeCompareTitle(s: string): string {
   return s.toLowerCase().replace(/[\s“”"'-]+/g, " ").trim();
-}
-const normalizeCompareTitle = memoize1(normalizeCompareTitleRaw, 2000);
-
-// Count name mentions (for tiny, capped repetition bonuses)
-function countNameMentions(s: string, author: string): number {
-  if (!s || !author) return 0;
-  const a = author.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
-  const re = new RegExp(`\\b${a}\\b`, "gi");
-  let n = 0;
-  while (re.exec(s)) n++;
-  return n;
 }
 
 /* Helpers for subtitle tail hygiene */
@@ -168,21 +131,6 @@ function cleanFirstSubtitleSegment(s: string): string {
   const cut = s.split(/[|•–—-]{1,2}|\b\|\b/)[0];
   return (cut || "").replace(/\s+/g, " ").trim();
 }
-// NEW: strip trailing “by <Name> …” from subtitle-ish strings
-function stripByAuthorTail(s: string): string {
-  return (s || "").replace(
-    /\s+\bby\b\s+[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,5}\s*(?:…|\.{3})?$/u,
-    ""
-  ).trim();
-}
-// For filtering only: remove ending “by <Name>” clause from a title string
-function stripTitleByClauseForFilter(title: string): string {
-  return (title || "")
-    .replace(/\b[:—-]\s*.+?\s+\bby\b\s+[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,5}\s*(?:…|\.{3})?$/u, "")
-    .replace(/\s+\bby\b\s+[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,5}\s*(?:…|\.{3})?$/u, "")
-    .trim();
-}
-
 function looksLikeISBNy(s: string): boolean {
   const d = (s.match(/\d/g) || []).length;
   return d >= 6 || /\b(?:ISBN|978|979)\b/i.test(s);
@@ -225,7 +173,7 @@ function isParticle(tok: string): boolean { return MIDDLE_PARTICLES.has(tok.toLo
 function isSuffix(tok: string): boolean { return GENERATIONAL_SUFFIX.has(tok.toLowerCase()); }
 function looksLikeAdverb(tok: string): boolean { return /^[A-Za-z]{3,}ly$/u.test(tok); }
 
-function nameLikenessRaw(raw: string): number {
+function nameLikeness(raw: string): number {
   const s = raw.trim().replace(/\s+/g, " ");
   if (!s) return 0;
 
@@ -266,7 +214,6 @@ function nameLikenessRaw(raw: string): number {
 
   return Math.max(0, Math.min(1, score));
 }
-const nameLikeness = memoize1(nameLikenessRaw, 4000);
 
 /** Obvious non-name words that often appear capitalized in subtitles/titles */
 const COMMON_TITLE_WORDS = new Set([
@@ -306,21 +253,7 @@ const ROLE_TAIL_TOKENS = new Set([
   "translated","translator","translators"
 ]);
 
-/** NEW: honorifics and post-nominals commonly glued to names */
-const HONORIFICS = new Set([
-  "mr","mrs","ms","miss","mx","dr","prof","prof.","sir","dame","lord","lady","rev","rabbi","imam"
-]);
-const DEGREE_OR_POSTNOMINAL = new Set([
-  "phd","ph.d.","md","m.d.","mba","jd","j.d.","mph","mphil","m.phil.",
-  "obe","cbe","dbe","kbe","frs","fba","frsl","frhists","dlitt","dphil","d.phil."
-]);
-
-/** NEW: prepositional/connector tails that usually start a clause after a name */
-const NAME_FOLLOW_TAIL = new Set([
-  "on","at","for","from","about","regarding","with","via","in","of","by","speaks","interview","talks","discusses"
-]);
-
-function stripTrailingGarbageBase(s: string): string {
+function stripTrailingGarbage(s: string): string {
   let parts = s.split(/\s+/);
   let changed = false;
   while (parts.length > 1) {
@@ -343,6 +276,7 @@ function stripTrailingGarbageBase(s: string): string {
 /** Additional cleanup for role artifacts inside extracted names */
 function cleanRoleArtifacts(name: string): string {
   let s = name.replace(/\b(Illustrated|Illustrator|Edited|Editor|Foreword|Afterword|Introduction|Intro|Translated|Translator)s?\b$/i, "").trim();
+  // Also trim accidental mid-name connectors like trailing commas or dangles
   s = s.replace(/[,\s]+$/g, "").trim();
   return s;
 }
@@ -362,93 +296,6 @@ function isOrgishName(name: string): boolean {
 }
 
 /* =============================
-   NEW: stronger clause/paren/honorific trimming for names
-   ============================= */
-function stripTrailingParenBlock(s: string): string {
-  return s.replace(/\s*[\(\[\{][^()\[\]{}]{0,80}[\)\]\}]\s*$/u, "").trim();
-}
-
-function stripParentheticalSuffixes(s: string): string {
-  let prev: string;
-  let cur = s.trim();
-  do {
-    prev = cur;
-    cur = stripTrailingParenBlock(cur);
-  } while (cur !== prev);
-  return cur;
-}
-
-function stripClauseAfterPunct(name: string): string {
-  let s = name.replace(/\s+[–—-]\s+(\S.*)$/u, (m, tail) => {
-    const first = String(tail).split(/\s+/)[0] || "";
-    if (NAME_FOLLOW_TAIL.has(first.toLowerCase())) return "";
-    if (/^[a-z]/.test(first)) return "";
-    return m;
-  }).trim();
-
-  s = s.replace(/\s*,\s+(\S.*)$/u, (m, tail) => {
-    const first = String(tail).split(/\s+/)[0] || "";
-    if (NAME_FOLLOW_TAIL.has(first.toLowerCase())) return "";
-    if (/^(author|writer|editor|journalist|historian|novelist)\b/i.test(tail)) return "";
-    return m;
-  }).trim();
-
-  return s;
-}
-
-function stripHonorificsAndPostnominals(s: string): string {
-  let parts = s.split(/\s+/).filter(Boolean);
-  while (parts.length > 0 && HONORIFICS.has(parts[0].toLowerCase().replace(/\.$/, ""))) {
-    parts.shift();
-  }
-  while (parts.length > 1) {
-    const last = parts[parts.length - 1];
-    const low = last.toLowerCase();
-    if (isSuffix(last)) break;
-    if (DEGREE_OR_POSTNOMINAL.has(low.replace(/\.$/, ""))) { parts.pop(); continue; }
-    if (/^(?:19|20)\d{2}$/.test(low) || /^@\w{2,}$/.test(last)) { parts.pop(); continue; }
-    break;
-  }
-  return parts.join(" ");
-}
-
-function stripTrailingGarbageStrongRaw(s: string): string {
-  let out = s.trim();
-  out = stripParentheticalSuffixes(out);
-  out = stripClauseAfterPunct(out);
-  out = stripHonorificsAndPostnominals(out);
-  out = stripTrailingGarbageBase(out);
-  out = stripTrailingParenBlock(out);
-  return out.trim();
-}
-const stripTrailingGarbageStrong = memoize1(stripTrailingGarbageStrongRaw, 4000);
-
-function stripTrailingGarbageLight(s: string): string {
-  // cheaper first pass: honorifics + basic garbage, no clause/paren loop
-  let out = s.trim();
-  out = stripHonorificsAndPostnominals(out);
-  out = stripTrailingGarbageBase(out);
-  return out.trim();
-}
-
-function trimToBestNamePrefix(s: string): string {
-  const parts = s.split(/\s+/).filter(Boolean);
-  const maxLen = Math.min(6, parts.length);
-  let best = s;
-  let bestScore = nameLikeness(s);
-
-  for (let len = 2; len <= maxLen; len++) {
-    const cand = parts.slice(0, len).join(" ");
-    const sc = nameLikeness(cand);
-    if (sc > bestScore + 0.04 || (Math.abs(sc - bestScore) <= 0.04 && cand.split(" ").length > best.split(" ").length)) {
-      best = cand;
-      bestScore = sc;
-    }
-  }
-  return best;
-}
-
-/* =============================
    Clean + validate a candidate
    ============================= */
 function normalizeNameCandidate(raw: string, title: string): string | null {
@@ -457,29 +304,37 @@ function normalizeNameCandidate(raw: string, title: string): string | null {
     .replace(/[.,;:–—-]+$/g, "")
     .replace(/\s+/g, " ");
 
-  // scrub token punctuation (single pass)
-  s = s.replace(/\b([^\s]+)[.,;:]+(?=\s|$)/g, "$1");
+  s = s.split(/\s+/).map(tok => tok.replace(/[.,;:]+$/g, "")).join(" ");
 
-  // Stronger cleanup with cheaper first pass, maintains logic
+  // NEW: remove role artifacts and then garbage tails
   s = cleanRoleArtifacts(s);
-  s = stripTrailingGarbageLight(s);
-  s = trimToBestNamePrefix(s);
+  s = stripTrailingGarbage(s);
 
   // Hard reject organizations / imprints
   if (isOrgishName(s)) return null;
 
-  // Early reject for common-word pairs (subtitle artifacts) and title echoes
+  // Early reject for common-word pairs (subtitle artifacts)
   const partsEarly = s.split(/\s+/);
-  const titleToks = tokens(stripTitleByClauseForFilter(title)); // NEW: filter-friendly title
   if (partsEarly.length === 2 && looksLikeCommonPair(s)) return null;
+
+  const titleToks = tokens(title);
   if (titleToks.includes(s.toLowerCase())) return null;
+
+  // If it's a 2-word candidate and both words appear in the title, reject
   if (partsEarly.length === 2) {
     const overlap = partsEarly.filter(p => titleToks.includes(p.toLowerCase())).length;
     if (overlap === 2) return null;
   }
 
-  // Second pass full strip + org re-check
-  s = stripTrailingGarbageStrong(s);
+  // Drop one trailing garbage token if present
+  const parts = s.split(" ");
+  const last = parts[parts.length - 1];
+  if (BAD_TAIL.has(last.toLowerCase()) || looksLikeAdverb(last) || ROLE_TAIL_TOKENS.has(last.toLowerCase())) {
+    if (parts.length >= 3) { parts.pop(); s = parts.join(" "); }
+  }
+
+  // Second pass strip + org re-check
+  s = stripTrailingGarbage(s);
   if (isOrgishName(s)) return null;
 
   return nameLikeness(s) >= 0.65 ? s : null;
@@ -504,6 +359,19 @@ function preferPublisherOrRetail(host: string): boolean {
 }
 
 /* =============================
+   NEW: strip author-looking tail from titles for overlap filter
+   ============================= */
+function stripAuthorTailBySeparators(title: string): string {
+  // Matches “Title – Paula Hawkins”, “Title | Paula Hawkins”, etc.
+  const re = /\s*(?:[-–—|])\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,4})\s*$/u;
+  const m = title.match(re);
+  if (m && nameLikeness(m[1]) >= 0.70) {
+    return title.slice(0, m.index).trim();
+  }
+  return title.trim();
+}
+
+/* =============================
    Phase 0: Title expansion (subtitle recovery)
    ============================= */
 function startsWithShortThenSubtitle(title: string, short: string): string | null {
@@ -513,7 +381,10 @@ function startsWithShortThenSubtitle(title: string, short: string): string | nul
   if (!m) return null;
   const subtitleRaw = m[1];
   let subtitle = cleanFirstSubtitleSegment(stripSiteSuffix(subtitleRaw));
-  subtitle = stripByAuthorTail(subtitle); // NEW: remove trailing “by Author …” from subtitle
+
+  // NEW: prevent treating a proper name as a subtitle (“- Paula Hawkins”)
+  if (subtitle && nameLikeness(subtitle) >= 0.70) return null;
+
   if (
     !subtitle ||
     looksLikeISBNy(subtitle) ||
@@ -567,7 +438,9 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
           if (colonIdx > 0) {
             const head = cand.slice(0, colonIdx).trim();
             let tail = cleanFirstSubtitleSegment(stripSiteSuffix(cand.slice(colonIdx + 1))).trim();
-            tail = stripByAuthorTail(tail); // NEW: remove “by Author” from colon tail
+
+            // NEW: prevent proper-name-only tails from being taken as subtitle
+            if (tail && nameLikeness(tail) >= 0.70) continue;
 
             if (!tail ||
                 /\bWikipedia\b/i.test(tail) ||
@@ -627,7 +500,9 @@ function splitNamesList(s: string): string[] {
 function extractAuthorSignals(text: string, opts?: { booky?: boolean; title?: string }): AuthorSignal[] {
   const out: AuthorSignal[] = [];
   const booky = !!opts?.booky;
-  const title = opts?.title || "";
+  // IMPORTANT: use the (possibly short) title provided by caller,
+  // and strip any trailing “- Name” tail before token overlap.
+  const titleForFilter = stripAuthorTailBySeparators(opts?.title || "");
 
   // Author / written by
   const reAuthor = /\bAuthor:\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=[),.?:;!–—-]|\s|$)/gu;
@@ -653,22 +528,22 @@ function extractAuthorSignals(text: string, opts?: { booky?: boolean; title?: st
     out.push({ kind: "written_by", name: cleanRoleArtifacts(m[1]) });
   }
   while ((m = reBylineBlock.exec(text))) {
-    const list = splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbageBase).filter(Boolean);
+    const list = splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean);
     list.forEach((n, i) => out.push({ kind: "byline_ordered", name: n, position: i }));
     if (m[2]) {
-      const withList = splitNamesList(m[2]).map(cleanRoleArtifacts).map(stripTrailingGarbageBase).filter(Boolean);
+      const withList = splitNamesList(m[2]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean);
       withList.forEach((n) => out.push({ kind: "with", name: n }));
     }
   }
   while ((m = reEditedBy.exec(text))) {
-    splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbageBase).filter(Boolean)
+    splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean)
       .forEach((n) => out.push({ kind: "editor", name: n }));
   }
   while ((m = reForewordBy.exec(text))) {
     out.push({ kind: "foreword", name: cleanRoleArtifacts(m[1]) });
   }
   while ((m = reIllustratedBy.exec(text))) {
-    splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbageBase).filter(Boolean)
+    splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean)
       .forEach((n) => out.push({ kind: "illustrator", name: n }));
   }
 
@@ -679,8 +554,8 @@ function extractAuthorSignals(text: string, opts?: { booky?: boolean; title?: st
     }
   }
 
-  // Filter out obvious false positives that echo the title content
-  const titleToks = tokens(stripTitleByClauseForFilter(title)); // NEW: strip trailing “by …” for filtering
+  // Filter out obvious false positives that echo the (sanitized) title content
+  const titleToks = tokens(titleForFilter);
   return out.filter(sig => {
     const normed = tokens(sig.name);
     const overlap = normed.filter(t => titleToks.includes(t)).length;
@@ -771,7 +646,8 @@ async function resolveAuthor(bookTitle: string): Promise<{
     }
     const expandedMatch = candidateTitles.some(t => normalizeCompareTitle(t) === normalizeCompareTitle(titleForSearch));
 
-    const sigs = extractAuthorSignals(haystack, { booky: mtIsBook, title: titleForSearch });
+    // IMPORTANT: use the original short bookTitle for overlap filtering to avoid nuking the author
+    const sigs = extractAuthorSignals(haystack, { booky: mtIsBook, title: bookTitle });
 
     for (const sig of sigs) {
       const normed = normalizeNameCandidate(sig.name, bookTitle);
@@ -779,17 +655,7 @@ async function resolveAuthor(bookTitle: string): Promise<{
 
       if ((sig.kind === "plain_last_first") && (maybeOrgish(normed) || looksLikeCommonPair(normed))) continue;
 
-      // base weight
-      let w = weightForSignal(sig, host, expandedMatch);
-
-      // NEW: tiny, capped repetition bonus keyed to THIS candidate name within this item
-      const m = countNameMentions(haystack, normed);
-      if (m > 0 && (mtIsBook || PUBLISHERS.some(d => host.endsWith(d)))) {
-        // ~0.04 @1 hit, ~0.07 @2, capped 0.12
-        const bonus = Math.min(0.12, 0.04 * Math.log2(1 + m));
-        w += bonus;
-      }
-
+      const w = weightForSignal(sig, host, expandedMatch);
       if (w <= 0) continue;
 
       const cur = aggs.get(normed) || { score: 0, roles: {}, positions: [], highSignals: 0 };
@@ -888,12 +754,6 @@ async function fetchPageText(url: string, ms = 5500): Promise<string> {
   try {
     const resp = await fetchWithTimeout(url, { headers: { Accept: "text/html,*/*" } }, ms);
     if (!resp?.ok) return "";
-    // Perf: fast-reject non-HTML and huge blobs
-    const ct = resp.headers.get("content-type") || "";
-    if (!/text\/html/i.test(ct)) return "";
-    const cl = Number(resp.headers.get("content-length") || 0);
-    if (cl && cl > MAX_BYTES * 3) return "";
-
     // stream and cap
     const reader = (resp as any).body?.getReader?.();
     if (!reader) return extractVisibleText(await resp.text());
@@ -973,7 +833,7 @@ function overlapRatio(a: string[], b: string[]): number {
   return inter / Math.min(A.size, B.size);
 }
 
-/** Authorship-focused boosts (+ NEW repetition nudge) */
+/** Authorship-focused boosts */
 function hasJsonLdPersonOrBook(htmlOrText: string, author: string, bookTitle: string): { person: boolean; book: boolean } {
   const h = htmlOrText;
   const a = norm(author).replace(/"/g, '\\"');
@@ -995,18 +855,13 @@ function contentSignalsForSite(text: string, author: string, bookTitle: string):
 
   const { person, book } = hasJsonLdPersonOrBook(text, author, bookTitle);
 
-  // NEW: small repetition bonus (cap bytes when scanning)
-  const repeats = countNameMentions(String(text || "").slice(0, 20000), author);
-  const repBonus = Math.min(0.08, 0.03 * Math.log2(1 + repeats));
-
   let score =
     0.40 * Math.min(1, bookOverlap * 1.5) +
     0.18 * aExact +
     0.12 * hasBooksPage +
     0.10 * mentionsAuthorRole +
     0.12 * (person ? 1 : 0) +
-    0.08 * (book ? 1 : 0) +
-    repBonus; // NEW
+    0.08 * (book ? 1 : 0);
 
   return Math.min(1, score);
 }
@@ -1020,34 +875,6 @@ const BLOCKED_DOMAINS = [
   "harpercollins.com","simonandschuster.com","macmillan.com","hachettebookgroup.com",
   "spotify.com","apple.com"
 ];
-
-// NEW: treat platform hosts below personal sites in close calls
-const PLATFORM_HOSTS = [
-  "substack.com","medium.com","wordpress.com","blogspot.","tumblr.com",
-  "linktr.ee","about.me","notion.site","notion.so","square.site","wixsite.com",
-  "weebly.com","ghost.io"
-];
-
-function isPlatformHost(host: string): boolean {
-  const h = host.toLowerCase();
-  return PLATFORM_HOSTS.some(p => h.endsWith(p) || h.includes(p));
-}
-
-function isApexOrWww(host: string): boolean {
-  const parts = host.split(".").filter(Boolean);
-  return parts.length <= 2 || (parts.length === 3 && parts[0] === "www");
-}
-
-/** NEW: host contains at least the surname (and usually first) */
-function hostHasAuthorName(host: string, author: string): boolean {
-  const h = host.toLowerCase();
-  const toks = tokens(author).filter(t => t.length > 2);
-  const last = toks[toks.length - 1];
-  if (!last || !h.includes(last)) return false;
-  const first = toks[0];
-  if (first && h.includes(first)) return true;
-  return true;
-}
 
 function isBlockedHost(host: string): boolean {
   return BLOCKED_DOMAINS.some((d) => host.includes(d));
@@ -1063,13 +890,7 @@ function scoreCandidateUrl(u: URL, author: string): number {
   const host = u.host.toLowerCase();
   for (const t of toks) if (host.includes(t)) score += 0.4;
 
-  // small preference for custom apex/www domains
-  if (isApexOrWww(host)) score += 0.05;
-
-  // STRONGER: platform penalty to help personal sites in close calls
-  if (isPlatformHost(host)) score -= 0.12;
-
-  return Math.max(0, Math.min(1, score));
+  return Math.min(1, score);
 }
 
 // Minimum normalized score to accept a site (default 0.6)
@@ -1083,19 +904,17 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
   ];
 
   const candidates: Array<{ urlObj: URL; urlScore: number; fromQuery: string }> = [];
-  const seenHosts = new Set<string>();
-
-  const itemsLists = await Promise.all(queries.map(q => googleCSE(q, 10)));
-  for (let i = 0; i < queries.length; i++) {
-    const items = itemsLists[i] || [];
+  for (const q of queries) {
+    const items = await googleCSE(q, 10);
     for (const it of items) {
       let u: URL | null = null;
       try { u = new URL(it.link); } catch { continue; }
       const host = u.host.toLowerCase();
-      if (isBlockedHost(host) || seenHosts.has(host)) continue;
-      seenHosts.add(host);
+      if (isBlockedHost(host)) continue;
       const urlScore = scoreCandidateUrl(u, author);
-      candidates.push({ urlObj: u, urlScore, fromQuery: queries[i] });
+      if (!candidates.some(c => c.urlObj.host === u!.host)) {
+        candidates.push({ urlObj: u, urlScore, fromQuery: q });
+      }
     }
   }
 
@@ -1116,37 +935,21 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     fromQuery: string;
   }> = [];
 
-  const run = pLimit(4); // cap parallel fetches per site
-
   for (const c of topFew) {
     const origin = c.urlObj.origin;
-    const paths = [
-      "", "/books", "/book", "/works", "/publications", "/titles", "/about", "/bio",
-      // extra likely book pages on author sites
-      "/wild", "/books/wild", "/wild.html", "/books/wild.html", "/works/wild"
-    ];
+    const paths = ["", "/books", "/book", "/works", "/publications", "/titles", "/about", "/bio"];
     const samples: Array<{ path: string; contentScore: number }> = [];
 
     const homeText = await fetchPageText(origin);
     let bestContent = contentSignalsForSite(homeText, author, bookTitle);
     samples.push({ path: "/", contentScore: bestContent });
 
-    // compute acceptance threshold once per host
-    const authorToks = tokens(author).filter(t => t.length > 2);
-    const hostHasAuthor = authorToks.some(t => c.urlObj.host.toLowerCase().includes(t));
-    const minAccept = Math.max(WEBSITE_MIN_SCORE, hostHasAuthor ? 0.60 : 0.70);
-
-    if (bestContent < Math.max(0.85, minAccept)) {
-      const fetches = paths.slice(1).map(p => run(async () => {
-        const text = await fetchPageText(origin + p);
-        const s = contentSignalsForSite(text, author, bookTitle);
-        return { path: p, s };
-      }));
-      const results = await Promise.all(fetches);
-      for (const { path, s } of results) {
-        if (s > bestContent) bestContent = s;
-        samples.push({ path, contentScore: s });
-      }
+    for (const p of paths.slice(1)) {
+      if (bestContent >= 0.85) break;
+      const text = await fetchPageText(origin + p);
+      const s = contentSignalsForSite(text, author, bookTitle);
+      bestContent = Math.max(bestContent, s);
+      samples.push({ path: p, contentScore: s });
     }
 
     if (bestContent < 0.5) {
@@ -1163,23 +966,7 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
       }
     }
 
-    // --- NEW: Official-site evidence floor (helps JS-heavy official sites) ---
-    const host = c.urlObj.host.toLowerCase();
-    const looksPersonal =
-      !isPlatformHost(host) &&
-      isApexOrWww(host) &&
-      hostHasAuthorName(host, author);
-    const cameFromOfficialQuery = /official site/i.test(c.fromQuery);
-    if (looksPersonal && cameFromOfficialQuery && bestContent < 0.58) {
-      bestContent = 0.58; // conservative content floor
-    }
-
-    let finalScore = 0.45 * c.urlScore + 0.55 * bestContent;
-    // NEW: slightly stronger dampener for platforms
-    if (isPlatformHost(c.urlObj.host)) {
-      finalScore *= 0.96;
-    }
-
+    const finalScore = 0.45 * c.urlScore + 0.55 * bestContent;
     validations.push({
       origin,
       urlScore: c.urlScore,
@@ -1191,42 +978,12 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
   }
 
   validations.sort((a, b) => b.finalScore - a.finalScore);
+  const top = validations[0];
 
-  // NEW: Prefer a confident personal (non-platform) site in a near tie
-  const authorToks2 = tokens(author).filter(t => t.length > 2);
-  const personalCandidates = validations.filter(v => {
-    const h = new URL(v.origin).host.toLowerCase();
-    const hasAuthor = hostHasAuthorName(h, author);
-    const thresholdLike = Math.max(WEBSITE_MIN_SCORE, hasAuthor ? 0.60 : 0.70);
-    return !isPlatformHost(h) && hasAuthor && v.contentScore >= Math.max(0.55, thresholdLike - 0.02);
-  }).sort((a, b) => b.finalScore - a.finalScore);
-
-  let top = validations[0];
-  const topHost = new URL(top.origin).host.toLowerCase();
-  const topIsPlatform = isPlatformHost(topHost);
-
-  if (topIsPlatform && personalCandidates.length) {
-    const bestPersonal = personalCandidates[0];
-
-    // If best personal site has decent content AND URL looks authorish,
-    // allow a larger override window (platforms tend to over-index on content score).
-    const delta = top.finalScore - bestPersonal.finalScore;
-    const personalIsApex = isApexOrWww(new URL(bestPersonal.origin).host);
-
-    const allowOverride =
-      delta <= 0.20 &&                    // up to 20% behind is okay
-      bestPersonal.contentScore >= 0.58 && // shows author/book signal
-      personalIsApex;                      // official-ish domain shape
-
-    if (allowOverride) {
-      top = bestPersonal;
-    }
-  }
-
-  // Compute threshold for the chosen 'top'
-  const hostChosen = new URL(top.origin).host.toLowerCase();
-  const hostHasAuthor2 = authorToks2.some(t => hostChosen.includes(t));
-  const threshold = Math.max(WEBSITE_MIN_SCORE, hostHasAuthor2 ? 0.60 : 0.70);
+  const authorToks = tokens(author).filter(t => t.length > 2);
+  const host = new URL(top.origin).host.toLowerCase();
+  const hostHasAuthor = authorToks.some(t => host.includes(t));
+  const threshold = Math.max(WEBSITE_MIN_SCORE, hostHasAuthor ? 0.60 : 0.70);
 
   if (top.finalScore >= threshold) {
     return {
