@@ -239,12 +239,25 @@ const NAME_TAIL_GARBAGE = new Set([
   "records","studios","partners","associates"
 ]);
 
+/** NEW: role-tail words that should never be part of a person’s name */
+const ROLE_TAIL_TOKENS = new Set([
+  "illustrated","illustrator","illustrations",
+  "edited","editor","editors",
+  "foreword","afterword","introduction","intro",
+  "translated","translator","translators"
+]);
+
 function stripTrailingGarbage(s: string): string {
   let parts = s.split(/\s+/);
   let changed = false;
   while (parts.length > 1) {
     const last = parts[parts.length - 1].toLowerCase();
-    if (NAME_TAIL_GARBAGE.has(last) || BAD_TAIL.has(last) || looksLikeAdverb(last)) {
+    if (
+      NAME_TAIL_GARBAGE.has(last) ||
+      BAD_TAIL.has(last) ||
+      looksLikeAdverb(last) ||
+      ROLE_TAIL_TOKENS.has(last)
+    ) {
       parts.pop();
       changed = true;
       continue;
@@ -252,6 +265,14 @@ function stripTrailingGarbage(s: string): string {
     break;
   }
   return changed ? parts.join(" ") : s;
+}
+
+/** Additional cleanup for role artifacts inside extracted names */
+function cleanRoleArtifacts(name: string): string {
+  let s = name.replace(/\b(Illustrated|Illustrator|Edited|Editor|Foreword|Afterword|Introduction|Intro|Translated|Translator)s?\b$/i, "").trim();
+  // Also trim accidental mid-name connectors like trailing commas or dangles
+  s = s.replace(/[,\s]+$/g, "").trim();
+  return s;
 }
 
 const ORG_TOKENS = new Set([
@@ -279,7 +300,8 @@ function normalizeNameCandidate(raw: string, title: string): string | null {
 
   s = s.split(/\s+/).map(tok => tok.replace(/[.,;:]+$/g, "")).join(" ");
 
-  // First pass: strip publisher-ish tails early
+  // NEW: remove role artifacts and then garbage tails
+  s = cleanRoleArtifacts(s);
   s = stripTrailingGarbage(s);
 
   // Hard reject organizations / imprints
@@ -301,7 +323,7 @@ function normalizeNameCandidate(raw: string, title: string): string | null {
   // Drop one trailing garbage token if present
   const parts = s.split(" ");
   const last = parts[parts.length - 1];
-  if (BAD_TAIL.has(last.toLowerCase()) || looksLikeAdverb(last)) {
+  if (BAD_TAIL.has(last.toLowerCase()) || looksLikeAdverb(last) || ROLE_TAIL_TOKENS.has(last.toLowerCase())) {
     if (parts.length >= 3) { parts.pop(); s = parts.join(" "); }
   }
 
@@ -358,7 +380,7 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
 
   let bestFull: string | null = null;
   let bestHost: string | null = null;
-  const evidence: any[] = [];
+  const evidence: any[] = []
 
   for (const it of items) {
     const host = hostOf(it.link);
@@ -430,7 +452,6 @@ async function expandBookTitle(shortTitle: string): Promise<{ full: string; used
    Phase 1: Determine Author(s)
    ============================= */
 
-/** signals now encode role + position for multi-author bylines */
 type AuthorSignal =
   | { kind: "author_label"; name: string }
   | { kind: "written_by"; name: string }
@@ -444,7 +465,6 @@ type AuthorSignal =
 const POSITION_WEIGHTS = [1.0, 0.9, 0.85, 0.8, 0.75, 0.7];
 
 function splitNamesList(s: string): string[] {
-  // split on commas and " and " / " & "
   return s
     .split(/\s*,\s*|\s+and\s+|\s*&\s+/i)
     .map((x) => x.trim())
@@ -456,11 +476,11 @@ function extractAuthorSignals(text: string, opts?: { booky?: boolean; title?: st
   const booky = !!opts?.booky;
   const title = opts?.title || "";
 
-  // Author: NAME / written by NAME
+  // Author / written by
   const reAuthor = /\bAuthor:\s*([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=[),.?:;!–—-]|\s|$)/gu;
   const reWritten = /\bwritten by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})(?=[),.?:;!–—-]|\s|$)/gu;
 
-  // by A, B and C [with D]
+  // by A, B and C [with D]   (NOTE: we’ll post-clean role artifacts from each name)
   const reBylineBlock = /\bby\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*(?:\s*(?:,?\s*and\s+|&\s*)[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})?)(?:\s+with\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*)\b)?/gu;
 
   // role-specific
@@ -468,39 +488,41 @@ function extractAuthorSignals(text: string, opts?: { booky?: boolean; title?: st
   const reForewordBy = /\bforeword by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})/gu;
   const reIllustratedBy = /\billustrated by\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3}(?:\s*,\s*[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})*(?:\s*(?:,?\s*and\s+|&\s*)[A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){0,3})?)/gu;
 
-  // optional: plain "Last, First" if page is booky (schema or OG book)
+  // optional: plain "Last, First" if page is booky
   const reLastFirst = /\b([A-Z][\p{L}'-]+),\s+([A-Z][\p{L}'-]+)\b(?!\s*(?:and|or|&|,))/gu;
 
   let m: RegExpExecArray | null;
 
   while ((m = reAuthor.exec(text))) {
-    out.push({ kind: "author_label", name: m[1] });
+    out.push({ kind: "author_label", name: cleanRoleArtifacts(m[1]) });
   }
   while ((m = reWritten.exec(text))) {
-    out.push({ kind: "written_by", name: m[1] });
+    out.push({ kind: "written_by", name: cleanRoleArtifacts(m[1]) });
   }
   while ((m = reBylineBlock.exec(text))) {
-    const list = splitNamesList(m[1]);
+    const list = splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean);
     list.forEach((n, i) => out.push({ kind: "byline_ordered", name: n, position: i }));
     if (m[2]) {
-      const withList = splitNamesList(m[2]);
+      const withList = splitNamesList(m[2]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean);
       withList.forEach((n) => out.push({ kind: "with", name: n }));
     }
   }
   while ((m = reEditedBy.exec(text))) {
-    splitNamesList(m[1]).forEach((n) => out.push({ kind: "editor", name: n }));
+    splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean)
+      .forEach((n) => out.push({ kind: "editor", name: n }));
   }
   while ((m = reForewordBy.exec(text))) {
-    out.push({ kind: "foreword", name: m[1] });
+    out.push({ kind: "foreword", name: cleanRoleArtifacts(m[1]) });
   }
   while ((m = reIllustratedBy.exec(text))) {
-    splitNamesList(m[1]).forEach((n) => out.push({ kind: "illustrator", name: n }));
+    splitNamesList(m[1]).map(cleanRoleArtifacts).map(stripTrailingGarbage).filter(Boolean)
+      .forEach((n) => out.push({ kind: "illustrator", name: n }));
   }
 
   if (booky) {
     while ((m = reLastFirst.exec(text))) {
       const name = `${m[2]} ${m[1]}`;
-      out.push({ kind: "plain_last_first", name });
+      out.push({ kind: "plain_last_first", name: cleanRoleArtifacts(name) });
     }
   }
 
@@ -509,19 +531,18 @@ function extractAuthorSignals(text: string, opts?: { booky?: boolean; title?: st
   return out.filter(sig => {
     const normed = tokens(sig.name);
     const overlap = normed.filter(t => titleToks.includes(t)).length;
-    return overlap < Math.min(2, normed.length); // don’t keep if it’s basically title words
+    return overlap < Math.min(2, normed.length);
   });
 }
 
 type AuthorAgg = {
   score: number;
   roles: Record<string, number>;
-  positions: number[]; // for byline order seen
-  highSignals: number; // author_label / written_by
+  positions: number[];
+  highSignals: number;
 };
 
 function weightForSignal(sig: AuthorSignal, host: string, expandedMatch: boolean): number {
-  // base weights per role/signal
   let w =
     sig.kind === "author_label" ? 1.0 :
     sig.kind === "written_by" ? 1.0 :
@@ -530,12 +551,9 @@ function weightForSignal(sig: AuthorSignal, host: string, expandedMatch: boolean
     sig.kind === "editor" ? 0.2 :
     sig.kind === "foreword" ? 0.1 :
     sig.kind === "illustrator" ? 0.1 :
-    sig.kind === "plain_last_first" ? 0.6 :
-    0.0;
+    sig.kind === "plain_last_first" ? 0.6 : 0.0;
 
-  // publisher/imprint boost
   if (host && PUBLISHERS.some(d => host.endsWith(d))) w *= 1.4;
-  // exact expanded-title page nudge
   if (expandedMatch) w *= 1.15;
 
   return w;
@@ -567,7 +585,6 @@ async function resolveAuthor(bookTitle: string): Promise<{
   }
 
   const aggs = new Map<string, AuthorAgg>();
-  const mtBookyByUrl = new Map<string, boolean>();
 
   for (const it of items) {
     const fields: string[] = [];
@@ -580,15 +597,14 @@ async function resolveAuthor(bookTitle: string): Promise<{
       if (mt && typeof mt === "object") {
         const t1 = (mt as any).title;
         const t2 = (mt as any)["og:title"];
-        const t3 = (mt as any)["book:author"]; // may be string
+        const t3 = (mt as any)["book:author"];
         const ogType = (mt as any)["og:type"];
         if (typeof t1 === "string") fields.push(t1);
         if (typeof t2 === "string") fields.push(t2);
-        if (typeof t3 === "string") fields.push(`Author: ${t3}`); // nudge as explicit author signal
+        if (typeof t3 === "string") fields.push(`Author: ${t3}`);
         if (ogType && String(ogType).toLowerCase().includes("book")) mtIsBook = true;
       }
     }
-    mtBookyByUrl.set(it.link, mtIsBook);
 
     let host = "";
     try { host = new URL(it.link).host.toLowerCase(); } catch {}
@@ -602,14 +618,12 @@ async function resolveAuthor(bookTitle: string): Promise<{
     }
     const expandedMatch = candidateTitles.some(t => normalizeCompareTitle(t) === normalizeCompareTitle(titleForSearch));
 
-    // extract multi-author aware signals
     const sigs = extractAuthorSignals(haystack, { booky: mtIsBook, title: titleForSearch });
 
     for (const sig of sigs) {
       const normed = normalizeNameCandidate(sig.name, bookTitle);
       if (!normed) continue;
 
-      // discard org/common-pair when the signal is weak-ish
       if ((sig.kind === "plain_last_first") && (maybeOrgish(normed) || looksLikeCommonPair(normed))) continue;
 
       const w = weightForSignal(sig, host, expandedMatch);
@@ -676,7 +690,6 @@ async function resolveAuthor(bookTitle: string): Promise<{
     }
   }
 
-  // confidence heuristic
   const second = merged[1];
   let confidence = primary.score >= 1.6 ? 0.95 : 0.8;
   if (second) {
@@ -693,7 +706,12 @@ async function resolveAuthor(bookTitle: string): Promise<{
     coAuthors,
     confidence,
     ranked: merged.map(m => ({ name: m.name, score: Number(m.score.toFixed(3)) })),
-    debug: { expanded, query, items, aggs: Object.fromEntries([...aggs].map(([k, v]) => [k, { ...v, score: Number(v.score.toFixed(3)) }])) }
+    debug: {
+      expanded,
+      query,
+      items,
+      aggs: Object.fromEntries([...aggs].map(([k, v]) => [k, { ...v, score: Number(v.score.toFixed(3)) }]))
+    }
   };
 }
 
@@ -786,7 +804,7 @@ function overlapRatio(a: string[], b: string[]): number {
   return inter / Math.min(A.size, B.size);
 }
 
-/** Boost *authorship* indicators instead of penalizing "sporty" content */
+/** Authorship-focused boosts */
 function hasJsonLdPersonOrBook(htmlOrText: string, author: string, bookTitle: string): { person: boolean; book: boolean } {
   const h = htmlOrText;
   const a = norm(author).replace(/"/g, '\\"');
@@ -803,7 +821,6 @@ function contentSignalsForSite(text: string, author: string, bookTitle: string):
   const bookOverlap = overlapRatio(bag, tokenBag(bookTitle)); // 0..1
   const aExact = new RegExp(`\\b${a.replace(/\s+/g, "\\s+")}\\b`, "i").test(text) ? 1 : 0;
 
-  // authorship indicators (boosts)
   const hasBooksPage = /\b(books|publications|titles|works)\b/i.test(text) ? 1 : 0;
   const mentionsAuthorRole = /\b(author|writer|written by|byline)\b/i.test(text) ? 1 : 0;
 
@@ -857,7 +874,6 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     `"${bookTitle}" "${author}" author website`,
   ];
 
-  // First pass: get a few distinct domains
   const candidates: Array<{ urlObj: URL; urlScore: number; fromQuery: string }> = [];
   for (const q of queries) {
     const items = await googleCSE(q, 10);
@@ -877,7 +893,6 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     return { url: null, debug: { tried: "broad_author_query", threshold: WEBSITE_MIN_SCORE } };
   }
 
-  // Validate content on top few domains
   const topFew = candidates
     .sort((a, b) => b.urlScore - a.urlScore)
     .slice(0, 5);
@@ -896,21 +911,18 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     const paths = ["", "/books", "/book", "/works", "/publications", "/titles", "/about", "/bio"];
     const samples: Array<{ path: string; contentScore: number }> = [];
 
-    // homepage first
     const homeText = await fetchPageText(origin);
     let bestContent = contentSignalsForSite(homeText, author, bookTitle);
     samples.push({ path: "/", contentScore: bestContent });
 
-    // try a few common paths until score saturates
     for (const p of paths.slice(1)) {
-      if (bestContent >= 0.85) break; // good enough
+      if (bestContent >= 0.85) break;
       const text = await fetchPageText(origin + p);
       const s = contentSignalsForSite(text, author, bookTitle);
       bestContent = Math.max(bestContent, s);
       samples.push({ path: p, contentScore: s });
     }
 
-    // If still weak, try a targeted site: query for the BOOK TITLE on this domain and fetch the first hit
     if (bestContent < 0.5) {
       const siteQuery = `"${bookTitle}" site:${c.urlObj.host}`;
       const siteHits = await googleCSE(siteQuery, 3);
@@ -936,11 +948,9 @@ async function resolveWebsite(author: string, bookTitle: string): Promise<{ url:
     });
   }
 
-  // pick best validated site
   validations.sort((a, b) => b.finalScore - a.finalScore);
   const top = validations[0];
 
-  // slightly higher bar if the domain isn’t name-like (no last name in host)
   const authorToks = tokens(author).filter(t => t.length > 2);
   const host = new URL(top.origin).host.toLowerCase();
   const hostHasAuthor = authorToks.some(t => host.includes(t));
@@ -982,8 +992,8 @@ export default async function handler(req: any, res: any) {
         book_title: bookTitle,
         primary_author: null,
         co_authors: [],
-        inferred_author: null,              // backward-compat
-        author_confidence: 0,               // backward-compat
+        inferred_author: null,
+        author_confidence: 0,
         author_url: null,
         confidence: 0,
         error: "no_author_found",
@@ -998,9 +1008,8 @@ export default async function handler(req: any, res: any) {
       primary_author: authorRes.primary,
       co_authors: authorRes.coAuthors,
       authors_ranked: authorRes.ranked,
-      // backward-compat fields
-      inferred_author: authorRes.primary,
-      author_confidence: authorRes.confidence,
+      inferred_author: authorRes.primary,          // backward-compat
+      author_confidence: authorRes.confidence,     // backward-compat
       author_url: siteRes.url,
       confidence: siteRes.url ? 0.9 : 0,
       _diag: {
